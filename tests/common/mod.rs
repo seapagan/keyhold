@@ -9,7 +9,8 @@
 //! `cancel` argument the daemon passes). Real GPG is never touched.
 use std::{
     fs,
-    os::unix::fs::PermissionsExt,
+    io::{Read, Write},
+    os::unix::{fs::PermissionsExt, net::UnixStream},
     path::PathBuf,
     process::{Command, Output},
     thread,
@@ -167,6 +168,26 @@ pub fn wait_for_status(
     timeout: Duration,
 ) -> bool {
     wait_until(timeout, || env.status().contains(needle))
+}
+
+/// Send one raw newline-framed JSON request over the daemon socket and
+/// return the parsed response, for precise protocol-level assertions.
+pub fn ipc_request(env: &TestEnv, request: &str) -> Option<serde_json::Value> {
+    let mut stream = UnixStream::connect(env.sock()).ok()?;
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+    stream.write_all(request.as_bytes()).ok()?;
+    stream.write_all(b"\n").ok()?;
+    // The daemon answers once and closes the connection.
+    let mut response = String::new();
+    stream.read_to_string(&mut response).ok()?;
+    serde_json::from_str(response.trim()).ok()
+}
+
+/// The daemon's status snapshot via raw IPC (exact fields, no display
+/// parsing).
+pub fn status_of(env: &TestEnv) -> Option<serde_json::Value> {
+    ipc_request(env, "{\"cmd\":\"status\"}")
+        .and_then(|v| v.get("status").cloned())
 }
 
 /// Wait for a foreground child process to exit, killing it on timeout.

@@ -66,10 +66,16 @@ fn on(
         return Err(Error::Message(format!("{e}; the hold was NOT enabled")));
     }
 
+    // The foreground success is a genuine key use: send its wall-clock
+    // moment so the daemon records it as the hold's first successful ping
+    // (an immediate `status` then reports it instead of "Last ping: -").
+    let activated_at_ms = now_ms();
+
     let request = Request::On {
         key,
         interval_ms: interval.as_millis() as u64,
         hold_ms: hold_for.map(|d| d.as_millis() as u64),
+        activated_at_ms,
     };
     check(ipc::request(&request)?)?;
 

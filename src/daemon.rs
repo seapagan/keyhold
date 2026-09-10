@@ -21,7 +21,7 @@ use std::{
     process::{Command, Stdio},
     sync::{Arc, Condvar, Mutex, MutexGuard},
     thread,
-    time::{Duration, Instant, SystemTime},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use crate::{
@@ -265,6 +265,7 @@ fn apply(request: Request, pair: &Pair) -> (Response, bool) {
             key,
             interval_ms,
             hold_ms,
+            activated_at_ms,
         } => {
             if interval_ms == 0 {
                 return (
@@ -272,11 +273,16 @@ fn apply(request: Request, pair: &Pair) -> (Response, bool) {
                     false,
                 );
             }
+            // The client sends the wall-clock moment of the successful
+            // foreground key use; it becomes the hold's first recorded ping.
+            let activated =
+                UNIX_EPOCH + Duration::from_millis(activated_at_ms);
             shared.hold.turn_on(
                 key,
                 Duration::from_millis(interval_ms),
                 hold_ms.map(Duration::from_millis),
                 Instant::now(),
+                activated,
             );
             pair.1.notify_all();
             (Response::ok(), false)

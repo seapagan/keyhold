@@ -79,18 +79,26 @@ impl Default for Hold {
 
 impl Hold {
     /// Enable (or replace) the hold at time `now`.
+    ///
+    /// `activated` is the wall-clock time of the successful key use that
+    /// justifies the hold (the foreground ping of `keyhold on`); it becomes
+    /// `last_ping`, so an immediate `status` reports the activation and a
+    /// replacement hold never displays a timestamp inherited from the hold
+    /// it replaced.
     pub fn turn_on(
         &mut self,
         key: Option<String>,
         interval: Duration,
         hold_for: Option<Duration>,
         now: Instant,
+        activated: SystemTime,
     ) {
         self.enabled = true;
         self.key = key;
         self.interval = interval;
         self.deadline = hold_for.map(|d| now + d);
         self.next_ping = Some(now + interval);
+        self.last_ping = Some(activated);
         self.last_error = None;
         self.generation += 1;
     }
@@ -188,11 +196,16 @@ mod tests {
         Instant::now()
     }
 
+    /// Synthetic wall-clock instant for activation timestamps.
+    fn wall(secs: u64) -> SystemTime {
+        UNIX_EPOCH + Duration::from_secs(secs)
+    }
+
     #[test]
     fn first_ping_is_scheduled_one_interval_after_on() {
         let mut hold = Hold::default();
         let start = t0();
-        hold.turn_on(Some("ABCD".into()), MINUTE, None, start);
+        hold.turn_on(Some("ABCD".into()), MINUTE, None, start, wall(1_000));
         assert_eq!(hold.due_action(start), None);
         assert_eq!(hold.due_action(start + MINUTE), Some(Action::Ping));
         assert_eq!(hold.next_wake(start), Some(start + MINUTE));
@@ -203,7 +216,7 @@ mod tests {
     fn deadline_wins_over_ping() {
         let mut hold = Hold::default();
         let start = t0();
-        hold.turn_on(None, MINUTE, Some(MINUTE), start);
+        hold.turn_on(None, MINUTE, Some(MINUTE), start, wall(1_000));
         assert_eq!(hold.due_action(start + MINUTE), Some(Action::Expire));
     }
 
@@ -211,7 +224,7 @@ mod tests {
     fn turn_off_stops_all_scheduling() {
         let mut hold = Hold::default();
         let start = t0();
-        hold.turn_on(None, MINUTE, Some(MINUTE), start);
+        hold.turn_on(None, MINUTE, Some(MINUTE), start, wall(1_000));
         hold.turn_off();
         assert!(!hold.enabled);
         assert_eq!(hold.due_action(start + 10 * MINUTE), None);
@@ -223,7 +236,7 @@ mod tests {
     fn ping_failure_disables_and_retains_error() {
         let mut hold = Hold::default();
         let start = t0();
-        hold.turn_on(None, MINUTE, None, start);
+        hold.turn_on(None, MINUTE, None, start, wall(1_000));
         hold.record_ping_failure(
             "gpg: signing failed: Operation cancelled".into(),
         );
@@ -239,7 +252,7 @@ mod tests {
     fn successful_ping_reschedules() {
         let mut hold = Hold::default();
         let start = t0();
-        hold.turn_on(None, MINUTE, None, start);
+        hold.turn_on(None, MINUTE, None, start, wall(1_000));
         let pinged_at = start + MINUTE;
         hold.record_ping_ok(pinged_at, SystemTime::now());
         assert_eq!(hold.due_action(pinged_at), None);
@@ -251,10 +264,16 @@ mod tests {
     fn repeated_on_replaces_deadline_and_bumps_generation() {
         let mut hold = Hold::default();
         let start = t0();
-        hold.turn_on(None, MINUTE, Some(MINUTE), start);
+        hold.turn_on(None, MINUTE, Some(MINUTE), start, wall(1_000));
         let generation = hold.generation;
         let later = start + Duration::from_secs(10);
-        hold.turn_on(Some("K".into()), Duration::from_secs(30), None, later);
+        hold.turn_on(
+            Some("K".into()),
+            Duration::from_secs(30),
+            None,
+            later,
+            wall(2_000),
+        );
         assert_eq!(hold.generation, generation + 1);
         assert_eq!(hold.deadline, None);
         assert_eq!(hold.next_ping, Some(later + Duration::from_secs(30)));
@@ -265,10 +284,41 @@ mod tests {
     fn timed_hold_counts_down() {
         let mut hold = Hold::default();
         let start = t0();
-        hold.turn_on(None, MINUTE, Some(Duration::from_secs(3600)), start);
+        hold.turn_on(
+            None,
+            MINUTE,
+            Some(Duration::from_secs(3600)),
+            start,
+            wall(1_000),
+        );
         assert_eq!(
             hold.remaining(start + Duration::from_secs(60)),
             Some(Duration::from_secs(3540))
         );
+    }
+
+    #[test]
+    fn activation_is_recorded_as_the_first_successful_use() {
+        let mut hold = Hold::default();
+        let start = t0();
+        let activated = wall(1_234);
+        hold.turn_on(None, MINUTE, None, start, activated);
+        assert_eq!(hold.last_ping, Some(activated));
+        // The activation is already the latest successful use; the first
+        // *background* ping stays one full interval after activation.
+        assert_eq!(hold.due_action(start), None);
+        assert_eq!(hold.next_ping, Some(start + MINUTE));
+    }
+
+    #[test]
+    fn replacing_a_hold_never_inherits_the_previous_last_ping() {
+        let mut hold = Hold::default();
+        let start = t0();
+        hold.turn_on(None, MINUTE, None, start, wall(1_000));
+        hold.record_ping_ok(start + MINUTE, wall(1_060));
+        let later = start + 2 * MINUTE;
+        let fresh = wall(2_000);
+        hold.turn_on(Some("K".into()), MINUTE, None, later, fresh);
+        assert_eq!(hold.last_ping, Some(fresh));
     }
 }

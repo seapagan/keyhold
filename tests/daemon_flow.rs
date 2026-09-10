@@ -185,8 +185,63 @@ fn failed_foreground_unlock_leaves_hold_off() {
 
     let text = env.status();
     assert!(text.contains("Hold:   off"), "{text}");
+    // The failed activation enabled nothing and recorded no successful use.
+    let status = common::status_of(&env).expect("status via IPC");
+    assert_eq!(status["hold_on"], false);
+    assert!(status["last_ping_ms"].is_null());
     // The foreground ping was really attempted.
     assert!(env.gpg_log().contains("--detach-sign"));
+}
+
+#[test]
+fn activation_is_reported_as_the_last_ping() {
+    let env = TestEnv::new();
+    let before = now_ms();
+    env.succeed(&["on"]);
+
+    // The successful foreground key use is recorded immediately: an
+    // instant `status` is truthful instead of "Last ping: -".
+    let status = common::status_of(&env).expect("status via IPC");
+    let last = status["last_ping_ms"]
+        .as_u64()
+        .expect("activation not recorded");
+    assert!(last >= before, "stale or missing activation: {status}");
+
+    let text = env.status();
+    assert!(text.contains("Last ping: "), "{text}");
+    assert!(!text.contains("Last ping: -"), "{text}");
+
+    // The activation is not itself a background ping: the first keepalive
+    // stays one full interval after activation.
+    assert!(!env.gpg_log().contains("cancel"), "{}", env.gpg_log());
+}
+
+#[test]
+fn replacing_a_hold_records_a_fresh_activation() {
+    let env = TestEnv::new();
+    // Start a hold whose last background ping is now in the past.
+    env.succeed(&["on", "--interval", "100ms", "--for", "1s"]);
+    assert!(wait_for_status(&env, "Hold:   off", 5 * SECS));
+
+    let replaced_at = now_ms();
+    env.succeed(&["on"]);
+
+    // The replacement must display its own activation, never a timestamp
+    // inherited from the expired hold's last background ping.
+    let status = common::status_of(&env).expect("status via IPC");
+    let last = status["last_ping_ms"]
+        .as_u64()
+        .expect("activation not recorded");
+    assert!(last >= replaced_at, "stale previous-hold ping: {status}");
+}
+
+/// Current wall-clock time in epoch milliseconds.
+fn now_ms() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 #[test]

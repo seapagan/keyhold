@@ -38,6 +38,11 @@ pub enum Request {
         interval_ms: u64,
         /// Hold duration in milliseconds; `None` for an indefinite hold.
         hold_ms: Option<u64>,
+        /// Epoch milliseconds of the successful foreground key use that
+        /// justifies this request. The daemon records it as the hold's
+        /// first successful ping, so an immediate `status` is truthful and
+        /// a replacement hold never displays the previous hold's timestamp.
+        activated_at_ms: u64,
     },
     /// Disable the hold.
     Off,
@@ -172,6 +177,7 @@ mod tests {
             key: Some("ABCD".into()),
             interval_ms: 300_000,
             hold_ms: Some(7_200_000),
+            activated_at_ms: 1_700_000_000_000,
         };
         let json = serde_json::to_string(&req).unwrap();
         assert!(json.contains("\"cmd\":\"on\""), "{json}");
@@ -181,7 +187,8 @@ mod tests {
             Request::On {
                 key: Some(_),
                 interval_ms: 300_000,
-                hold_ms: Some(_)
+                hold_ms: Some(_),
+                activated_at_ms: 1_700_000_000_000
             }
         ));
 

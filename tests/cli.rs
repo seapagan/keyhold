@@ -91,6 +91,35 @@ fn zero_durations_are_rejected() {
 }
 
 #[test]
+fn daemon_help_lists_background_and_stop() {
+    let env = TestEnv::new();
+    let out = env.succeed(&["daemon", "--help"]);
+    let text = String::from_utf8_lossy(&out.stdout);
+    for needle in ["-b, --background", "--stop"] {
+        assert!(
+            text.contains(needle),
+            "daemon help missing {needle}:\n{text}"
+        );
+    }
+}
+
+#[test]
+fn background_conflicts_with_stop() {
+    let env = TestEnv::new();
+    for args in [
+        vec!["daemon", "--background", "--stop"],
+        vec!["daemon", "-b", "--stop"],
+    ] {
+        let out = env.fail(&args);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("cannot be used with"),
+            "keyhold {args:?} not rejected:\n{stderr}"
+        );
+    }
+}
+
+#[test]
 fn unknown_subcommand_is_rejected() {
     let env = TestEnv::new();
     env.fail(&["explode"]);

@@ -50,6 +50,8 @@ keyhold on --key <key-id> --for 2h
 keyhold on --interval 5m      # custom ping interval
 keyhold off                   # stop holding; cache expires naturally
 keyhold status                # what is happening right now
+keyhold daemon -b             # start the daemon detached; no hold, no GPG use
+keyhold daemon --stop         # shut the daemon down cleanly
 ```
 
 Output uses restrained semantic colour when writing to a terminal —
@@ -216,6 +218,10 @@ the cache entry regardless of activity.
 - `keyhold off` leaves the daemon running — it only stops the pings.
 - `keyhold daemon` runs the daemon in the foreground (for debugging or use
   under a service manager). A second instance refuses to start.
+- `keyhold daemon -b` (or `--background`) starts the daemon detached through
+  the same path `keyhold on` uses, then returns. It enables no hold and
+  never touches GPG; if the daemon is already running it reports that and
+  succeeds.
 - `keyhold daemon --stop` shuts the daemon down cleanly and removes its
   socket.
 - The daemon keeps no state across restarts: a fresh daemon starts with the

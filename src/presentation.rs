@@ -43,6 +43,17 @@ pub fn daemon_not_running() {
     println!("Daemon {}.", "not running".yellow());
 }
 
+/// Print the confirmation for `keyhold daemon --background`.
+pub fn daemon_started() {
+    println!("Daemon {}.", "started".green());
+}
+
+/// Print the notice that a background start found the daemon running
+/// (idempotent success).
+pub fn daemon_already_running() {
+    println!("Daemon {}.", "already running".yellow());
+}
+
 /// Print an application error to stderr with a red `error:` prefix.
 ///
 /// Rendered for the stderr target so colour follows stderr, not stdout.

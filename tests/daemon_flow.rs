@@ -8,6 +8,7 @@ use std::{
     io::{Read, Write},
     os::unix::{fs::PermissionsExt, net::UnixStream},
     process::{Command, Stdio},
+    thread,
     time::Duration,
 };
 
@@ -520,6 +521,69 @@ fn daemon_stop_removes_socket_and_auto_restart_works() {
 fn daemon_stop_without_daemon_is_fine() {
     let env = TestEnv::new();
     assert_eq!(env.stdout(&["daemon", "--stop"]), "Daemon not running.\n");
+}
+
+#[test]
+fn daemon_background_starts_detached_and_returns() {
+    let env = TestEnv::new();
+    assert_eq!(env.stdout(&["daemon", "-b"]), "Daemon started.\n");
+
+    let text = env.status();
+    assert!(text.contains("Daemon     running"), "{text}");
+    assert!(text.contains("Hold       off"), "{text}");
+    // Starting the daemon alone must never invoke GPG (or pinentry).
+    assert_eq!(env.gpg_log(), "");
+}
+
+#[test]
+fn daemon_long_background_flag_matches_short() {
+    let env = TestEnv::new();
+    assert_eq!(env.stdout(&["daemon", "--background"]), "Daemon started.\n");
+
+    let text = env.status();
+    assert!(text.contains("Daemon     running"), "{text}");
+    assert!(text.contains("Hold       off"), "{text}");
+    assert_eq!(env.gpg_log(), "");
+}
+
+#[test]
+fn repeated_background_start_is_idempotent() {
+    let env = TestEnv::new();
+    env.succeed(&["daemon", "-b"]);
+    assert_eq!(env.stdout(&["daemon", "-b"]), "Daemon already running.\n");
+}
+
+#[test]
+fn background_daemon_can_be_stopped_normally() {
+    let env = TestEnv::new();
+    env.succeed(&["daemon", "-b"]);
+    assert_eq!(env.stdout(&["daemon", "--stop"]), "Daemon stopped.\n");
+    assert_eq!(
+        env.status(),
+        "Keyhold status\n\nDaemon     stopped\nHold       off\n"
+    );
+}
+
+#[test]
+fn daemon_without_flags_stays_in_the_foreground() {
+    let env = TestEnv::new();
+    let mut child = spawn_daemon(&env);
+    assert!(
+        wait_for_status(&env, "Daemon     running", 5 * SECS),
+        "foreground daemon did not start: {}",
+        env.status()
+    );
+
+    // Bare `daemon` blocks the terminal: it must not return on its own.
+    thread::sleep(Duration::from_millis(300));
+    assert!(
+        child.try_wait().unwrap().is_none(),
+        "foreground daemon exited without --stop"
+    );
+
+    env.succeed(&["daemon", "--stop"]);
+    wait_with_kill(&mut child, 5 * SECS);
+    assert!(child.wait().unwrap().success());
 }
 
 #[test]

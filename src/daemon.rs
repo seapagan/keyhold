@@ -36,7 +36,8 @@ use signal_hook::{
     iterator::Signals,
 };
 
-/// How long `keyhold on` waits for a freshly spawned daemon to answer.
+/// How long `keyhold on` and `keyhold daemon --background` wait for a
+/// freshly spawned daemon to answer.
 const START_TIMEOUT: Duration = Duration::from_secs(5);
 /// How long the daemon waits for a client to send its request.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
@@ -95,7 +96,7 @@ pub fn ensure_running() -> Result<bool> {
         // it instead of pointlessly trying to start a daemon.
         Err(e) => return Err(e),
     }
-    spawn_detached()?;
+    start_background()?;
     let deadline = Instant::now() + START_TIMEOUT;
     while Instant::now() < deadline {
         if connect().is_ok() {
@@ -108,10 +109,11 @@ pub fn ensure_running() -> Result<bool> {
 
 /// Start a detached daemon: `setsid` + exec of `keyhold daemon` with all
 /// standard streams pointed at `/dev/null`, so it survives the invoking
-/// terminal and never touches a TTY.
+/// terminal and never touches a TTY. This is the one detached-start path,
+/// shared by `keyhold on` and `keyhold daemon --background`.
 // The only `unsafe` in the crate lives in this function; see the SAFETY note.
 #[allow(unsafe_code)]
-fn spawn_detached() -> Result<()> {
+fn start_background() -> Result<()> {
     use std::os::unix::process::CommandExt;
 
     let exe = std::env::current_exe()?;

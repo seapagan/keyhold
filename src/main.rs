@@ -40,15 +40,29 @@ fn run(command: Command) -> Result<()> {
         } => on(key, git_key, r#for, interval),
         Command::Off => off(),
         Command::Status => status(),
-        Command::Daemon { stop } => {
+        Command::Daemon { stop, background } => {
             if stop {
                 daemon_stop()
+            } else if background {
+                daemon_background()
             } else {
                 // Foreground/debugging mode (also the detached entry point).
                 daemon::run(Gpg::detect()?)
             }
         }
     }
+}
+
+/// Start the daemon detached via the exact path `keyhold on` uses, then
+/// return immediately. This only starts the daemon: no hold is enabled,
+/// and neither GPG nor pinentry is invoked.
+fn daemon_background() -> Result<()> {
+    if daemon::ensure_running()? {
+        presentation::daemon_started();
+    } else {
+        presentation::daemon_already_running();
+    }
+    Ok(())
 }
 
 fn on(

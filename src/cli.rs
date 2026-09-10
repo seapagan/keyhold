@@ -67,8 +67,14 @@ pub enum Command {
     Off,
     /// Show whether the daemon and hold are active
     Status,
-    /// Run the daemon in the foreground, or stop a running daemon
+    /// Run the daemon in the foreground, start it in the background, or
+    /// stop a running daemon
     Daemon {
+        /// Start the daemon detached in the background (the same path
+        /// `keyhold on` uses) and return; no hold is enabled and GPG
+        /// is not touched
+        #[arg(short = 'b', long, conflicts_with = "stop")]
+        background: bool,
         /// Stop a running daemon instead of starting one
         #[arg(long)]
         stop: bool,

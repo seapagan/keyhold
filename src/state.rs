@@ -208,12 +208,18 @@ impl Hold {
                 .and_then(|d| u64::try_from(d.as_millis()).ok())
         };
         let wall = SystemTime::now();
+        // Duration length in milliseconds, when it fits the u64 IPC model.
+        // Values that cannot fit are never truncated: the interval
+        // saturates, and the remaining time is reported as absent, like
+        // `next_ping_ms`.
+        let millis =
+            |d: Duration| -> Option<u64> { u64::try_from(d.as_millis()).ok() };
         StatusData {
             hold_on: self.enabled,
             key: self.key.clone(),
             key_source: self.key_source,
-            interval_ms: self.interval.as_millis() as u64,
-            remaining_ms: self.remaining(now).map(|d| d.as_millis() as u64),
+            interval_ms: millis(self.interval).unwrap_or(u64::MAX),
+            remaining_ms: self.remaining(now).and_then(millis),
             last_ping_ms: self.last_ping.and_then(epoch),
             // Checked wall-clock projection: a far-future ping that cannot
             // be expressed in epoch milliseconds is reported as absent
@@ -295,6 +301,49 @@ mod tests {
         assert_eq!(hold.due_action(start + 10 * MINUTE), None);
         assert_eq!(hold.next_wake(start), None);
         assert_eq!(hold.remaining(start), None);
+    }
+
+    #[test]
+    fn status_reports_millisecond_fields_exactly() {
+        let mut hold = Hold::default();
+        let start = t0();
+        hold.turn_on(
+            None,
+            KeySource::Default,
+            MINUTE,
+            Some(MINUTE),
+            start,
+            wall(1_000),
+        )
+        .unwrap();
+
+        let status = hold.status();
+        assert_eq!(status.interval_ms, 60_000);
+        // `status` samples `Instant::now()` itself, so the remaining time
+        // can only have shrunk by the call overhead — never grown.
+        assert!(status.remaining_ms.is_some_and(|ms| ms <= 60_000));
+    }
+
+    #[test]
+    fn status_saturates_interval_beyond_the_u64_millisecond_model() {
+        let mut hold = Hold::default();
+        let start = t0();
+        hold.turn_on(
+            None,
+            KeySource::Default,
+            MINUTE,
+            Some(MINUTE),
+            start,
+            wall(1_000),
+        )
+        .unwrap();
+
+        // A millisecond length that overflows u64 cannot be scheduled
+        // through `turn_on` (the checked `Instant` add rejects it long
+        // before), so pin the field directly: the snapshot must saturate,
+        // never truncate.
+        hold.interval = Duration::from_secs(u64::MAX);
+        assert_eq!(hold.status().interval_ms, u64::MAX);
     }
 
     #[test]

@@ -41,6 +41,10 @@ use signal_hook::{
 const START_TIMEOUT: Duration = Duration::from_secs(5);
 /// How long the daemon waits for a client to send its request.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long the accept loop waits before retrying after a failed `accept`,
+/// so a persistent error (e.g. `EMFILE`) degrades to a slow poll instead
+/// of a busy spin.
+const ACCEPT_RETRY_DELAY: Duration = Duration::from_millis(100);
 
 /// Locations of the daemon's per-user runtime files.
 #[derive(Debug, Clone)]
@@ -247,11 +251,21 @@ fn lock(pair: &Pair) -> MutexGuard<'_, Shared> {
 
 fn accept_loop(listener: UnixListener, pair: Pair) {
     for stream in listener.incoming() {
-        if let Ok(stream) = stream {
-            let pair = Arc::clone(&pair);
-            let _ = thread::Builder::new()
-                .name("keyhold-conn".into())
-                .spawn(move || handle(stream, pair));
+        match stream {
+            Ok(stream) => {
+                let pair = Arc::clone(&pair);
+                let _ = thread::Builder::new()
+                    .name("keyhold-conn".into())
+                    .spawn(move || handle(stream, pair));
+            }
+            // A failing `accept` must not busy-spin the loop: report it
+            // and pause before the next attempt.
+            Err(e) => {
+                eprintln!(
+                    "keyhold: daemon: accepting a connection failed: {e}"
+                );
+                thread::sleep(ACCEPT_RETRY_DELAY);
+            }
         }
         if lock(&pair).shutdown {
             return;

@@ -3,10 +3,10 @@
 //! Colour policy is delegated entirely to `colored_text`: terminal
 //! detection, `NO_COLOR` / `FORCE_COLOR` / `CLICOLOR` handling and colour
 //! depth are the crate's job. This module only chooses which semantic
-
 //! fragments are styled — green for success/active states, yellow for
 //! inactive-but-valid states, red for errors, cyan for key identifiers
 //! and durations — and renders them to the right target. Redirected or
+//! captured output stays plain automatically.
 //!
 //! Styling is applied to individual fragments after any layout has been
 //! decided (labels stay plain, widths are computed from plain text), so

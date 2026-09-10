@@ -235,6 +235,80 @@ fn replacing_a_hold_records_a_fresh_activation() {
     assert!(last >= replaced_at, "stale previous-hold ping: {status}");
 }
 
+#[test]
+fn in_flight_ping_cannot_mutate_a_disabled_hold() {
+    let env = TestEnv::new();
+    // Background keepalives start, then stall for 2s before failing:
+    // `off` arrives while they are still running.
+    env.slow_background_pings();
+    env.fail_background_pings();
+    env.succeed(&["on", "--interval", "100ms", "--for", "1h"]);
+    assert!(
+        common::wait_until(5 * SECS, || log_count(&env, "cancel") >= 1),
+        "no background ping started: {}",
+        env.gpg_log()
+    );
+
+    env.succeed(&["off"]);
+
+    // Wait until every already-started keepalive has finished (failing);
+    // none of those late results may re-enable the hold or record an error.
+    assert!(
+        common::wait_until(10 * SECS, || {
+            log_count(&env, "bg-done") == log_count(&env, "cancel")
+        }),
+        "in-flight pings never finished: {}",
+        env.gpg_log()
+    );
+    let text = env.status();
+    assert!(text.contains("Hold:   off"), "{text}");
+    assert!(!text.contains("Error:"), "{text}");
+    assert!(text.contains("Daemon: running"), "{text}");
+}
+
+#[test]
+fn in_flight_ping_cannot_mutate_a_replaced_hold() {
+    let env = TestEnv::new();
+    env.slow_background_pings();
+    env.fail_background_pings();
+    env.succeed(&["on", "--interval", "100ms", "--for", "1h"]);
+    assert!(
+        common::wait_until(5 * SECS, || log_count(&env, "cancel") >= 1),
+        "no background ping started: {}",
+        env.gpg_log()
+    );
+
+    // Replace the hold while the old hold's keepalives are in flight; the
+    // new hold's first background ping is 30s out, so nothing else runs.
+    let replaced_at = now_ms();
+    env.succeed(&["on", "--key", "NEWKEY", "--interval", "30s"]);
+
+    assert!(
+        common::wait_until(10 * SECS, || {
+            log_count(&env, "bg-done") == log_count(&env, "cancel")
+        }),
+        "in-flight pings never finished: {}",
+        env.gpg_log()
+    );
+    let text = env.status();
+    assert!(text.contains("Hold:   on"), "{text}");
+    assert!(text.contains("Key:    NEWKEY"), "{text}");
+    assert!(!text.contains("Error:"), "{text}");
+    assert!(text.contains("Daemon: running"), "{text}");
+
+    // The replacement's activation remains the latest successful use.
+    let status = common::status_of(&env).expect("status via IPC");
+    let last = status["last_ping_ms"]
+        .as_u64()
+        .expect("activation not recorded");
+    assert!(last >= replaced_at, "stale ping mutated state: {status}");
+}
+
+/// Number of fake-gpg log lines containing `needle`.
+fn log_count(env: &TestEnv, needle: &str) -> usize {
+    env.gpg_log().lines().filter(|l| l.contains(needle)).count()
+}
+
 /// Current wall-clock time in epoch milliseconds.
 fn now_ms() -> u64 {
     use std::time::{SystemTime, UNIX_EPOCH};

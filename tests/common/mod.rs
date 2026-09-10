@@ -30,6 +30,7 @@ pub struct TestEnv {
     pub log: PathBuf,
     fail_all: PathBuf,
     fail_bg: PathBuf,
+    slow_bg: PathBuf,
 }
 
 impl TestEnv {
@@ -41,11 +42,16 @@ impl TestEnv {
         let log = scratch.path().join("gpg.log");
         let fail_all = scratch.path().join("fail-all");
         let fail_bg = scratch.path().join("fail-bg");
+        let slow_bg = scratch.path().join("slow-bg");
         let script = concat!(
             "#!/bin/sh\n",
             "echo \"$*\" >> \"$KEYHOLD_FAKE_LOG\"\n",
             "background=0\n",
             "for a in \"$@\"; do [ \"$a\" = cancel ] && background=1; done\n",
+            "if [ \"$background\" = 1 ] && [ -e \"$KEYHOLD_FAKE_SLOW_BG\" ]; then\n",
+            "  sleep 2\n",
+            "  echo bg-done >> \"$KEYHOLD_FAKE_LOG\"\n",
+            "fi\n",
             "if [ \"$background\" = 1 ] && [ -e \"$KEYHOLD_FAKE_FAIL_BG\" ]; then\n",
             "  echo 'gpg: signing failed: Operation cancelled' >&2\n",
             "  exit 2\n",
@@ -62,6 +68,7 @@ impl TestEnv {
             log,
             fail_all,
             fail_bg,
+            slow_bg,
             runtime,
             config,
             scratch,
@@ -77,7 +84,8 @@ impl TestEnv {
             .env("KEYHOLD_GPG", &self.gpg)
             .env("KEYHOLD_FAKE_LOG", &self.log)
             .env("KEYHOLD_FAKE_FAIL_ALL", &self.fail_all)
-            .env("KEYHOLD_FAKE_FAIL_BG", &self.fail_bg);
+            .env("KEYHOLD_FAKE_FAIL_BG", &self.fail_bg)
+            .env("KEYHOLD_FAKE_SLOW_BG", &self.slow_bg);
         cmd
     }
 
@@ -125,6 +133,12 @@ impl TestEnv {
     /// Make only background (daemon) pings fail, like an expired cache.
     pub fn fail_background_pings(&self) {
         fs::write(&self.fail_bg, b"1").expect("write fail-bg marker");
+    }
+
+    /// Make background (daemon) pings take 2s, so keepalives are still
+    /// in flight when `off`/`on` transitions happen.
+    pub fn slow_background_pings(&self) {
+        fs::write(&self.slow_bg, b"1").expect("write slow-bg marker");
     }
 
     pub fn sock(&self) -> PathBuf {

@@ -466,10 +466,53 @@ fn daemon_stop_is_always_acknowledged() {
         assert_eq!(env.stdout(&["daemon", "--stop"]), "Daemon stopped.\n");
         wait_with_kill(&mut daemon, 5 * SECS);
         assert!(
+            daemon.wait().unwrap().success(),
+            "daemon did not exit successfully after --stop"
+        );
+        assert!(
             common::wait_until(5 * SECS, || !env.sock().exists()),
             "socket file was not removed"
         );
     }
+}
+
+#[test]
+fn shutdown_for_a_vanished_client_still_terminates_cleanly() {
+    // A client that sends a valid shutdown request and then breaks the
+    // connection cannot be acknowledged — delivery over the broken socket
+    // is impossible. The daemon must report the write failure, still
+    // honour the shutdown, exit successfully and clean up its socket;
+    // whether the kernel actually surfaces EPIPE for the single small
+    // write does not change that contract.
+    let env = TestEnv::new();
+    let mut daemon = env
+        .keyhold(&["daemon"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    assert!(
+        wait_for_status(&env, "Daemon: running", 5 * SECS),
+        "daemon did not start: {}",
+        env.status()
+    );
+
+    let mut stream = UnixStream::connect(env.sock()).unwrap();
+    stream.write_all(b"{\"cmd\":\"shutdown\"}\n").unwrap();
+    let _ = stream.shutdown(std::net::Shutdown::Both);
+    drop(stream);
+
+    wait_with_kill(&mut daemon, 5 * SECS);
+    assert!(
+        daemon.wait().unwrap().success(),
+        "daemon did not exit successfully after broken-client shutdown"
+    );
+    assert!(
+        common::wait_until(5 * SECS, || !env.sock().exists()),
+        "socket file was not removed"
+    );
+    assert_eq!(env.status(), "Daemon: stopped\nHold:   off\n");
 }
 
 #[test]

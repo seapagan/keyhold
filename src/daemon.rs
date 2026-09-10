@@ -244,11 +244,16 @@ fn handle(stream: UnixStream, pair: Pair) {
         Err(e) => (Response::err(e.to_string()), false),
     };
     // A shutdown request may only take effect once its acknowledgement has
-    // been written (and flushed) to the socket: after these bytes are handed
-    // to the kernel the client can read them even if the daemon exits
-    // immediately afterwards. Setting the flag before the write let the
-    // scheduler tear the daemon down while the response was still in flight.
-    let _ = ipc::write_response(&stream, &response);
+    // been handed to the socket: after a successful write and flush the
+    // client can read the response even if the daemon exits immediately
+    // afterwards, and setting the flag before the write would reintroduce
+    // the exit-before-ack race. If the client already vanished, delivery is
+    // impossible over the broken socket: report the I/O error instead of
+    // silently discarding it, then still honour the already-valid shutdown
+    // request — there is nobody left to answer to.
+    if let Err(e) = ipc::write_response(&stream, &response) {
+        eprintln!("keyhold: daemon: writing response failed: {e}");
+    }
     if shutdown {
         lock(&pair).shutdown = true;
         pair.1.notify_all();

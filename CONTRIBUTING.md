@@ -13,6 +13,42 @@ cargo build
 Rust toolchain: see `rust-version` in `Cargo.toml` for the minimum supported
 version; development generally targets current stable.
 
+## Development tools
+
+The `cargo make` tasks (see `Makefile.toml`) rely on a few external tools.
+Required for the normal `cargo make verify` gate:
+
+| Tool | Needed by | Install |
+| ---- | --------- | ------- |
+| `cargo-make` | every `cargo make ...` task | `cargo install cargo-make` |
+| `cargo-nextest` | tests, coverage | `cargo install cargo-nextest --locked` |
+| `actionlint` | `verify` | [see notes below][actionlint-install] |
+| `zizmor` | `verify` | `pipx install zizmor` |
+
+Only needed for special-purpose tasks:
+
+| Tool | Needed by | Install |
+| ---- | --------- | ------- |
+| `cargo-llvm-cov` | coverage tasks | `cargo install cargo-llvm-cov --locked` |
+| `cargo-audit` | `audit` | `cargo install cargo-audit` |
+| `github-changelog-md` | `changelog` | `pipx install github-changelog-md` |
+
+Notes:
+
+- `cargo-nextest --locked` is mandatory: a plain `cargo install
+  cargo-nextest` fails by design.
+- `zizmor` also ships on PyPI (`uv tool install zizmor`), Homebrew and
+  crates.io (`cargo install --locked zizmor`).
+- `github-changelog-md` is a Python tool (>= 3.10);
+  `uv tool install github-changelog-md` works too.
+- `actionlint` is a Go binary: `go install
+  github.com/rhysd/actionlint/cmd/actionlint@latest`,
+  `brew install actionlint`, or a prebuilt binary from its releases.
+- CI pins `cargo-make@0.37.24` and `cargo-nextest@0.9.143`; matching those
+  versions locally avoids surprises.
+
+[actionlint-install]: https://github.com/rhysd/actionlint/releases
+
 ## Before opening a PR
 
 Run the full local gate:
@@ -32,9 +68,8 @@ cargo make msrv           # check against the minimum supported Rust
 cargo make changelog      # regenerate CHANGELOG.md
 ```
 
-The tasks live in `Makefile.toml` (requires `cargo-make`; the coverage tasks
-also need `cargo-llvm-cov`, and `verify` needs `actionlint` and `zizmor` on
-`PATH`).
+The tasks live in `Makefile.toml`; see *Development tools* above for the
+external tools they require.
 
 CI runs the same cargo-make tasks on Ubuntu 24.04 plus a Zizmor audit of the
 workflow files.

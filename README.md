@@ -274,6 +274,9 @@ cargo make msrv          # check against the minimum supported Rust
 cargo make changelog     # regenerate CHANGELOG.md
 ```
 
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the required development tools,
+the full task list, and contribution guidelines.
+
 Tests never touch your real keyring: integration tests point `KEYHOLD_GPG` at
 a fake `gpg` script. For manual smoke testing against real GnuPG, use a
 throwaway home:

@@ -1,0 +1,141 @@
+[env]
+MSRV_VERSION = "1.88"
+
+[tasks.format]
+description = "Check Rust formatting"
+command = "cargo"
+args = ["fmt", "--all", "--", "--check"]
+
+[tasks.check]
+description = "Check all targets and features"
+command = "cargo"
+args = ["check", "--all-targets", "--all-features", "--locked"]
+
+[tasks.clippy]
+description = "Run Clippy with warnings denied"
+command = "cargo"
+args = [
+  "clippy",
+  "--all-targets",
+  "--all-features",
+  "--locked",
+  "--",
+  "-D",
+  "warnings",
+]
+
+[tasks.test]
+description = "Run the test suite with cargo-nextest"
+command = "cargo"
+args = ["nextest", "run", "--all-targets", "--all-features", "--locked"]
+
+[tasks.doc]
+description = "Build documentation with rustdoc warnings denied"
+env = { "RUSTDOCFLAGS" = "-D warnings" }
+command = "cargo"
+args = ["doc", "--no-deps"]
+
+[tasks.build]
+description = "Build all targets and features"
+command = "cargo"
+args = ["build", "--all-targets", "--all-features", "--locked"]
+
+[tasks.release]
+description = "Build the optimized release binary"
+command = "cargo"
+args = ["build", "--release", "--locked"]
+
+[tasks.package]
+description = "Verify the crate packages cleanly"
+command = "cargo"
+args = ["package", "--locked"]
+
+[tasks.msrv-check]
+private = true
+install_crate = false
+command = "cargo"
+args = [
+  "+${MSRV_VERSION}",
+  "check",
+  "--all-targets",
+  "--all-features",
+  "--locked",
+]
+
+[tasks.msrv]
+description = "Check against the minimum supported Rust version"
+dependencies = ["msrv-check"]
+
+[tasks.audit]
+description = "Audit dependencies for known vulnerabilities (cargo audit)"
+command = "cargo"
+args = ["audit"]
+
+[tasks.actions-lint]
+description = "Validate GitHub Actions workflow syntax"
+command = "actionlint"
+
+[tasks.zizmor]
+description = "Audit GitHub Actions workflows with the pedantic persona"
+command = "zizmor"
+args = ["--persona=pedantic", ".github/workflows"]
+
+[tasks.prepare-coverage]
+private = true
+script_runner = "@duckscript"
+script = ["mkdir target/llvm-cov"]
+
+[tasks.coverage]
+# `clear` replaces cargo-make's built-in coverage task instead of merging
+# with it (the merge would combine incompatible action types).
+clear = true
+description = "Run tests and write repository-relative LCOV coverage"
+# Requires cargo-nextest and cargo-llvm-cov.
+dependencies = ["prepare-coverage"]
+command = "cargo"
+args = [
+  "llvm-cov",
+  "nextest",
+  "--all-targets",
+  "--all-features",
+  "--locked",
+  "--no-fail-fast",
+  "--remap-path-prefix",
+  "--lcov",
+  "--output-path=target/llvm-cov/coverage.lcov",
+]
+
+[tasks.coverage-html]
+description = "Run tests and generate a local HTML report (target/llvm-cov/html)"
+# Requires cargo-nextest and cargo-llvm-cov.
+command = "cargo"
+args = [
+  "llvm-cov",
+  "nextest",
+  "--all-targets",
+  "--all-features",
+  "--locked",
+  "--no-fail-fast",
+  "--remap-path-prefix",
+  "--html",
+]
+
+[tasks.changelog]
+description = "Update CHANGELOG.md with the latest merged PRs and closed issues"
+command = "github-changelog-md"
+args = ["${@}"]
+
+[tasks.verify]
+description = "Run the full local verification gate"
+dependencies = [
+  "format",
+  "check",
+  "clippy",
+  "test",
+  "doc",
+  "release",
+  "package",
+  "msrv",
+  "actions-lint",
+  "zizmor",
+]

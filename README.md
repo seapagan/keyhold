@@ -266,12 +266,12 @@ Run `keyhold on` again to unlock via the normal pinentry flow and resume.
 ## Development
 
 ```sh
-cargo fmt --all -- --check
-cargo check --all-targets --all-features --locked
-cargo clippy --all-targets --all-features --locked -- -D warnings
-cargo nextest run --all-targets --all-features --locked   # or: cargo test
-cargo doc --no-deps
-cargo package --locked
+cargo make verify        # full local gate: fmt, check, clippy, tests, docs,
+                         # release build, package, MSRV, actionlint, zizmor
+cargo make test          # tests only (cargo nextest)
+cargo make coverage-html # HTML coverage report in target/llvm-cov/html
+cargo make msrv          # check against the minimum supported Rust
+cargo make changelog     # regenerate CHANGELOG.md
 ```
 
 Tests never touch your real keyring: integration tests point `KEYHOLD_GPG` at

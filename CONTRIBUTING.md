@@ -18,16 +18,26 @@ version; development generally targets current stable.
 Run the full local gate:
 
 ```sh
-cargo fmt --all -- --check
-cargo check --all-targets --all-features --locked
-cargo clippy --all-targets --all-features --locked -- -D warnings
-cargo nextest run --all-targets --all-features --locked   # or: cargo test --locked
-cargo doc --no-deps
-cargo package --locked
+cargo make verify
 ```
 
-CI runs the same checks on Ubuntu 24.04 plus a Zizmor audit of the workflow
-files.
+That runs formatting, check, Clippy (`-D warnings`), tests (nextest), docs,
+release build, packaging, the MSRV check, `actionlint`, and Zizmor
+(pedantic). Other useful tasks:
+
+```sh
+cargo make test           # tests only (cargo nextest)
+cargo make coverage-html  # HTML coverage report in target/llvm-cov/html
+cargo make msrv           # check against the minimum supported Rust
+cargo make changelog      # regenerate CHANGELOG.md
+```
+
+The tasks live in `Makefile.toml` (requires `cargo-make`; the coverage tasks
+also need `cargo-llvm-cov`, and `verify` needs `actionlint` and `zizmor` on
+`PATH`).
+
+CI runs the same cargo-make tasks on Ubuntu 24.04 plus a Zizmor audit of the
+workflow files.
 
 ## Conventions
 

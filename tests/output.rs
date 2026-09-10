@@ -129,3 +129,65 @@ fn no_color_beats_forced_color() {
     assert_eq!(stdout, "Keyhold enabled for 30m.\n");
     assert!(!stdout.contains('\x1b'), "{stdout:?}");
 }
+
+#[test]
+fn status_uses_aligned_two_column_layout() {
+    const STOPPED: &str =
+        "Keyhold status\n\nDaemon     stopped\nHold       off\n";
+    const RUNNING_OFF: &str =
+        "Keyhold status\n\nDaemon     running\nHold       off\n";
+
+    // Stopped daemon: heading plus two rows, values in one column.
+    let env = TestEnv::new();
+    assert_eq!(env.status(), STOPPED);
+
+    // Running daemon, hold on: only meaningful rows, same value column.
+    env.succeed(&["on", "--for", "1h"]);
+    let text = env.status();
+    assert!(text.starts_with("Keyhold status\n\n"), "{text}");
+    let rows: Vec<&str> = text.lines().skip(2).collect();
+    assert_eq!(rows[0], "Daemon     running", "{text}");
+    assert_eq!(rows[1], "Hold       on", "{text}");
+    assert!(text.contains("Key        default"), "{text}");
+    assert!(text.contains("Interval   5m"), "{text}");
+    assert!(text.contains("Remaining  "), "{text}");
+    assert!(text.contains("Last ping  "), "{text}");
+    assert!(text.contains("Next ping  in "), "{text}");
+    for row in &rows {
+        assert!(
+            row.len() > 11
+                && !row[11..].is_empty()
+                && row[..11].ends_with("  "),
+            "misaligned row: {row:?}"
+        );
+    }
+
+    // Running daemon, hold off: timing/key/ping rows are omitted.
+    env.succeed(&["off"]);
+    assert_eq!(env.status(), RUNNING_OFF);
+}
+
+#[test]
+fn status_styling_does_not_shift_alignment() {
+    let env = TestEnv::new();
+    env.succeed(&["on", "--for", "1h"]);
+    let out = run_with(&env, &["status"], &[("FORCE_COLOR", "1")]);
+    assert!(out.status.success());
+    let stdout = text(&out.stdout);
+    assert!(stdout.contains('\x1b'), "not styled: {stdout:?}");
+
+    // Strip the ANSI sequences: the visible layout is identical to the
+    // plain rendering, so styling never affected the columns.
+    let plain = strip_ansi(&stdout);
+    assert!(plain.starts_with("Keyhold status\n\n"), "{plain}");
+    for row in plain.lines().skip(2) {
+        assert!(
+            row.len() > 11
+                && !row[11..].is_empty()
+                && row[..11].ends_with("  "),
+            "misaligned styled row: {row:?}"
+        );
+    }
+    assert!(plain.contains("Daemon     running"), "{plain}");
+    assert!(plain.contains("Hold       on"), "{plain}");
+}

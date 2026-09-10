@@ -14,7 +14,6 @@ use keyhold::{
     gpg::{Gpg, PingMode},
     ipc::{self, Request, Response},
     presentation,
-    state::StatusData,
 };
 
 fn main() -> ExitCode {
@@ -113,8 +112,7 @@ fn off() -> Result<()> {
 fn status() -> Result<()> {
     match daemon::connect() {
         Err(Error::DaemonNotRunning) => {
-            println!("Daemon: stopped");
-            println!("Hold:   off");
+            presentation::status_stopped();
             Ok(())
         }
         Err(e) => Err(e),
@@ -124,7 +122,7 @@ fn status() -> Result<()> {
             let data = response.status.ok_or_else(|| {
                 Error::Message("daemon returned no status".into())
             })?;
-            print_status(&data);
+            presentation::print_status(&data);
             Ok(())
         }
     }
@@ -163,48 +161,6 @@ fn check(response: Response) -> Result<()> {
         Err(Error::Daemon(
             response.error.unwrap_or_else(|| "unknown error".into()),
         ))
-    }
-}
-
-fn print_status(data: &StatusData) {
-    println!("Daemon: running");
-    println!("Hold:   {}", if data.hold_on { "on" } else { "off" });
-    if data.hold_on {
-        println!("Key:    {}", data.key.as_deref().unwrap_or("default"));
-        println!(
-            "Interval: {}",
-            humantime::format_duration(Duration::from_millis(
-                data.interval_ms
-            ))
-        );
-        match data.remaining_ms {
-            Some(ms) => println!(
-                "Expires: in {}",
-                humantime::format_duration(Duration::from_millis(ms))
-            ),
-            None => println!("Expires: never"),
-        }
-        let now = now_ms();
-        match data.last_ping_ms {
-            Some(ms) => println!(
-                "Last ping: {} ago",
-                humantime::format_duration(Duration::from_millis(
-                    now.saturating_sub(ms)
-                ))
-            ),
-            None => println!("Last ping: -"),
-        }
-        if let Some(ms) = data.next_ping_ms {
-            println!(
-                "Next ping: in {}",
-                humantime::format_duration(Duration::from_millis(
-                    ms.saturating_sub(now)
-                ))
-            );
-        }
-    }
-    if let Some(err) = &data.last_error {
-        println!("Error: {err}");
     }
 }
 

@@ -62,21 +62,25 @@ A typical session:
 
 ```text
 $ keyhold status
-Daemon: stopped
-Hold:   off
+Keyhold status
+
+Daemon     stopped
+Hold       off
 
 $ keyhold on --for 4h
 # Pinentry appears here if the key is not cached yet.
 Keyhold enabled for 4h.
 
 $ keyhold status
-Daemon: running
-Hold:   on
-Key:    default
-Interval: 5m
-Expires: in 3h 59m
-Last ping: 3s ago
-Next ping: in 4m 57s
+Keyhold status
+
+Daemon     running
+Hold       on
+Key        default
+Interval   5m
+Remaining  3h 59m
+Last ping  3s ago
+Next ping  in 4m 57s
 
 # Close the terminal and walk away; the daemon keeps the key cached.
 
@@ -84,8 +88,10 @@ $ keyhold off
 Keyhold disabled.
 
 $ keyhold status
-Daemon: running
-Hold:   off
+Keyhold status
+
+Daemon     running
+Hold       off
 ```
 
 ### What `on` does
@@ -192,9 +198,11 @@ nobody is watching. The daemon then:
 3. records the failure, shown by `keyhold status`:
 
 ```text
-Daemon: running
-Hold:   off
-Error: gpg keepalive failed: gpg: signing failed: Operation cancelled (exit status 2)
+Keyhold status
+
+Daemon     running
+Hold       off
+Error      gpg keepalive failed: gpg: signing failed: Operation cancelled (exit status 2)
 ```
 
 Run `keyhold on` again to unlock via the normal pinentry flow and resume.

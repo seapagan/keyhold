@@ -19,7 +19,10 @@ const SECS: Duration = Duration::from_secs(1);
 fn status_reports_stopped_when_no_daemon() {
     let env = TestEnv::new();
     let text = env.status();
-    assert_eq!(text, "Daemon: stopped\nHold:   off\n");
+    assert_eq!(
+        text,
+        "Keyhold status\n\nDaemon     stopped\nHold       off\n"
+    );
 }
 
 #[test]
@@ -33,14 +36,14 @@ fn on_enables_hold_after_foreground_ping() {
 
     let text = env.status();
     for needle in [
-        "Daemon: running",
-        "Hold:   on",
-        "Key:    default",
-        "Interval: 5m",
+        "Daemon     running",
+        "Hold       on",
+        "Key        default",
+        "Interval   5m",
     ] {
         assert!(text.contains(needle), "status missing {needle:?}:\n{text}");
     }
-    assert!(text.contains("Expires: never"), "{text}");
+    assert!(text.contains("Remaining  never"), "{text}");
 
     // The foreground ping must be a real signing invocation without the
     // background `cancel` pinentry mode.
@@ -57,9 +60,9 @@ fn on_with_key_and_duration_reports_details() {
     let env = TestEnv::new();
     env.succeed(&["on", "--key", "DEADBEEF", "--for", "2h"]);
     let text = env.status();
-    assert!(text.contains("Key:    DEADBEEF"), "{text}");
-    assert!(text.contains("Expires: in 1h"), "{text}");
-    assert!(text.contains("Interval: 5m"), "{text}");
+    assert!(text.contains("Key        DEADBEEF"), "{text}");
+    assert!(text.contains("Remaining  1h"), "{text}");
+    assert!(text.contains("Interval   5m"), "{text}");
 
     let log = env.gpg_log();
     assert!(log.contains("--local-user DEADBEEF"), "{log}");
@@ -70,12 +73,12 @@ fn repeated_on_replaces_the_hold() {
     let env = TestEnv::new();
     env.succeed(&["on", "--for", "1h"]);
     env.succeed(&["on", "--for", "3h"]);
-    assert!(env.status().contains("Expires: in 2h"));
+    assert!(env.status().contains("Remaining  2h"));
 
     env.succeed(&["on", "--key", "XYZ"]);
     let text = env.status();
-    assert!(text.contains("Expires: never"), "{text}");
-    assert!(text.contains("Key:    XYZ"), "{text}");
+    assert!(text.contains("Remaining  never"), "{text}");
+    assert!(text.contains("Key        XYZ"), "{text}");
 }
 
 #[test]
@@ -88,8 +91,8 @@ fn off_disables_and_is_idempotent() {
     assert_eq!(env.stdout(&["off"]), "Keyhold disabled.\n");
 
     let text = env.status();
-    assert!(text.contains("Daemon: running"), "{text}");
-    assert!(text.contains("Hold:   off"), "{text}");
+    assert!(text.contains("Daemon     running"), "{text}");
+    assert!(text.contains("Hold       off"), "{text}");
 
     assert_eq!(env.stdout(&["off"]), "Keyhold disabled.\n");
 }
@@ -98,15 +101,15 @@ fn off_disables_and_is_idempotent() {
 fn timed_hold_expires_by_itself() {
     let env = TestEnv::new();
     env.succeed(&["on", "--for", "1s", "--interval", "200ms"]);
-    assert!(env.status().contains("Hold:   on"));
+    assert!(env.status().contains("Hold       on"));
     assert!(
-        wait_for_status(&env, "Hold:   off", 5 * SECS),
+        wait_for_status(&env, "Hold       off", 5 * SECS),
         "hold did not expire: {}",
         env.status()
     );
     let text = env.status();
-    assert!(text.contains("Daemon: running"), "{text}");
-    assert!(!text.contains("Error:"), "{text}");
+    assert!(text.contains("Daemon     running"), "{text}");
+    assert!(!text.contains("Error      "), "{text}");
 }
 
 #[test]
@@ -150,27 +153,27 @@ fn relative_gpg_override_survives_daemon_detachment() {
         "daemon did not ping via relative override, log: {}",
         env.gpg_log()
     );
-    assert!(env.status().contains("Hold:   on"));
+    assert!(env.status().contains("Hold       on"));
 }
 
 #[test]
 fn background_ping_failure_stops_hold_and_reports_error() {
     let env = TestEnv::new();
     env.succeed(&["on", "--interval", "200ms", "--for", "1h"]);
-    assert!(env.status().contains("Hold:   on"));
+    assert!(env.status().contains("Hold       on"));
 
     // Simulate the GPG cache disappearing: background pings now fail.
     env.fail_background_pings();
 
     assert!(
-        wait_for_status(&env, "Hold:   off", 5 * SECS),
+        wait_for_status(&env, "Hold       off", 5 * SECS),
         "hold did not stop: {}",
         env.status()
     );
     let text = env.status();
-    assert!(text.contains("Error:"), "{text}");
+    assert!(text.contains("Error      "), "{text}");
     assert!(text.contains("cancelled"), "{text}");
-    assert!(text.contains("Daemon: running"), "{text}");
+    assert!(text.contains("Daemon     running"), "{text}");
 }
 
 #[test]
@@ -184,7 +187,7 @@ fn failed_foreground_unlock_leaves_hold_off() {
     assert!(stderr.contains("NOT enabled"), "{stderr}");
 
     let text = env.status();
-    assert!(text.contains("Hold:   off"), "{text}");
+    assert!(text.contains("Hold       off"), "{text}");
     // The failed activation enabled nothing and recorded no successful use.
     let status = common::status_of(&env).expect("status via IPC");
     assert_eq!(status["hold_on"], false);
@@ -200,7 +203,7 @@ fn activation_is_reported_as_the_last_ping() {
     env.succeed(&["on"]);
 
     // The successful foreground key use is recorded immediately: an
-    // instant `status` is truthful instead of "Last ping: -".
+    // instant `status` reports it instead of omitting the row.
     let status = common::status_of(&env).expect("status via IPC");
     let last = status["last_ping_ms"]
         .as_u64()
@@ -208,8 +211,7 @@ fn activation_is_reported_as_the_last_ping() {
     assert!(last >= before, "stale or missing activation: {status}");
 
     let text = env.status();
-    assert!(text.contains("Last ping: "), "{text}");
-    assert!(!text.contains("Last ping: -"), "{text}");
+    assert!(text.contains("Last ping  "), "{text}");
 
     // The activation is not itself a background ping: the first keepalive
     // stays one full interval after activation.
@@ -221,7 +223,7 @@ fn replacing_a_hold_records_a_fresh_activation() {
     let env = TestEnv::new();
     // Start a hold whose last background ping is now in the past.
     env.succeed(&["on", "--interval", "100ms", "--for", "1s"]);
-    assert!(wait_for_status(&env, "Hold:   off", 5 * SECS));
+    assert!(wait_for_status(&env, "Hold       off", 5 * SECS));
 
     let replaced_at = now_ms();
     env.succeed(&["on"]);
@@ -261,9 +263,9 @@ fn in_flight_ping_cannot_mutate_a_disabled_hold() {
         env.gpg_log()
     );
     let text = env.status();
-    assert!(text.contains("Hold:   off"), "{text}");
-    assert!(!text.contains("Error:"), "{text}");
-    assert!(text.contains("Daemon: running"), "{text}");
+    assert!(text.contains("Hold       off"), "{text}");
+    assert!(!text.contains("Error      "), "{text}");
+    assert!(text.contains("Daemon     running"), "{text}");
 }
 
 #[test]
@@ -291,10 +293,10 @@ fn in_flight_ping_cannot_mutate_a_replaced_hold() {
         env.gpg_log()
     );
     let text = env.status();
-    assert!(text.contains("Hold:   on"), "{text}");
-    assert!(text.contains("Key:    NEWKEY"), "{text}");
-    assert!(!text.contains("Error:"), "{text}");
-    assert!(text.contains("Daemon: running"), "{text}");
+    assert!(text.contains("Hold       on"), "{text}");
+    assert!(text.contains("Key        NEWKEY"), "{text}");
+    assert!(!text.contains("Error      "), "{text}");
+    assert!(text.contains("Daemon     running"), "{text}");
 
     // The replacement's activation remains the latest successful use.
     let status = common::status_of(&env).expect("status via IPC");
@@ -329,11 +331,11 @@ fn extreme_timing_values_cannot_kill_the_daemon() {
     assert_eq!(status["interval_ms"].as_u64(), Some(u64::MAX));
     // The u64::MAX-ms ping is schedulable but its wall-clock projection
     // overflows epoch milliseconds: the field is absent, never zero
-    // (which the CLI would render as "Next ping: in 0s").
+    // (which the CLI would render as "Next ping  in 0s").
     assert!(status["next_ping_ms"].is_null(), "{status}");
     let text = env.status();
-    assert!(text.contains("Hold:   on"), "{text}");
-    assert!(!text.contains("Next ping:"), "{text}");
+    assert!(text.contains("Hold       on"), "{text}");
+    assert!(!text.contains("Next ping"), "{text}");
     // ...including the widest hold deadline; remaining stays near u64::MAX.
     let request = format!(
         "{{\"cmd\":\"on\",\"key\":null,\"interval_ms\":300000,\
@@ -352,7 +354,7 @@ fn extreme_timing_values_cannot_kill_the_daemon() {
     );
     // Ordinary intervals keep their next-ping display.
     let text = env.status();
-    assert!(text.contains("Next ping: in "), "{text}");
+    assert!(text.contains("Next ping  in "), "{text}");
     assert!(!text.contains("in 0s"), "{text}");
 
     // A zero interval stays a plain protocol error, not a crash.
@@ -372,7 +374,7 @@ fn extreme_timing_values_cannot_kill_the_daemon() {
 
     // The daemon is unharmed and fully operational afterwards.
     env.succeed(&["off"]);
-    assert!(env.status().contains("Daemon: running"));
+    assert!(env.status().contains("Daemon     running"));
 }
 
 #[test]
@@ -400,7 +402,7 @@ fn huge_activation_timestamp_does_not_disturb_the_daemon() {
     );
 
     env.succeed(&["off"]);
-    assert!(env.status().contains("Daemon: running"));
+    assert!(env.status().contains("Daemon     running"));
 }
 
 #[test]
@@ -416,7 +418,10 @@ fn unrepresentable_cli_durations_are_rejected_before_side_effects() {
         );
     }
     // Rejected before any side effect: no daemon was started, no GPG call.
-    assert_eq!(env.status(), "Daemon: stopped\nHold:   off\n");
+    assert_eq!(
+        env.status(),
+        "Keyhold status\n\nDaemon     stopped\nHold       off\n"
+    );
     assert_eq!(env.gpg_log(), "");
 }
 
@@ -451,10 +456,9 @@ fn status_shows_subsecond_remaining_and_ping_times() {
     // With a fresh hold, remaining and next-ping times are between one and
     // two seconds: the display must keep the millisecond remainder instead
     // of collapsing to whole seconds (or to "0s").
-    assert!(text.contains("Expires: in 1s "), "{text}");
-    assert!(text.contains("Next ping: in 1s "), "{text}");
-    assert!(text.contains("Last ping: "), "{text}");
-    assert!(!text.contains("Last ping: -"), "{text}");
+    assert!(text.contains("Remaining  1s "), "{text}");
+    assert!(text.contains("Next ping  in 1s "), "{text}");
+    assert!(text.contains("Last ping  "), "{text}");
 }
 
 #[test]
@@ -464,7 +468,7 @@ fn stale_socket_file_is_recovered() {
     fs::write(env.sock(), b"junk from a dead daemon").unwrap();
 
     env.succeed(&["on"]);
-    assert!(env.status().contains("Daemon: running"));
+    assert!(env.status().contains("Daemon     running"));
 }
 
 #[test]
@@ -478,7 +482,7 @@ fn second_foreground_daemon_is_rejected() {
         .spawn()
         .unwrap();
     assert!(
-        wait_for_status(&env, "Daemon: running", 5 * SECS),
+        wait_for_status(&env, "Daemon     running", 5 * SECS),
         "first daemon did not start"
     );
 
@@ -491,7 +495,7 @@ fn second_foreground_daemon_is_rejected() {
 
     env.succeed(&["daemon", "--stop"]);
     wait_with_kill(&mut first, 5 * SECS);
-    assert!(env.status().contains("Daemon: stopped"));
+    assert!(env.status().contains("Daemon     stopped"));
 }
 
 #[test]
@@ -500,13 +504,16 @@ fn daemon_stop_removes_socket_and_auto_restart_works() {
     env.succeed(&["on"]);
     assert_eq!(env.stdout(&["daemon", "--stop"]), "Daemon stopped.\n");
     assert!(common::wait_until(5 * SECS, || !env.sock().exists()));
-    assert_eq!(env.status(), "Daemon: stopped\nHold:   off\n");
+    assert_eq!(
+        env.status(),
+        "Keyhold status\n\nDaemon     stopped\nHold       off\n"
+    );
 
     // A subsequent `on` transparently starts a fresh daemon (hold was off).
     env.succeed(&["on"]);
     let text = env.status();
-    assert!(text.contains("Daemon: running"), "{text}");
-    assert!(text.contains("Hold:   on"), "{text}");
+    assert!(text.contains("Daemon     running"), "{text}");
+    assert!(text.contains("Hold       on"), "{text}");
 }
 
 #[test]
@@ -538,8 +545,8 @@ fn malformed_request_does_not_kill_daemon() {
     drop(stream);
 
     let text = env.status();
-    assert!(text.contains("Daemon: running"), "{text}");
-    assert!(text.contains("Hold:   on"), "{text}");
+    assert!(text.contains("Daemon     running"), "{text}");
+    assert!(text.contains("Hold       on"), "{text}");
 }
 
 /// Spawn a foreground daemon with all streams silenced.
@@ -566,7 +573,7 @@ fn sigterm_shuts_the_daemon_down_cleanly() {
     let env = TestEnv::new();
     let mut daemon = spawn_daemon(&env);
     assert!(
-        wait_for_status(&env, "Daemon: running", 5 * SECS),
+        wait_for_status(&env, "Daemon     running", 5 * SECS),
         "daemon did not start: {}",
         env.status()
     );
@@ -582,7 +589,10 @@ fn sigterm_shuts_the_daemon_down_cleanly() {
         common::wait_until(5 * SECS, || !env.sock().exists()),
         "socket file was not removed on SIGTERM"
     );
-    assert_eq!(env.status(), "Daemon: stopped\nHold:   off\n");
+    assert_eq!(
+        env.status(),
+        "Keyhold status\n\nDaemon     stopped\nHold       off\n"
+    );
 }
 
 #[test]
@@ -590,7 +600,7 @@ fn sigint_routes_through_the_same_clean_shutdown() {
     let env = TestEnv::new();
     let mut daemon = spawn_daemon(&env);
     assert!(
-        wait_for_status(&env, "Daemon: running", 5 * SECS),
+        wait_for_status(&env, "Daemon     running", 5 * SECS),
         "daemon did not start: {}",
         env.status()
     );
@@ -610,7 +620,7 @@ fn sigterm_with_active_hold_exits_promptly_and_restarts_cleanly() {
     let env = TestEnv::new();
     let mut daemon = spawn_daemon(&env);
     assert!(
-        wait_for_status(&env, "Daemon: running", 5 * SECS),
+        wait_for_status(&env, "Daemon     running", 5 * SECS),
         "daemon did not start: {}",
         env.status()
     );
@@ -636,7 +646,7 @@ fn sigterm_with_active_hold_exits_promptly_and_restarts_cleanly() {
     // The next daemon starts normally — no stale-socket recovery needed.
     let mut second = spawn_daemon(&env);
     assert!(
-        wait_for_status(&env, "Daemon: running", 5 * SECS),
+        wait_for_status(&env, "Daemon     running", 5 * SECS),
         "second daemon did not start: {}",
         env.status()
     );
@@ -672,7 +682,7 @@ fn daemon_stop_is_always_acknowledged() {
             .spawn()
             .unwrap();
         assert!(
-            wait_for_status(&env, "Daemon: running", 5 * SECS),
+            wait_for_status(&env, "Daemon     running", 5 * SECS),
             "daemon did not start: {}",
             env.status()
         );
@@ -706,7 +716,7 @@ fn shutdown_for_a_vanished_client_still_terminates_cleanly() {
         .spawn()
         .unwrap();
     assert!(
-        wait_for_status(&env, "Daemon: running", 5 * SECS),
+        wait_for_status(&env, "Daemon     running", 5 * SECS),
         "daemon did not start: {}",
         env.status()
     );
@@ -725,7 +735,10 @@ fn shutdown_for_a_vanished_client_still_terminates_cleanly() {
         common::wait_until(5 * SECS, || !env.sock().exists()),
         "socket file was not removed"
     );
-    assert_eq!(env.status(), "Daemon: stopped\nHold:   off\n");
+    assert_eq!(
+        env.status(),
+        "Keyhold status\n\nDaemon     stopped\nHold       off\n"
+    );
 }
 
 #[test]
@@ -774,7 +787,10 @@ fn invalid_config_is_reported() {
     assert!(stderr.contains("invalid configuration"), "{stderr}");
 
     // `status` does not need configuration and keeps working.
-    assert_eq!(env.status(), "Daemon: stopped\nHold:   off\n");
+    assert_eq!(
+        env.status(),
+        "Keyhold status\n\nDaemon     stopped\nHold       off\n"
+    );
 }
 
 #[test]
@@ -789,14 +805,14 @@ fn config_file_supplies_defaults_and_cli_wins() {
 
     env.succeed(&["on", "--for", "1h"]);
     let text = env.status();
-    assert!(text.contains("Key:    CAFEF00D"), "{text}");
-    assert!(text.contains("Interval: 9m"), "{text}");
+    assert!(text.contains("Key        CAFEF00D"), "{text}");
+    assert!(text.contains("Interval   9m"), "{text}");
 
     env.succeed(&["off"]);
     env.succeed(&["on", "--key", "0xBEEF", "--interval", "3m"]);
     let text = env.status();
-    assert!(text.contains("Key:    0xBEEF"), "{text}");
-    assert!(text.contains("Interval: 3m"), "{text}");
+    assert!(text.contains("Key        0xBEEF"), "{text}");
+    assert!(text.contains("Interval   3m"), "{text}");
 }
 
 #[test]

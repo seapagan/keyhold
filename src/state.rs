@@ -180,11 +180,13 @@ impl Hold {
     /// Build an IPC status snapshot.
     pub fn status(&self) -> StatusData {
         let now = Instant::now();
-        let epoch = |t: SystemTime| {
-            u64::try_from(
-                t.duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis()),
-            )
-            .unwrap_or(0)
+        // Wall-clock time as Unix epoch milliseconds, when representable.
+        // Pre-epoch or u64-overflowing values are absent — never epoch
+        // zero, which would display as "in 0s".
+        let epoch = |t: SystemTime| -> Option<u64> {
+            t.duration_since(UNIX_EPOCH)
+                .ok()
+                .and_then(|d| u64::try_from(d.as_millis()).ok())
         };
         let wall = SystemTime::now();
         StatusData {
@@ -192,12 +194,13 @@ impl Hold {
             key: self.key.clone(),
             interval_ms: self.interval.as_millis() as u64,
             remaining_ms: self.remaining(now).map(|d| d.as_millis() as u64),
-            last_ping_ms: self.last_ping.map(epoch),
-            // Checked wall-clock projection: an unrepresentable far-future
-            // ping is reported as absent rather than panicking.
+            last_ping_ms: self.last_ping.and_then(epoch),
+            // Checked wall-clock projection: a far-future ping that cannot
+            // be expressed in epoch milliseconds is reported as absent
+            // rather than panicking or collapsing to zero.
             next_ping_ms: self.next_ping.and_then(|p| {
                 wall.checked_add(p.saturating_duration_since(now))
-                    .map(epoch)
+                    .and_then(epoch)
             }),
             last_error: self.last_error.clone(),
         }
@@ -400,5 +403,35 @@ mod tests {
         assert_eq!(hold.next_ping, Some(start + interval));
         assert_eq!(hold.deadline, Some(start + interval));
         assert_eq!(hold.status().interval_ms, u64::MAX);
+    }
+
+    #[test]
+    fn unrepresentable_status_timestamps_are_absent_not_zero() {
+        // An ordinary interval projects onto a representable wall-clock
+        // instant: the next ping is reported in epoch milliseconds.
+        let mut hold = Hold::default();
+        let start = t0();
+        hold.turn_on(None, MINUTE, None, start, wall(1_000))
+            .unwrap();
+        let status = hold.status();
+        let next = status.next_ping_ms.expect("next ping present");
+        assert!(next > 1_700_000_000_000, "not epoch millis: {next}");
+        assert_eq!(status.last_ping_ms, Some(1_000_000));
+
+        // u64::MAX milliseconds stays schedulable monotonically, but the
+        // wall-clock projection overflows epoch milliseconds: the display
+        // field must be absent, never epoch zero ("in 0s").
+        hold.turn_on(
+            None,
+            Duration::from_millis(u64::MAX),
+            None,
+            start,
+            wall(1_000),
+        )
+        .unwrap();
+        assert!(hold.next_ping.is_some(), "monotonic schedule kept");
+        let status = hold.status();
+        assert_eq!(status.next_ping_ms, None);
+        assert_eq!(status.last_ping_ms, Some(1_000_000));
     }
 }

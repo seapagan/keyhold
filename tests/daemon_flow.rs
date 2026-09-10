@@ -327,7 +327,13 @@ fn extreme_timing_values_cannot_kill_the_daemon() {
     assert_eq!(response["ok"], true, "{response}");
     let status = common::status_of(&env).expect("status via IPC");
     assert_eq!(status["interval_ms"].as_u64(), Some(u64::MAX));
-
+    // The u64::MAX-ms ping is schedulable but its wall-clock projection
+    // overflows epoch milliseconds: the field is absent, never zero
+    // (which the CLI would render as "Next ping: in 0s").
+    assert!(status["next_ping_ms"].is_null(), "{status}");
+    let text = env.status();
+    assert!(text.contains("Hold:   on"), "{text}");
+    assert!(!text.contains("Next ping:"), "{text}");
     // ...including the widest hold deadline; remaining stays near u64::MAX.
     let request = format!(
         "{{\"cmd\":\"on\",\"key\":null,\"interval_ms\":300000,\
@@ -344,7 +350,10 @@ fn extreme_timing_values_cannot_kill_the_daemon() {
         remaining > u64::MAX - 60_000,
         "remaining not representable: {status}"
     );
-    assert!(env.status().contains("Hold:   on"));
+    // Ordinary intervals keep their next-ping display.
+    let text = env.status();
+    assert!(text.contains("Next ping: in "), "{text}");
+    assert!(!text.contains("in 0s"), "{text}");
 
     // A zero interval stays a plain protocol error, not a crash.
     let response = common::ipc_request(

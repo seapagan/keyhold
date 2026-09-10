@@ -7,7 +7,7 @@ use std::{
     fs,
     io::{Read, Write},
     os::unix::{fs::PermissionsExt, net::UnixStream},
-    process::Stdio,
+    process::{Command, Stdio},
     time::Duration,
 };
 
@@ -531,6 +531,108 @@ fn malformed_request_does_not_kill_daemon() {
     let text = env.status();
     assert!(text.contains("Daemon: running"), "{text}");
     assert!(text.contains("Hold:   on"), "{text}");
+}
+
+/// Spawn a foreground daemon with all streams silenced.
+fn spawn_daemon(env: &TestEnv) -> std::process::Child {
+    env.keyhold(&["daemon"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap()
+}
+
+/// Send a named signal to a child via `/usr/bin/kill` (no unsafe needed).
+fn send_signal(child: &std::process::Child, signal: &str) {
+    let ok = Command::new("kill")
+        .args([format!("-{signal}"), child.id().to_string()])
+        .status()
+        .expect("run kill");
+    assert!(ok.success(), "failed to send SIG{signal}");
+}
+
+#[test]
+fn sigterm_shuts_the_daemon_down_cleanly() {
+    let env = TestEnv::new();
+    let mut daemon = spawn_daemon(&env);
+    assert!(
+        wait_for_status(&env, "Daemon: running", 5 * SECS),
+        "daemon did not start: {}",
+        env.status()
+    );
+
+    send_signal(&daemon, "TERM");
+
+    wait_with_kill(&mut daemon, 5 * SECS);
+    assert!(
+        daemon.wait().unwrap().success(),
+        "daemon did not exit successfully on SIGTERM"
+    );
+    assert!(
+        common::wait_until(5 * SECS, || !env.sock().exists()),
+        "socket file was not removed on SIGTERM"
+    );
+    assert_eq!(env.status(), "Daemon: stopped\nHold:   off\n");
+}
+
+#[test]
+fn sigint_routes_through_the_same_clean_shutdown() {
+    let env = TestEnv::new();
+    let mut daemon = spawn_daemon(&env);
+    assert!(
+        wait_for_status(&env, "Daemon: running", 5 * SECS),
+        "daemon did not start: {}",
+        env.status()
+    );
+
+    send_signal(&daemon, "INT");
+
+    wait_with_kill(&mut daemon, 5 * SECS);
+    assert!(
+        daemon.wait().unwrap().success(),
+        "daemon did not exit successfully on SIGINT"
+    );
+    assert!(common::wait_until(5 * SECS, || !env.sock().exists()));
+}
+
+#[test]
+fn sigterm_with_active_hold_exits_promptly_and_restarts_cleanly() {
+    let env = TestEnv::new();
+    let mut daemon = spawn_daemon(&env);
+    assert!(
+        wait_for_status(&env, "Daemon: running", 5 * SECS),
+        "daemon did not start: {}",
+        env.status()
+    );
+
+    // Keepalives genuinely running when the signal arrives.
+    env.succeed(&["on", "--interval", "100ms"]);
+    assert!(
+        common::wait_until(5 * SECS, || log_count(&env, "cancel") >= 1),
+        "no background ping started: {}",
+        env.gpg_log()
+    );
+
+    send_signal(&daemon, "TERM");
+
+    // Prompt exit despite an active 100ms hold: shutdown stops scheduling.
+    wait_with_kill(&mut daemon, 5 * SECS);
+    assert!(daemon.wait().unwrap().success());
+    assert!(
+        common::wait_until(5 * SECS, || !env.sock().exists()),
+        "socket file was not removed on SIGTERM"
+    );
+
+    // The next daemon starts normally — no stale-socket recovery needed.
+    let mut second = spawn_daemon(&env);
+    assert!(
+        wait_for_status(&env, "Daemon: running", 5 * SECS),
+        "second daemon did not start: {}",
+        env.status()
+    );
+    env.succeed(&["daemon", "--stop"]);
+    wait_with_kill(&mut second, 5 * SECS);
 }
 
 #[test]

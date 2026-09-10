@@ -242,8 +242,11 @@ before submitting.
 ## Limitations
 
 - Linux only (v0.1).
+- The daemon handles `SIGTERM` (and `SIGINT` when running in the foreground)
+  with the same clean shutdown as `keyhold daemon --stop`: no new keepalive
+  pings are scheduled, the socket file is removed, and the process exits
+  successfully. A `SIGKILL` still abandons the socket file, but the next
+  start recovers it automatically.
 - One hold at a time: `on` replaces any existing hold.
-- The daemon does not catch `SIGTERM`; if it is killed forcibly the socket
-  file is left behind, but the next start recovers it automatically.
 - `keyhold` cannot extend a hold past GnuPG's `max-cache-ttl` ceiling; GnuPG
   itself imposes that limit.

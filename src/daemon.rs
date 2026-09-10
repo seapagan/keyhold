@@ -31,6 +31,11 @@ use crate::{
     state::{Action, Hold},
 };
 
+use signal_hook::{
+    consts::{SIGINT, SIGTERM},
+    iterator::Signals,
+};
+
 /// How long `keyhold on` waits for a freshly spawned daemon to answer.
 const START_TIMEOUT: Duration = Duration::from_secs(5);
 /// How long the daemon waits for a client to send its request.
@@ -141,7 +146,8 @@ fn spawn_detached() -> Result<()> {
     Ok(())
 }
 
-/// Run the daemon until a `shutdown` IPC request arrives.
+/// Run the daemon until a `shutdown` IPC request or a termination signal
+/// arrives.
 ///
 /// Returns cleanly after removing the socket file.
 pub fn run(gpg: Gpg) -> Result<()> {
@@ -154,6 +160,23 @@ pub fn run(gpg: Gpg) -> Result<()> {
         }),
         Condvar::new(),
     ));
+
+    // SIGTERM (service managers, plain `kill`) and SIGINT (Ctrl-C on a
+    // foreground daemon) run through the same shutdown path as a shutdown
+    // IPC request: set the flag, wake the scheduler, and let `run` below
+    // remove the socket and exit successfully. The iterator is self-pipe
+    // based, so nothing but async-signal-safe bookkeeping ever runs inside
+    // a signal handler.
+    let mut signals = Signals::new([SIGINT, SIGTERM])?;
+    let signal_pair = Arc::clone(&pair);
+    thread::Builder::new()
+        .name("keyhold-signals".into())
+        .spawn(move || {
+            if signals.forever().next().is_some() {
+                lock(&signal_pair).shutdown = true;
+                signal_pair.1.notify_all();
+            }
+        })?;
 
     let accept_pair = Arc::clone(&pair);
     thread::Builder::new()

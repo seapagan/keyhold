@@ -44,8 +44,13 @@ jobs:
           prefix-key: v1-${{ runner.os }}-rust-${{ env.MSRV_VERSION }}
           shared-key: msrv
 
+      - name: Install Cargo Make
+        uses: taiki-e/install-action@c3ec0de9ae7f1019cea21aa96aa0a895b9552063 # v2.87.9
+        with:
+          tool: cargo-make@0.37.24
+
       - name: Check all targets and features on MSRV
-        run: cargo check --all-targets --all-features --locked
+        run: cargo make msrv
 
   linux:
     name: Linux
@@ -69,28 +74,28 @@ jobs:
           prefix-key: v1-${{ runner.os }}-rust-${{ env.RUST_VERSION }}
           shared-key: linux
 
-      - name: Install cargo-nextest
+      - name: Install Cargo tools
         uses: taiki-e/install-action@c3ec0de9ae7f1019cea21aa96aa0a895b9552063 # v2.87.9
         with:
-          tool: cargo-nextest@0.9.143
+          tool: cargo-make@0.37.24, cargo-nextest@0.9.143
 
       - name: Check formatting
-        run: cargo fmt --all -- --check
+        run: cargo make format
 
       - name: Check all targets and features
-        run: cargo check --all-targets --all-features --locked
+        run: cargo make check
 
       - name: Lint with Clippy (warnings denied)
-        run: cargo clippy --all-targets --all-features --locked -- -D warnings
+        run: cargo make clippy
 
       - name: Run tests
-        run: cargo nextest run --all-targets --all-features --locked
+        run: cargo make test
 
       - name: Build Rust documentation
-        run: cargo doc --no-deps
+        run: cargo make doc
 
       - name: Build release binary
-        run: cargo build --release --locked
+        run: cargo make release
 
       - name: Verify crate is packageable
-        run: cargo package --locked
+        run: cargo make package

@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     daemon,
     error::{Error, Result},
-    state::StatusData,
+    state::{KeySource, StatusData},
 };
 
 /// Largest request line accepted (defensive; real requests are tiny).
@@ -34,6 +34,9 @@ pub enum Request {
     On {
         /// Key selector, or `None` for GPG's default key.
         key: Option<String>,
+        /// Where the key selector came from (resolved client-side; the
+        /// daemon never consults Git).
+        key_source: KeySource,
         /// Ping interval in milliseconds (must be positive).
         interval_ms: u64,
         /// Hold duration in milliseconds; `None` for an indefinite hold.
@@ -44,7 +47,6 @@ pub enum Request {
         /// a replacement hold never displays the previous hold's timestamp.
         activated_at_ms: u64,
     },
-    /// Disable the hold.
     Off,
     /// Request a status snapshot.
     Status,
@@ -175,23 +177,25 @@ mod tests {
     fn requests_roundtrip_through_json() {
         let req = Request::On {
             key: Some("ABCD".into()),
+            key_source: KeySource::Git,
             interval_ms: 300_000,
             hold_ms: Some(7_200_000),
             activated_at_ms: 1_700_000_000_000,
         };
         let json = serde_json::to_string(&req).unwrap();
         assert!(json.contains("\"cmd\":\"on\""), "{json}");
+        assert!(json.contains("\"key_source\":\"git\""), "{json}");
         let back: Request = serde_json::from_str(&json).unwrap();
         assert!(matches!(
             back,
             Request::On {
                 key: Some(_),
+                key_source: KeySource::Git,
                 interval_ms: 300_000,
                 hold_ms: Some(_),
                 activated_at_ms: 1_700_000_000_000
             }
         ));
-
         let json = serde_json::to_string(&Request::Off).unwrap();
         assert_eq!(json, "{\"cmd\":\"off\"}");
     }

@@ -20,6 +20,7 @@ pub mod cli;
 pub mod config;
 pub mod daemon;
 pub mod error;
+pub mod git;
 pub mod gpg;
 pub mod ipc;
 pub mod presentation;

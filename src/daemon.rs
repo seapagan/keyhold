@@ -291,6 +291,7 @@ fn apply(request: Request, pair: &Pair) -> (Response, bool) {
         Request::Ping => (Response::ok(), false),
         Request::On {
             key,
+            key_source,
             interval_ms,
             hold_ms,
             activated_at_ms,
@@ -316,6 +317,7 @@ fn apply(request: Request, pair: &Pair) -> (Response, bool) {
             };
             match shared.hold.turn_on(
                 key,
+                key_source,
                 Duration::from_millis(interval_ms),
                 hold_ms.map(Duration::from_millis),
                 Instant::now(),

@@ -118,9 +118,37 @@ the key just resumes its normal idle countdown from the last use.
 
 ### Selecting a key
 
-`--key` accepts anything `gpg --local-user` accepts (full fingerprint, long or
-short key id). Without it, GPG's normal default-key selection applies. The
-key can also be set in the config file; the CLI flag wins.
+There are three key-selection modes.
+
+**GnuPG default** — plain `keyhold on` passes no key selector, so GnuPG
+chooses its normal/default signing key. This is what happens with no
+key-related options or configuration; Git configuration is irrelevant
+unless Git-key mode is explicitly requested.
+
+**Explicit key** — `keyhold on --key ABCDEF0123456789` (or `key = "..."`
+in the config file). `--key` accepts anything `gpg --local-user` accepts
+(full fingerprint, long or short key id).
+
+**Git signing key** — `keyhold on --git-key` (or `git_key = true` in the
+config file) resolves Git's effective `user.signingkey` and uses that
+value exactly like an explicit key, for both the foreground unlock and
+the daemon's keepalives. Git itself performs the resolution with its
+normal configuration precedence, so inside a repository the local
+`user.signingkey` naturally overrides the global one. The value is
+resolved once, when the hold is enabled; the daemon never consults Git
+afterwards, and the hold keeps the originally resolved key until the
+next `keyhold on`. If Git reports no signing key, `on` fails clearly
+without starting anything.
+
+`--key` and `--git-key` are mutually exclusive. Precedence when several
+sources are configured: `--key` > `--git-key` > config `key` >
+config `git_key` > GnuPG default.
+
+Git-selected holds show the source in `keyhold status`:
+
+```text
+Key        ABCDEF0123456789 (git)
+```
 
 ## Configuration
 
@@ -128,13 +156,17 @@ Optional file at `$XDG_CONFIG_HOME/keyhold/config.toml`
 (`~/.config/keyhold/config.toml` by default):
 
 ```toml
-key = "ABCD1234EFGH5678"   # optional; omit for GPG's default key
+key = "ABCD1234EFGH5678"   # optional static key; omit for GPG's default key
+git_key = true             # optional; use Git's user.signingkey by default
 interval = "5m"            # optional; default 5m
 ```
 
+Setting both `key` and `git_key = true` is rejected as an invalid
+configuration: choose one default key-selection strategy.
+
 Precedence: CLI option > config file > built-in default. No config file is
-required. Unknown keys and non-positive intervals are rejected with an error
-naming the file.
+required. Unknown keys, non-positive intervals, and conflicting
+key-selection settings are rejected with an error naming the file.
 
 ## How the GnuPG TTL interaction works
 

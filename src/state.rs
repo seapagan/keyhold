@@ -16,6 +16,8 @@ pub struct StatusData {
     pub hold_on: bool,
     /// Selected key, or `None` for GPG's default key.
     pub key: Option<String>,
+    /// Where the selected key came from (presentation metadata).
+    pub key_source: KeySource,
     /// Ping interval in milliseconds.
     pub interval_ms: u64,
     /// Remaining hold time in milliseconds; `None` when indefinite or off.
@@ -26,6 +28,18 @@ pub struct StatusData {
     pub next_ping_ms: Option<u64>,
     /// Last keepalive failure, retained until the next `on`/`off`.
     pub last_error: Option<String>,
+}
+
+/// Where the active key selector came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum KeySource {
+    /// No selector passed: GnuPG's normal default-key selection.
+    Default,
+    /// An explicitly chosen key (CLI `--key` or config `key`).
+    Explicit,
+    /// Git's effective `user.signingkey`, resolved at activation.
+    Git,
 }
 
 /// What the daemon should do at a given instant.
@@ -47,6 +61,8 @@ pub struct Hold {
     pub enabled: bool,
     /// Key selector (`None` = GPG default key).
     pub key: Option<String>,
+    /// Where the key selector came from (display metadata only).
+    pub key_source: KeySource,
     /// Ping interval.
     pub interval: Duration,
     /// Monotonic deadline imposed by `--for`.
@@ -67,6 +83,7 @@ impl Default for Hold {
         Self {
             enabled: false,
             key: None,
+            key_source: KeySource::Default,
             interval: crate::cli::DEFAULT_INTERVAL,
             deadline: None,
             next_ping: None,
@@ -92,6 +109,7 @@ impl Hold {
     pub fn turn_on(
         &mut self,
         key: Option<String>,
+        key_source: KeySource,
         interval: Duration,
         hold_for: Option<Duration>,
         now: Instant,
@@ -106,6 +124,7 @@ impl Hold {
         }
         self.enabled = true;
         self.key = key;
+        self.key_source = key_source;
         self.interval = interval;
         self.deadline = deadline;
         self.next_ping = Some(next_ping);
@@ -192,6 +211,7 @@ impl Hold {
         StatusData {
             hold_on: self.enabled,
             key: self.key.clone(),
+            key_source: self.key_source,
             interval_ms: self.interval.as_millis() as u64,
             remaining_ms: self.remaining(now).map(|d| d.as_millis() as u64),
             last_ping_ms: self.last_ping.and_then(epoch),
@@ -226,8 +246,15 @@ mod tests {
     fn first_ping_is_scheduled_one_interval_after_on() {
         let mut hold = Hold::default();
         let start = t0();
-        hold.turn_on(Some("ABCD".into()), MINUTE, None, start, wall(1_000))
-            .unwrap();
+        hold.turn_on(
+            Some("ABCD".into()),
+            KeySource::Explicit,
+            MINUTE,
+            None,
+            start,
+            wall(1_000),
+        )
+        .unwrap();
         assert_eq!(hold.due_action(start), None);
         assert_eq!(hold.due_action(start + MINUTE), Some(Action::Ping));
         assert_eq!(hold.next_wake(start), Some(start + MINUTE));
@@ -238,8 +265,15 @@ mod tests {
     fn deadline_wins_over_ping() {
         let mut hold = Hold::default();
         let start = t0();
-        hold.turn_on(None, MINUTE, Some(MINUTE), start, wall(1_000))
-            .unwrap();
+        hold.turn_on(
+            None,
+            KeySource::Default,
+            MINUTE,
+            Some(MINUTE),
+            start,
+            wall(1_000),
+        )
+        .unwrap();
         assert_eq!(hold.due_action(start + MINUTE), Some(Action::Expire));
     }
 
@@ -247,8 +281,15 @@ mod tests {
     fn turn_off_stops_all_scheduling() {
         let mut hold = Hold::default();
         let start = t0();
-        hold.turn_on(None, MINUTE, Some(MINUTE), start, wall(1_000))
-            .unwrap();
+        hold.turn_on(
+            None,
+            KeySource::Default,
+            MINUTE,
+            Some(MINUTE),
+            start,
+            wall(1_000),
+        )
+        .unwrap();
         hold.turn_off();
         assert!(!hold.enabled);
         assert_eq!(hold.due_action(start + 10 * MINUTE), None);
@@ -260,8 +301,15 @@ mod tests {
     fn ping_failure_disables_and_retains_error() {
         let mut hold = Hold::default();
         let start = t0();
-        hold.turn_on(None, MINUTE, None, start, wall(1_000))
-            .unwrap();
+        hold.turn_on(
+            None,
+            KeySource::Default,
+            MINUTE,
+            None,
+            start,
+            wall(1_000),
+        )
+        .unwrap();
         hold.record_ping_failure(
             "gpg: signing failed: Operation cancelled".into(),
         );
@@ -277,8 +325,15 @@ mod tests {
     fn successful_ping_reschedules() {
         let mut hold = Hold::default();
         let start = t0();
-        hold.turn_on(None, MINUTE, None, start, wall(1_000))
-            .unwrap();
+        hold.turn_on(
+            None,
+            KeySource::Default,
+            MINUTE,
+            None,
+            start,
+            wall(1_000),
+        )
+        .unwrap();
         let pinged_at = start + MINUTE;
         hold.record_ping_ok(pinged_at, SystemTime::now());
         assert_eq!(hold.due_action(pinged_at), None);
@@ -290,12 +345,20 @@ mod tests {
     fn repeated_on_replaces_deadline_and_bumps_generation() {
         let mut hold = Hold::default();
         let start = t0();
-        hold.turn_on(None, MINUTE, Some(MINUTE), start, wall(1_000))
-            .unwrap();
+        hold.turn_on(
+            None,
+            KeySource::Default,
+            MINUTE,
+            Some(MINUTE),
+            start,
+            wall(1_000),
+        )
+        .unwrap();
         let generation = hold.generation;
         let later = start + Duration::from_secs(10);
         hold.turn_on(
             Some("K".into()),
+            KeySource::Explicit,
             Duration::from_secs(30),
             None,
             later,
@@ -314,6 +377,7 @@ mod tests {
         let start = t0();
         hold.turn_on(
             None,
+            KeySource::Default,
             MINUTE,
             Some(Duration::from_secs(3600)),
             start,
@@ -331,7 +395,8 @@ mod tests {
         let mut hold = Hold::default();
         let start = t0();
         let activated = wall(1_234);
-        hold.turn_on(None, MINUTE, None, start, activated).unwrap();
+        hold.turn_on(None, KeySource::Default, MINUTE, None, start, activated)
+            .unwrap();
         assert_eq!(hold.last_ping, Some(activated));
         // The activation is already the latest successful use; the first
         // *background* ping stays one full interval after activation.
@@ -343,13 +408,27 @@ mod tests {
     fn replacing_a_hold_never_inherits_the_previous_last_ping() {
         let mut hold = Hold::default();
         let start = t0();
-        hold.turn_on(None, MINUTE, None, start, wall(1_000))
-            .unwrap();
+        hold.turn_on(
+            None,
+            KeySource::Default,
+            MINUTE,
+            None,
+            start,
+            wall(1_000),
+        )
+        .unwrap();
         hold.record_ping_ok(start + MINUTE, wall(1_060));
         let later = start + 2 * MINUTE;
         let fresh = wall(2_000);
-        hold.turn_on(Some("K".into()), MINUTE, None, later, fresh)
-            .unwrap();
+        hold.turn_on(
+            Some("K".into()),
+            KeySource::Explicit,
+            MINUTE,
+            None,
+            later,
+            fresh,
+        )
+        .unwrap();
         assert_eq!(hold.last_ping, Some(fresh));
     }
 
@@ -360,6 +439,7 @@ mod tests {
         let err = hold
             .turn_on(
                 None,
+                KeySource::Default,
                 Duration::from_secs(u64::MAX),
                 None,
                 start,
@@ -379,6 +459,7 @@ mod tests {
         let err = hold
             .turn_on(
                 None,
+                KeySource::Default,
                 MINUTE,
                 Some(Duration::from_secs(u64::MAX)),
                 start,
@@ -398,8 +479,15 @@ mod tests {
         let mut hold = Hold::default();
         let start = t0();
         let interval = Duration::from_millis(u64::MAX);
-        hold.turn_on(None, interval, Some(interval), start, wall(1_000))
-            .unwrap();
+        hold.turn_on(
+            None,
+            KeySource::Explicit,
+            interval,
+            Some(interval),
+            start,
+            wall(1_000),
+        )
+        .unwrap();
         assert_eq!(hold.next_ping, Some(start + interval));
         assert_eq!(hold.deadline, Some(start + interval));
         assert_eq!(hold.status().interval_ms, u64::MAX);
@@ -411,8 +499,15 @@ mod tests {
         // instant: the next ping is reported in epoch milliseconds.
         let mut hold = Hold::default();
         let start = t0();
-        hold.turn_on(None, MINUTE, None, start, wall(1_000))
-            .unwrap();
+        hold.turn_on(
+            None,
+            KeySource::Default,
+            MINUTE,
+            None,
+            start,
+            wall(1_000),
+        )
+        .unwrap();
         let status = hold.status();
         let next = status.next_ping_ms.expect("next ping present");
         assert!(next > 1_700_000_000_000, "not epoch millis: {next}");
@@ -423,6 +518,7 @@ mod tests {
         // field must be absent, never epoch zero ("in 0s").
         hold.turn_on(
             None,
+            KeySource::Default,
             Duration::from_millis(u64::MAX),
             None,
             start,

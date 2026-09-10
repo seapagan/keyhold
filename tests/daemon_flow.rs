@@ -319,7 +319,7 @@ fn extreme_timing_values_cannot_kill_the_daemon() {
     // A raw IPC client can send any u64. Values the platform can represent
     // (on Linux, every millisecond count) schedule normally...
     let request = format!(
-        "{{\"cmd\":\"on\",\"key\":null,\"interval_ms\":{},\
+        "{{\"cmd\":\"on\",\"key\":null,\"key_source\":\"default\",\"interval_ms\":{},\
          \"hold_ms\":null,\"activated_at_ms\":{}}}",
         u64::MAX,
         now_ms()
@@ -338,7 +338,7 @@ fn extreme_timing_values_cannot_kill_the_daemon() {
     assert!(!text.contains("Next ping"), "{text}");
     // ...including the widest hold deadline; remaining stays near u64::MAX.
     let request = format!(
-        "{{\"cmd\":\"on\",\"key\":null,\"interval_ms\":300000,\
+        "{{\"cmd\":\"on\",\"key\":null,\"key_source\":\"default\",\"interval_ms\":300000,\
          \"hold_ms\":{},\"activated_at_ms\":{}}}",
         u64::MAX,
         now_ms()
@@ -360,7 +360,7 @@ fn extreme_timing_values_cannot_kill_the_daemon() {
     // A zero interval stays a plain protocol error, not a crash.
     let response = common::ipc_request(
         &env,
-        "{\"cmd\":\"on\",\"key\":null,\"interval_ms\":0,\"hold_ms\":null,\
+        "{\"cmd\":\"on\",\"key\":null,\"key_source\":\"default\",\"interval_ms\":0,\"hold_ms\":null,\
          \"activated_at_ms\":0}",
     )
     .expect("daemon responsive");
@@ -386,7 +386,7 @@ fn huge_activation_timestamp_does_not_disturb_the_daemon() {
     // panic, must not touch monotonic scheduling, and is represented as-is.
     let before = now_ms();
     let request = format!(
-        "{{\"cmd\":\"on\",\"key\":null,\"interval_ms\":300000,\
+        "{{\"cmd\":\"on\",\"key\":null,\"key_source\":\"default\",\"interval_ms\":300000,\
          \"hold_ms\":null,\"activated_at_ms\":{}}}",
         u64::MAX
     );

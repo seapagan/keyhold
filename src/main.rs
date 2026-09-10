@@ -9,11 +9,14 @@ use clap::Parser;
 
 use keyhold::{
     cli::{Cli, Command},
-    config, daemon,
+    config::{self, Config},
+    daemon,
     error::{Error, Result},
+    git,
     gpg::{Gpg, PingMode},
     ipc::{self, Request, Response},
     presentation,
+    state::KeySource,
 };
 
 fn main() -> ExitCode {
@@ -31,9 +34,10 @@ fn run(command: Command) -> Result<()> {
     match command {
         Command::On {
             key,
+            git_key,
             r#for,
             interval,
-        } => on(key, r#for, interval),
+        } => on(key, git_key, r#for, interval),
         Command::Off => off(),
         Command::Status => status(),
         Command::Daemon { stop } => {
@@ -49,11 +53,14 @@ fn run(command: Command) -> Result<()> {
 
 fn on(
     key: Option<String>,
+    git_key: bool,
     hold_for: Option<Duration>,
     interval: Option<Duration>,
 ) -> Result<()> {
     let config = config::load()?;
-    let key = key.or(config.key);
+    // Resolve which key to hold before any side effect: a failing Git
+    // lookup must not start a daemon, touch GPG, or disturb a hold.
+    let (key, key_source) = select_key(key, git_key, &config)?;
     let interval = interval.unwrap_or(config.interval);
     // Reject durations the millisecond IPC/state model cannot carry before
     // touching GPG or starting the daemon: silently truncating them would
@@ -78,6 +85,7 @@ fn on(
 
     let request = Request::On {
         key,
+        key_source,
         interval_ms,
         hold_ms,
         activated_at_ms,
@@ -91,6 +99,31 @@ fn on(
         None => presentation::enabled_indefinitely(),
     }
     Ok(())
+}
+
+/// Choose the key selector and its source.
+///
+/// Precedence: `--key` > `--git-key` > config `key` > config `git_key` >
+/// GnuPG's default selection. Git is only ever consulted in explicit
+/// Git-key mode, and the daemon receives the already-resolved selector.
+fn select_key(
+    cli_key: Option<String>,
+    cli_git: bool,
+    config: &Config,
+) -> Result<(Option<String>, KeySource)> {
+    if let Some(key) = cli_key {
+        return Ok((Some(key), KeySource::Explicit));
+    }
+    if cli_git {
+        return Ok((Some(git::signing_key()?), KeySource::Git));
+    }
+    if let Some(key) = &config.key {
+        return Ok((Some(key.clone()), KeySource::Explicit));
+    }
+    if config.git_key {
+        return Ok((Some(git::signing_key()?), KeySource::Git));
+    }
+    Ok((None, KeySource::Default))
 }
 
 fn off() -> Result<()> {

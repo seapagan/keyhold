@@ -50,8 +50,11 @@ pub enum Command {
     /// Enable the keepalive hold (starts the daemon if needed)
     On {
         /// GPG key (fingerprint or key id) to keep cached; omit for GPG's default signing key
-        #[arg(long, value_name = "KEY")]
+        #[arg(long, value_name = "KEY", conflicts_with = "git_key")]
         key: Option<String>,
+        /// Use Git's effective user.signingkey as the key to keep cached
+        #[arg(long)]
+        git_key: bool,
         /// Keep the hold enabled for this long (e.g. 30m, 4h, 1h30m); omit for an indefinite hold
         #[arg(long = "for", value_name = "DURATION", value_parser = parse_duration)]
         r#for: Option<Duration>,

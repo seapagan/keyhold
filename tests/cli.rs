@@ -19,7 +19,7 @@ fn subcommand_help_is_available() {
     let env = TestEnv::new();
     let out = env.succeed(&["on", "--help"]);
     let text = String::from_utf8_lossy(&out.stdout);
-    for needle in ["--for", "--key", "--interval"] {
+    for needle in ["--for", "--key", "--git-key", "--interval"] {
         assert!(text.contains(needle), "on help missing {needle}:\n{text}");
     }
 }

@@ -18,6 +18,9 @@ use crate::{
 pub struct Config {
     /// Key selector passed to `gpg --local-user`; `None` uses GPG's default key.
     pub key: Option<String>,
+    /// Resolve Git's effective `user.signingkey` when no explicit key is
+    /// given.
+    pub git_key: bool,
     /// Keepalive ping interval.
     pub interval: Duration,
 }
@@ -26,6 +29,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             key: None,
+            git_key: false,
             interval: DEFAULT_INTERVAL,
         }
     }
@@ -36,6 +40,7 @@ impl Default for Config {
 #[serde(deny_unknown_fields)]
 struct ConfigFile {
     key: Option<String>,
+    git_key: Option<bool>,
     interval: Option<String>,
 }
 
@@ -83,8 +88,18 @@ pub fn load_from(dir: &Path) -> Result<Config> {
         })?,
         None => DEFAULT_INTERVAL,
     };
+    let git_key = file.git_key.unwrap_or(false);
+    if file.key.is_some() && git_key {
+        return Err(Error::Config {
+            path,
+            reason: "both 'key' and 'git_key = true' are set; choose one \
+                     default key-selection strategy"
+                .into(),
+        });
+    }
     Ok(Config {
         key: file.key,
+        git_key,
         interval,
     })
 }

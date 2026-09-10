@@ -7,7 +7,6 @@
 //! fragments are styled — green for success/active states, yellow for
 //! inactive-but-valid states, red for errors, cyan for key identifiers
 //! and durations — and renders them to the right target. Redirected or
-//! captured output stays plain automatically.
 //!
 //! Styling is applied to individual fragments after any layout has been
 //! decided (labels stay plain, widths are computed from plain text), so
@@ -17,7 +16,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use colored_text::{Colorize, RenderTarget};
 
-use crate::state::StatusData;
+use crate::state::{KeySource, StatusData};
 
 /// Print the success line for a timed hold.
 pub fn enabled_for(duration: &str) {
@@ -131,7 +130,15 @@ pub fn print_status(data: &StatusData) {
     );
     if data.hold_on {
         let key = data.key.clone().unwrap_or_else(|| "default".into());
-        row("Key", key.cyan());
+        // Git-selected keys carry a dim suffix; layout is unaffected
+        // because the value column is last.
+        let value = match data.key_source {
+            KeySource::Git => {
+                format!("{} {}", key.cyan(), "(git)".dim())
+            }
+            _ => key.cyan().to_string(),
+        };
+        row("Key", value);
         row("Interval", duration(data.interval_ms));
         match data.remaining_ms {
             Some(ms) => row("Remaining", duration(ms)),

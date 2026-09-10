@@ -108,9 +108,10 @@ deadline, new interval, new key — not an error.
 
 ### `--for`
 
-Without `--for`, the hold lasts until you turn it off. With it, the daemon
-disables the hold automatically when the time is up (e.g. `--for 1h30m`).
-Durations accept combined units (`30m`, `4h`, `1h30m`, `500ms`).
+Without `--for`, the hold lasts until you turn it off (status reports
+`Remaining  no deadline`). With it, the daemon disables the hold
+automatically when the time is up (e.g. `--for 1h30m`). Durations accept
+combined units (`30m`, `4h`, `1h30m`, `500ms`).
 
 Expiry — like `off` — never touches `gpg-agent` and never clears the cache;
 the key just resumes its normal idle countdown from the last use.

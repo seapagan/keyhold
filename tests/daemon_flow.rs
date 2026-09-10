@@ -43,7 +43,7 @@ fn on_enables_hold_after_foreground_ping() {
     ] {
         assert!(text.contains(needle), "status missing {needle:?}:\n{text}");
     }
-    assert!(text.contains("Remaining  never"), "{text}");
+    assert!(text.contains("Remaining  no deadline"), "{text}");
 
     // The foreground ping must be a real signing invocation without the
     // background `cancel` pinentry mode.
@@ -77,7 +77,7 @@ fn repeated_on_replaces_the_hold() {
 
     env.succeed(&["on", "--key", "XYZ"]);
     let text = env.status();
-    assert!(text.contains("Remaining  never"), "{text}");
+    assert!(text.contains("Remaining  no deadline"), "{text}");
     assert!(text.contains("Key        XYZ"), "{text}");
 }
 

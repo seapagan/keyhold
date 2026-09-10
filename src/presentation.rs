@@ -135,7 +135,7 @@ pub fn print_status(data: &StatusData) {
         row("Interval", duration(data.interval_ms));
         match data.remaining_ms {
             Some(ms) => row("Remaining", duration(ms)),
-            None => row("Remaining", "never".dim()),
+            None => row("Remaining", "no deadline".dim()),
         }
         let now = epoch_ms();
         if let Some(ms) = data.last_ping_ms {

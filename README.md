@@ -141,17 +141,15 @@ max-cache-ttl 43200
 ```
 
 a key left alone expires after ten minutes of inactivity. With
-`keyhold on --for 8h` and the default 5-minute interval, keyhold refreshes
-the idle timer for exactly those eight hours: the key stays available while
-the hold lasts, and no longer.
+`keyhold on --for 8h` and the default 5-minute interval, keyhold actively
+maintains the cached key for exactly those eight hours. When the hold ends,
+keyhold stops touching the key and normal `gpg-agent` idle expiry resumes
+from the final key use, so the key may stay cached for up to ten more
+minutes before expiring naturally.
 
 The `max-cache-ttl 43200` setting does **not** stretch an 8-hour hold into a
 twelve-hour one — it is an independent absolute ceiling GnuPG enforces on
-the cache entry regardless of activity. When the eight-hour hold expires,
-keyhold stops scheduling new pings; `gpg-agent`'s normal idle-expiry
-behaviour then resumes from the most recent genuine key use, so the cache
-expires about ten minutes after the last ping (still subject to the
-`max-cache-ttl` cap).
+the cache entry regardless of activity.
 
 ## Daemon model
 

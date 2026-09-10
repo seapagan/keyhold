@@ -80,10 +80,9 @@ fn on(
     check(ipc::request(&request)?)?;
 
     match hold_for {
-        Some(d) => println!(
-            "Keyhold enabled for {}.",
-            humantime::format_duration(Duration::from_secs(d.as_secs()))
-        ),
+        Some(d) => {
+            println!("Keyhold enabled for {}.", humantime::format_duration(d))
+        }
         None => println!("Keyhold enabled (no expiry)."),
     }
     Ok(())
@@ -164,7 +163,7 @@ fn print_status(data: &StatusData) {
         match data.remaining_ms {
             Some(ms) => println!(
                 "Expires: in {}",
-                humantime::format_duration(Duration::from_secs(ms / 1000))
+                humantime::format_duration(Duration::from_millis(ms))
             ),
             None => println!("Expires: never"),
         }
@@ -172,8 +171,8 @@ fn print_status(data: &StatusData) {
         match data.last_ping_ms {
             Some(ms) => println!(
                 "Last ping: {} ago",
-                humantime::format_duration(Duration::from_secs(
-                    now.saturating_sub(ms) / 1000
+                humantime::format_duration(Duration::from_millis(
+                    now.saturating_sub(ms)
                 ))
             ),
             None => println!("Last ping: -"),
@@ -181,8 +180,8 @@ fn print_status(data: &StatusData) {
         if let Some(ms) = data.next_ping_ms {
             println!(
                 "Next ping: in {}",
-                humantime::format_duration(Duration::from_secs(
-                    ms.saturating_sub(now) / 1000
+                humantime::format_duration(Duration::from_millis(
+                    ms.saturating_sub(now)
                 ))
             );
         }

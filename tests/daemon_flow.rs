@@ -245,6 +245,34 @@ fn now_ms() -> u64 {
 }
 
 #[test]
+fn subsecond_durations_are_not_truncated_to_zero() {
+    let env = TestEnv::new();
+    assert_eq!(
+        env.stdout(&["on", "--for", "500ms"]),
+        "Keyhold enabled for 500ms.\n"
+    );
+    env.succeed(&["off"]);
+    assert_eq!(
+        env.stdout(&["on", "--for", "1s500ms"]),
+        "Keyhold enabled for 1s 500ms.\n"
+    );
+}
+
+#[test]
+fn status_shows_subsecond_remaining_and_ping_times() {
+    let env = TestEnv::new();
+    env.succeed(&["on", "--for", "2s", "--interval", "2s"]);
+    let text = env.status();
+    // With a fresh hold, remaining and next-ping times are between one and
+    // two seconds: the display must keep the millisecond remainder instead
+    // of collapsing to whole seconds (or to "0s").
+    assert!(text.contains("Expires: in 1s "), "{text}");
+    assert!(text.contains("Next ping: in 1s "), "{text}");
+    assert!(text.contains("Last ping: "), "{text}");
+    assert!(!text.contains("Last ping: -"), "{text}");
+}
+
+#[test]
 fn stale_socket_file_is_recovered() {
     let env = TestEnv::new();
     fs::create_dir_all(env.sock().parent().unwrap()).unwrap();

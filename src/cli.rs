@@ -36,6 +36,7 @@ GPG private key, refreshing gpg-agent's normal idle cache timeout for as long as
 explicitly allow it. Turning it off leaves the cache to expire naturally; keyhold never \
 sees or stores your passphrase.",
     propagate_version = true,
+    disable_help_subcommand = true,
     arg_required_else_help = true
 )]
 pub struct Cli {

@@ -12,6 +12,12 @@ fn help_lists_commands_and_options() {
     for needle in ["on", "off", "status", "daemon", "Usage:"] {
         assert!(text.contains(needle), "help missing {needle}:\n{text}");
     }
+    // Clap's generated `help` subcommand is disabled: `--help` is the
+    // only help convention.
+    assert!(
+        !text.contains("Print this message"),
+        "root help still advertises a help subcommand:\n{text}"
+    );
 }
 
 #[test]
@@ -22,6 +28,27 @@ fn subcommand_help_is_available() {
     for needle in ["--for", "--key", "--git-key", "--interval"] {
         assert!(text.contains(needle), "on help missing {needle}:\n{text}");
     }
+}
+
+#[test]
+fn subcommand_help_works_for_every_subcommand() {
+    let env = TestEnv::new();
+    for subcommand in ["on", "off", "status", "daemon"] {
+        let out = env.succeed(&[subcommand, "--help"]);
+        let text = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            text.contains("Usage:"),
+            "{subcommand} --help broken:\n{text}"
+        );
+    }
+}
+
+#[test]
+fn help_subcommand_is_disabled() {
+    let env = TestEnv::new();
+    let out = env.fail(&["help"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("unrecognized subcommand"), "{stderr}");
 }
 
 #[test]

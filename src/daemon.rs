@@ -116,6 +116,16 @@ fn spawn_detached() -> Result<()> {
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
+    // The daemon re-detects gpg itself, but runs with cwd "/": hand it an
+    // absolute KEYHOLD_GPG so relative overrides keep working.
+    if let Some(spec) = std::env::var_os(crate::gpg::GPG_ENV) {
+        let path = PathBuf::from(&spec);
+        if !path.is_absolute()
+            && let Ok(cwd) = std::env::current_dir()
+        {
+            cmd.env(crate::gpg::GPG_ENV, cwd.join(path));
+        }
+    }
     // SAFETY: the closure runs in the child between fork and exec and must be
     // async-signal-safe. `setsid` is async-signal-safe, and the closure makes
     // no allocations, takes no locks and calls nothing else. Detaching into a

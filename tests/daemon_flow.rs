@@ -131,6 +131,29 @@ fn wait_until_log(env: &TestEnv, timeout: Duration, min: usize) -> bool {
 }
 
 #[test]
+fn relative_gpg_override_survives_daemon_detachment() {
+    let env = TestEnv::new();
+    let mut cmd = env.keyhold(&["on", "--interval", "100ms"]);
+    cmd.env("KEYHOLD_GPG", "fake-gpg");
+    cmd.current_dir(env.scratch.path());
+    let out = cmd.output().unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // The detached daemon (cwd "/") must still find the fake gpg and keep
+    // pinging it in the background.
+    assert!(
+        wait_until_log(&env, 5 * SECS, 1),
+        "daemon did not ping via relative override, log: {}",
+        env.gpg_log()
+    );
+    assert!(env.status().contains("Hold:   on"));
+}
+
+#[test]
 fn background_ping_failure_stops_hold_and_reports_error() {
     let env = TestEnv::new();
     env.succeed(&["on", "--interval", "200ms", "--for", "1h"]);

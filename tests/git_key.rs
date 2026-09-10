@@ -26,13 +26,26 @@ fn git_isolated(env: &TestEnv, args: &[&str], workdir: &Path) -> Command {
     cmd
 }
 
+/// Write the global Git config verbatim (under the isolated `HOME`).
+fn global_config(home: &Path, body: &str) {
+    fs::write(home.join(".gitconfig"), body).expect("write .gitconfig");
+}
+
 /// Write a global Git config with `user.signingkey = <key>`.
 fn global_signing_key(home: &Path, key: &str) {
-    fs::write(
-        home.join(".gitconfig"),
-        format!("[user]\n\tsigningkey = {key}\n"),
-    )
-    .expect("write .gitconfig");
+    global_config(home, &format!("[user]\n\tsigningkey = {key}\n"));
+}
+
+/// Set a repository-local Git config value.
+fn local_config(repo: &Path, name: &str, value: &str) {
+    let status = Command::new("git")
+        .args(["config", name, value])
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env_remove("GIT_CONFIG_GLOBAL")
+        .current_dir(repo)
+        .status()
+        .expect("run git config");
+    assert!(status.success(), "git config failed");
 }
 
 /// Create a Git repository (no signing key unless `key` is given).
@@ -139,6 +152,145 @@ fn git_output_whitespace_is_trimmed() {
     assert_eq!(lines.len(), 1, "newline leaked into key: {log:?}");
     assert!(lines[0].ends_with("--local-user PADDEDKEY"), "{log}");
     assert!(env.status().contains("Key        PADDEDKEY (git)"));
+}
+
+#[test]
+fn unset_format_defaults_to_openpgp() {
+    // Already implied by every other test (no [gpg] section), but pin the
+    // default explicitly: gpg.format unset + valid signingkey succeeds.
+    let env = TestEnv::new();
+    let home = neutral_dir();
+    global_signing_key(home.path(), "DEFAULTKEY");
+
+    let out = git_isolated(&env, &["on", "--git-key"], home.path())
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(env.status().contains("Key        DEFAULTKEY (git)"));
+}
+
+#[test]
+fn explicit_openpgp_format_succeeds() {
+    let env = TestEnv::new();
+    let home = neutral_dir();
+    global_config(
+        home.path(),
+        "[gpg]\n\tformat = openpgp\n[user]\n\tsigningkey = OPENPGPKEY\n",
+    );
+
+    let out = git_isolated(&env, &["on", "--git-key"], home.path())
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(env.gpg_log().contains("--local-user OPENPGPKEY"));
+    assert!(env.status().contains("Key        OPENPGPKEY (git)"));
+}
+
+#[test]
+fn ssh_format_is_rejected_without_side_effects() {
+    let env = TestEnv::new();
+    // A healthy default hold first: the rejection must not disturb it.
+    env.succeed(&["on"]);
+    assert!(env.status().contains("Key        default"));
+
+    let home = neutral_dir();
+    global_config(
+        home.path(),
+        "[gpg]\n\tformat = ssh\n[user]\n\tsigningkey = /home/x/.ssh/id_ed25519\n",
+    );
+
+    let out = git_isolated(&env, &["on", "--git-key"], home.path())
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let stderr = stderr(&out);
+    assert!(stderr.contains("Git signing format is 'ssh'"), "{stderr}");
+    assert!(stderr.contains("requires OpenPGP"), "{stderr}");
+
+    // No new foreground GPG call, no On request: the existing hold and
+    // daemon state are unchanged.
+    let text = env.status();
+    assert!(text.contains("Hold       on"), "{text}");
+    assert!(text.contains("Key        default"), "{text}");
+    assert!(!env.gpg_log().contains("id_ed25519"), "{}", env.gpg_log());
+}
+
+#[test]
+fn x509_format_is_rejected() {
+    let env = TestEnv::new();
+    let home = neutral_dir();
+    global_config(
+        home.path(),
+        "[gpg]\n\tformat = x509\n[user]\n\tsigningkey = /cn=Someone\n",
+    );
+
+    let out = git_isolated(&env, &["on", "--git-key"], home.path())
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(
+        stderr(&out).contains("Git signing format is 'x509'"),
+        "{}",
+        stderr(&out)
+    );
+    assert_eq!(env.gpg_log(), "");
+    assert!(env.status().contains("Daemon     stopped"));
+}
+
+#[test]
+fn unknown_format_is_rejected() {
+    let env = TestEnv::new();
+    let home = neutral_dir();
+    global_config(
+        home.path(),
+        "[gpg]\n\tformat = smime9\n[user]\n\tsigningkey = WHATEVER\n",
+    );
+
+    let out = git_isolated(&env, &["on", "--git-key"], home.path())
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(
+        stderr(&out).contains("Git signing format is 'smime9'"),
+        "{}",
+        stderr(&out)
+    );
+    assert_eq!(env.gpg_log(), "");
+}
+
+#[test]
+fn local_format_overrides_global() {
+    let env = TestEnv::new();
+    let repo = init_repo(Some("LOCALKEY"));
+    // Global says ssh, the repository overrides back to openpgp: Git's
+    // own effective config wins, so Git-key mode succeeds.
+    global_config(repo.path(), "[gpg]\n\tformat = ssh\n");
+    local_config(repo.path(), "gpg.format", "openpgp");
+
+    let out = git_isolated(&env, &["on", "--git-key"], repo.path())
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(env.status().contains("Key        LOCALKEY (git)"));
+}
+
+#[test]
+fn local_ssh_format_overrides_global_openpgp() {
+    let env = TestEnv::new();
+    let repo = init_repo(Some("LOCALKEY"));
+    global_config(repo.path(), "[gpg]\n\tformat = openpgp\n");
+    local_config(repo.path(), "gpg.format", "ssh");
+
+    let out = git_isolated(&env, &["on", "--git-key"], repo.path())
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(
+        stderr(&out).contains("Git signing format is 'ssh'"),
+        "{}",
+        stderr(&out)
+    );
+    assert_eq!(env.gpg_log(), "");
 }
 
 #[test]

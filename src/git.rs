@@ -8,37 +8,74 @@
 //! parses Git config files and never falls back to GPG's default key in
 //! this mode. The daemon is entirely Git-unaware: it only ever receives
 //! the already-resolved selector.
+//!
+//! keyhold is an OpenPGP/GnuPG utility, so Git-key mode first verifies
+//! that Git's effective signing format is OpenPGP. `gpg.format` unset
+//! counts as OpenPGP (Git's default); `ssh` or `x509` signing keys are
+//! not GnuPG selectors and are rejected before anything is started.
 
 use std::process::Command;
 
 use crate::error::{Error, Result};
 
-/// Resolve Git's effective `user.signingkey`.
+/// Resolve Git's effective OpenPGP signing key.
 ///
-/// Fails with a clear message when Git cannot be executed, reports no
-/// signing key, or returns an empty value. The value is passed on as-is,
-/// apart from trimming the command output's surrounding whitespace.
+/// Verifies the signing format first, then resolves `user.signingkey`.
+/// Fails with a clear message when Git cannot be executed, uses a
+/// non-OpenPGP signing format, reports no signing key, or returns an
+/// empty value. The value is passed on as-is, apart from trimming the
+/// command output's surrounding whitespace.
 pub fn signing_key() -> Result<String> {
+    ensure_openpgp_format()?;
+    let Some(key) = config_get("user.signingkey")? else {
+        return Err(no_signing_key());
+    };
+    if key.is_empty() {
+        return Err(no_signing_key());
+    }
+    Ok(key)
+}
+
+/// Confirm Git's effective signing format is OpenPGP.
+///
+/// `gpg.format` unset is Git's default (OpenPGP); an explicit `openpgp`
+/// (ASCII case-insensitively, as a lone canonical value) also passes.
+/// Anything else — `ssh`, `x509`, unknown values — is rejected: those
+/// signing keys are not GnuPG selectors.
+fn ensure_openpgp_format() -> Result<()> {
+    match config_get("gpg.format")? {
+        None => Ok(()),
+        Some(format) if format.eq_ignore_ascii_case("openpgp") => Ok(()),
+        Some(format) => Err(Error::Message(format!(
+            "Git signing format is '{format}'; --git-key requires OpenPGP \
+             signing"
+        ))),
+    }
+}
+
+/// Run `git config --get <name>` in the caller's working directory.
+///
+/// `Ok(None)` means the value is unset (`git config --get` exit code 1).
+/// Trimmed values are returned as-is.
+fn config_get(name: &str) -> Result<Option<String>> {
     let output = Command::new("git")
-        .args(["config", "--get", "user.signingkey"])
+        .args(["config", "--get", name])
         .output()
         .map_err(|e| Error::Message(format!("could not execute git: {e}")))?;
     if !output.status.success() {
         // `git config --get` exits 1 when the key is unset; anything else
         // is a real Git failure worth showing.
         if output.status.code() == Some(1) {
-            return Err(no_signing_key());
+            return Ok(None);
         }
         return Err(Error::Message(format!(
             "git config failed: {}",
             stderr_tail(&output.stderr)
         )));
     }
-    let key = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if key.is_empty() {
-        return Err(no_signing_key());
-    }
-    Ok(key)
+    Ok(Some(
+        String::from_utf8_lossy(&output.stdout).trim().to_string(),
+    ))
 }
 
 fn no_signing_key() -> Error {

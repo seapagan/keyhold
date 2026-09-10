@@ -130,15 +130,19 @@ in the config file). `--key` accepts anything `gpg --local-user` accepts
 (full fingerprint, long or short key id).
 
 **Git signing key** — `keyhold on --git-key` (or `git_key = true` in the
-config file) resolves Git's effective `user.signingkey` and uses that
-value exactly like an explicit key, for both the foreground unlock and
-the daemon's keepalives. Git itself performs the resolution with its
-normal configuration precedence, so inside a repository the local
-`user.signingkey` naturally overrides the global one. The value is
-resolved once, when the hold is enabled; the daemon never consults Git
-afterwards, and the hold keeps the originally resolved key until the
-next `keyhold on`. If Git reports no signing key, `on` fails clearly
-without starting anything.
+config file) resolves Git's effective **OpenPGP** `user.signingkey` and
+uses that value exactly like an explicit key, for both the foreground
+unlock and the daemon's keepalives. The effective `gpg.format` is checked
+first: unset or `openpgp` proceeds, while repositories configured with
+`gpg.format = ssh` or `gpg.format = x509` are not supported — keyhold
+works through GnuPG/OpenPGP, and those signing keys are not GnuPG
+selectors. Git itself performs the resolution with its normal
+configuration precedence, so inside a repository the local
+`user.signingkey` and `gpg.format` naturally override the global ones.
+The value is resolved once, when the hold is enabled; the daemon never
+consults Git afterwards, and the hold keeps the originally resolved key
+until the next `keyhold on`. If Git reports no signing key, `on` fails
+clearly without starting anything.
 
 `--key` and `--git-key` are mutually exclusive. Precedence when several
 sources are configured: `--key` > `--git-key` > config `key` >

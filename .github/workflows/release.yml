@@ -3,13 +3,16 @@ name: Release
 on:
   push:
     tags:
-      - "*"
+      - "v*"
 
 concurrency:
   group: release-${{ github.ref }}
   cancel-in-progress: false
 
 permissions: {}
+
+env:
+  RUST_VERSION: 1.98.1
 
 jobs:
   build:
@@ -19,6 +22,10 @@ jobs:
       contents: write # Required to create releases and upload assets.
     env:
       BINARY_NAME: keyhold
+      # Version tags already carry the leading "v" (e.g. v0.1.0), so the
+      # archive name must not add another. Both the packaging and the upload
+      # steps use this single definition.
+      ARCHIVE_NAME: ${{ format('{0}-{1}-{2}.tar.gz', 'keyhold', github.ref_name, matrix.binary_target) }}
     strategy:
       fail-fast: false
       matrix:
@@ -37,7 +44,7 @@ jobs:
       - name: Install Rust toolchain
         uses: seapagan/setup-rust@a91f5a34c552642ece0e8cef8b5e9226f41a3c0b # v1.0.0
         with:
-          toolchain: stable
+          toolchain: ${{ env.RUST_VERSION }}
 
       - name: Install cross
         if: matrix.use-cross
@@ -64,18 +71,15 @@ jobs:
       - name: Package archive
         env:
           BINARY_TARGET: ${{ matrix.binary_target }}
-          TAG_NAME: ${{ github.ref_name }}
         run: |
-          archive_name="$BINARY_NAME-v$TAG_NAME-$BINARY_TARGET.tar.gz"
           archive_root="${RUNNER_TEMP:?}/keyhold-release"
           mkdir -p "$archive_root"
           cp "target/$BINARY_TARGET/release/$BINARY_NAME" "$archive_root/"
           cp LICENSE.txt README.md "$archive_root/"
-          tar -czf "$archive_name" -C "$archive_root" .
+          tar -czf "$ARCHIVE_NAME" -C "$archive_root" .
 
       - name: Upload release asset
         env:
-          ARCHIVE_NAME: ${{ format('{0}-v{1}-{2}.tar.gz', 'keyhold', github.ref_name, matrix.binary_target) }}
           GH_TOKEN: ${{ github.token }}
           TAG_NAME: ${{ github.ref_name }}
         run: |

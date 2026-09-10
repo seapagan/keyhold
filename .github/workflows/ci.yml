@@ -16,13 +16,15 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
-  RUST_VERSION: 1.98.0
+  RUST_VERSION: 1.98.1
   MSRV_VERSION: "1.88"
   RUSTDOCFLAGS: "-D warnings"
 
 jobs:
   msrv:
-    name: Check MSRV (${{ env.MSRV_VERSION }})
+    # The `env` context is not available in a job name (only github, needs,
+    # strategy, matrix, vars, inputs), so the MSRV value stays in the steps.
+    name: Check MSRV
     runs-on: ubuntu-24.04
 
     steps:

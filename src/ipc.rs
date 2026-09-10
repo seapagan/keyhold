@@ -6,7 +6,7 @@
 //! newline, reads one JSON response, and disconnects.
 
 use std::{
-    io::{self, BufRead, BufReader, Write},
+    io::{self, BufRead, BufReader, Read, Write},
     os::unix::net::UnixStream,
     time::Duration,
 };
@@ -114,8 +114,13 @@ pub fn request(req: &Request) -> Result<Response> {
 }
 
 /// Read one newline-framed request. `Ok(None)` means the client disconnected.
+///
+/// The read is capped at `MAX_REQUEST + 1` bytes, so a client sending an
+/// arbitrarily long (or unterminated) line cannot make the daemon allocate
+/// proportionally: the single extra byte is exactly enough to detect that
+/// the line exceeds the limit.
 pub fn read_request(stream: &UnixStream) -> Result<Option<Request>> {
-    let mut reader = BufReader::new(stream);
+    let mut reader = BufReader::new(stream).take(MAX_REQUEST as u64 + 1);
     let mut buf = Vec::new();
     let read = reader.read_until(b'\n', &mut buf)?;
     if read == 0 {
@@ -150,6 +155,16 @@ fn trim_trailing_whitespace(mut buf: &[u8]) -> &[u8] {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error::Error;
+    use std::{io::Write, os::unix::net::UnixStream, thread};
+
+    /// Write `payload` from a peer socket, then read it back as a request.
+    fn read_written(payload: &[u8]) -> Result<Option<Request>> {
+        let (mut peer, ours) = UnixStream::pair().expect("socketpair");
+        peer.write_all(payload).expect("write payload");
+        drop(peer);
+        read_request(&ours)
+    }
 
     #[test]
     fn requests_roundtrip_through_json() {
@@ -180,5 +195,68 @@ mod tests {
         assert_eq!(json, "{\"ok\":true}");
         let back: Response = serde_json::from_str(&json).unwrap();
         assert!(back.ok && back.error.is_none() && back.status.is_none());
+    }
+
+    #[test]
+    fn valid_request_below_the_limit_roundtrips() {
+        assert!(matches!(
+            read_written(b"{\"cmd\":\"off\"}\n"),
+            Ok(Some(Request::Off))
+        ));
+    }
+
+    #[test]
+    fn request_at_the_size_limit_is_accepted() {
+        // Valid JSON padded with trailing whitespace to exactly MAX_REQUEST
+        // bytes, newline included.
+        let mut payload = br#"{"cmd":"ping"}"#.to_vec();
+        payload.resize(MAX_REQUEST - 1, b' ');
+        payload.push(b'\n');
+        assert!(matches!(read_written(&payload), Ok(Some(Request::Ping))));
+    }
+
+    #[test]
+    fn request_one_byte_over_the_limit_is_rejected() {
+        let mut payload = vec![b'a'; MAX_REQUEST];
+        payload.push(b'\n');
+        let err = read_written(&payload).unwrap_err();
+        assert!(err.to_string().contains("too large"), "{err}");
+    }
+
+    #[test]
+    fn oversized_request_is_rejected() {
+        let mut payload = vec![b'x'; MAX_REQUEST + 4096];
+        payload.push(b'\n');
+        let err = read_written(&payload).unwrap_err();
+        assert!(err.to_string().contains("too large"), "{err}");
+    }
+
+    #[test]
+    fn very_large_unterminated_input_is_rejected_bounded() {
+        // Eight mebibytes with no newline at all: the reader must stop at
+        // the limit instead of waiting for the line to end. Written from a
+        // thread because the payload far exceeds socket buffers.
+        let (mut peer, ours) = UnixStream::pair().unwrap();
+        let writer = thread::spawn(move || {
+            let _ = peer.write_all(&vec![b'a'; 8 * 1024 * 1024]);
+        });
+        let result = read_request(&ours);
+        drop(ours);
+        writer.join().unwrap();
+        assert!(matches!(
+            &result,
+            Err(Error::Ipc(msg)) if msg.contains("too large")
+        ));
+    }
+
+    #[test]
+    fn malformed_normal_sized_request_is_an_ipc_error() {
+        let err = read_written(b"this is not json\n").unwrap_err();
+        assert!(err.to_string().contains("malformed request"), "{err}");
+    }
+
+    #[test]
+    fn disconnect_without_a_request_yields_none() {
+        assert!(matches!(read_written(b""), Ok(None)));
     }
 }

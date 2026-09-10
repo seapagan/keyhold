@@ -309,6 +309,108 @@ fn log_count(env: &TestEnv, needle: &str) -> usize {
     env.gpg_log().lines().filter(|l| l.contains(needle)).count()
 }
 
+#[test]
+fn extreme_timing_values_cannot_kill_the_daemon() {
+    let env = TestEnv::new();
+    env.succeed(&["on"]);
+
+    // A raw IPC client can send any u64. Values the platform can represent
+    // (on Linux, every millisecond count) schedule normally...
+    let request = format!(
+        "{{\"cmd\":\"on\",\"key\":null,\"interval_ms\":{},\
+         \"hold_ms\":null,\"activated_at_ms\":{}}}",
+        u64::MAX,
+        now_ms()
+    );
+    let response =
+        common::ipc_request(&env, &request).expect("daemon responsive");
+    assert_eq!(response["ok"], true, "{response}");
+    let status = common::status_of(&env).expect("status via IPC");
+    assert_eq!(status["interval_ms"].as_u64(), Some(u64::MAX));
+
+    // ...including the widest hold deadline; remaining stays near u64::MAX.
+    let request = format!(
+        "{{\"cmd\":\"on\",\"key\":null,\"interval_ms\":300000,\
+         \"hold_ms\":{},\"activated_at_ms\":{}}}",
+        u64::MAX,
+        now_ms()
+    );
+    let response =
+        common::ipc_request(&env, &request).expect("daemon responsive");
+    assert_eq!(response["ok"], true, "{response}");
+    let status = common::status_of(&env).expect("status via IPC");
+    let remaining = status["remaining_ms"].as_u64().expect("remaining");
+    assert!(
+        remaining > u64::MAX - 60_000,
+        "remaining not representable: {status}"
+    );
+    assert!(env.status().contains("Hold:   on"));
+
+    // A zero interval stays a plain protocol error, not a crash.
+    let response = common::ipc_request(
+        &env,
+        "{\"cmd\":\"on\",\"key\":null,\"interval_ms\":0,\"hold_ms\":null,\
+         \"activated_at_ms\":0}",
+    )
+    .expect("daemon responsive");
+    assert_eq!(response["ok"], false, "{response}");
+    assert!(
+        response["error"]
+            .as_str()
+            .is_some_and(|e| e.contains("greater than zero")),
+        "{response}"
+    );
+
+    // The daemon is unharmed and fully operational afterwards.
+    env.succeed(&["off"]);
+    assert!(env.status().contains("Daemon: running"));
+}
+
+#[test]
+fn huge_activation_timestamp_does_not_disturb_the_daemon() {
+    let env = TestEnv::new();
+    env.succeed(&["on"]);
+
+    // `activated_at_ms` is display-only history: an absurd value must not
+    // panic, must not touch monotonic scheduling, and is represented as-is.
+    let before = now_ms();
+    let request = format!(
+        "{{\"cmd\":\"on\",\"key\":null,\"interval_ms\":300000,\
+         \"hold_ms\":null,\"activated_at_ms\":{}}}",
+        u64::MAX
+    );
+    let response =
+        common::ipc_request(&env, &request).expect("daemon responsive");
+    assert_eq!(response["ok"], true, "{response}");
+    let status = common::status_of(&env).expect("status via IPC");
+    assert_eq!(status["last_ping_ms"].as_u64(), Some(u64::MAX));
+    let next = status["next_ping_ms"].as_u64().expect("next ping kept");
+    assert!(
+        next > before + 4 * 60_000,
+        "monotonic scheduling disturbed: {status}"
+    );
+
+    env.succeed(&["off"]);
+    assert!(env.status().contains("Daemon: running"));
+}
+
+#[test]
+fn unrepresentable_cli_durations_are_rejected_before_side_effects() {
+    let env = TestEnv::new();
+    for flag in ["--for", "--interval"] {
+        let out = env.fail(&["on", flag, "9223372036854775807s"]);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("invalid duration")
+                && stderr.contains("largest duration keyhold can schedule"),
+            "{flag}: {stderr}"
+        );
+    }
+    // Rejected before any side effect: no daemon was started, no GPG call.
+    assert_eq!(env.status(), "Daemon: stopped\nHold:   off\n");
+    assert_eq!(env.gpg_log(), "");
+}
+
 /// Current wall-clock time in epoch milliseconds.
 fn now_ms() -> u64 {
     use std::time::{SystemTime, UNIX_EPOCH};

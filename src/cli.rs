@@ -103,4 +103,12 @@ mod tests {
         assert!(parse_duration("banana").is_err());
         assert!(parse_duration("-1m").is_err());
     }
+
+    #[test]
+    fn parses_durations_larger_than_the_daemon_can_schedule() {
+        // The parser itself accepts any duration that fits a u64 of
+        // seconds; values the millisecond IPC model cannot carry are
+        // rejected later with a dedicated error (see `on`).
+        assert!(parse_duration("9223372036854775807s").is_ok());
+    }
 }

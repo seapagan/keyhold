@@ -280,17 +280,30 @@ fn apply(request: Request, pair: &Pair) -> (Response, bool) {
             }
             // The client sends the wall-clock moment of the successful
             // foreground key use; it becomes the hold's first recorded ping.
-            let activated =
-                UNIX_EPOCH + Duration::from_millis(activated_at_ms);
-            shared.hold.turn_on(
+            // IPC values are untrusted: timestamps that cannot be
+            // represented, or timings that cannot be scheduled, are normal
+            // protocol errors — never a panic.
+            let Some(activated) =
+                UNIX_EPOCH.checked_add(Duration::from_millis(activated_at_ms))
+            else {
+                return (
+                    Response::err("activation timestamp is out of range"),
+                    false,
+                );
+            };
+            match shared.hold.turn_on(
                 key,
                 Duration::from_millis(interval_ms),
                 hold_ms.map(Duration::from_millis),
                 Instant::now(),
                 activated,
-            );
-            pair.1.notify_all();
-            (Response::ok(), false)
+            ) {
+                Ok(()) => {
+                    pair.1.notify_all();
+                    (Response::ok(), false)
+                }
+                Err(reason) => (Response::err(reason), false),
+            }
         }
         Request::Off => {
             shared.hold.turn_off();
@@ -325,10 +338,9 @@ fn scheduler(pair: &Pair, gpg: &Gpg) {
                     break action;
                 }
                 let timeout = match shared.hold.next_wake(now) {
-                    Some(wake) => {
-                        wake.saturating_duration_since(now)
-                            + Duration::from_millis(1)
-                    }
+                    Some(wake) => wake
+                        .saturating_duration_since(now)
+                        .saturating_add(Duration::from_millis(1)),
                     None => {
                         // Nothing scheduled: sleep until an IPC wake-up.
                         shared = pair

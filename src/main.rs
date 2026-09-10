@@ -55,6 +55,11 @@ fn on(
     let config = config::load()?;
     let key = key.or(config.key);
     let interval = interval.unwrap_or(config.interval);
+    // Reject durations the millisecond IPC/state model cannot carry before
+    // touching GPG or starting the daemon: silently truncating them would
+    // schedule something the user never asked for.
+    let interval_ms = duration_ms(&interval)?;
+    let hold_ms = hold_for.map(|d| duration_ms(&d)).transpose()?;
     let gpg = Gpg::detect()?;
 
     daemon::ensure_running()?;
@@ -73,8 +78,8 @@ fn on(
 
     let request = Request::On {
         key,
-        interval_ms: interval.as_millis() as u64,
-        hold_ms: hold_for.map(|d| d.as_millis() as u64),
+        interval_ms,
+        hold_ms,
         activated_at_ms,
     };
     check(ipc::request(&request)?)?;
@@ -137,6 +142,17 @@ fn daemon_stop() -> Result<()> {
         }
         Err(e) => Err(e),
     }
+}
+
+/// Millisecond form of a parsed duration.
+///
+/// Rejects durations too large for the daemon's millisecond IPC/state model
+/// (with the original duration in the error) instead of truncating them.
+fn duration_ms(d: &Duration) -> Result<u64> {
+    u64::try_from(d.as_millis()).map_err(|_| Error::Duration {
+        value: humantime::format_duration(*d).to_string(),
+        reason: "exceeds the largest duration keyhold can schedule".into(),
+    })
 }
 
 fn check(response: Response) -> Result<()> {

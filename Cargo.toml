@@ -1,0 +1,29 @@
+[package]
+name = "keyhold"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+description = "Temporarily keep a GPG private key cached in gpg-agent while you explicitly allow it"
+license = "MIT"
+repository = "https://github.com/seapagan/keyhold"
+keywords = ["gpg", "gnupg", "gpg-agent", "cache", "cli"]
+categories = ["command-line-utilities"]
+include = ["src/**", "tests/**", "LICENSE.txt", "README.md", "CHANGELOG.md"]
+
+[dependencies]
+clap = { version = "4.6.6", features = ["derive"] }
+humantime = "2.4.0"
+libc = "0.2.189"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+thiserror = "2.0.20"
+toml = { version = "1.1.5", default-features = false, features = ["parse", "serde"] }
+
+[dev-dependencies]
+tempfile = "3.27.0"
+
+[lints.rust]
+unsafe_code = "deny"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }

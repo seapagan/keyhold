@@ -1,0 +1,94 @@
+name: CI
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_VERSION: 1.98.0
+  MSRV_VERSION: "1.88"
+  RUSTDOCFLAGS: "-D warnings"
+
+jobs:
+  msrv:
+    name: Check MSRV (${{ env.MSRV_VERSION }})
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Rust MSRV
+        uses: seapagan/setup-rust@a91f5a34c552642ece0e8cef8b5e9226f41a3c0b # v1.0.0
+        with:
+          toolchain: ${{ env.MSRV_VERSION }}
+
+      - name: Restore Rust cache
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          prefix-key: v1-${{ runner.os }}-rust-${{ env.MSRV_VERSION }}
+          shared-key: msrv
+
+      - name: Check all targets and features on MSRV
+        run: cargo check --all-targets --all-features --locked
+
+  linux:
+    name: Linux
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        uses: seapagan/setup-rust@a91f5a34c552642ece0e8cef8b5e9226f41a3c0b # v1.0.0
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          components: rustfmt clippy
+
+      - name: Restore Rust cache
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          prefix-key: v1-${{ runner.os }}-rust-${{ env.RUST_VERSION }}
+          shared-key: linux
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@c3ec0de9ae7f1019cea21aa96aa0a895b9552063 # v2.87.9
+        with:
+          tool: cargo-nextest@0.9.143
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Check all targets and features
+        run: cargo check --all-targets --all-features --locked
+
+      - name: Lint with Clippy (warnings denied)
+        run: cargo clippy --all-targets --all-features --locked -- -D warnings
+
+      - name: Run tests
+        run: cargo nextest run --all-targets --all-features --locked
+
+      - name: Build Rust documentation
+        run: cargo doc --no-deps
+
+      - name: Build release binary
+        run: cargo build --release --locked
+
+      - name: Verify crate is packageable
+        run: cargo package --locked

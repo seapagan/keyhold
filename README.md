@@ -140,9 +140,18 @@ default-cache-ttl 600
 max-cache-ttl 43200
 ```
 
-a key left alone expires after ten minutes; with `keyhold on --for 8h` and the
-default 5-minute interval, it stays available for up to twelve hours
-(the `max-cache-ttl` ceiling).
+a key left alone expires after ten minutes of inactivity. With
+`keyhold on --for 8h` and the default 5-minute interval, keyhold refreshes
+the idle timer for exactly those eight hours: the key stays available while
+the hold lasts, and no longer.
+
+The `max-cache-ttl 43200` setting does **not** stretch an 8-hour hold into a
+twelve-hour one — it is an independent absolute ceiling GnuPG enforces on
+the cache entry regardless of activity. When the eight-hour hold expires,
+keyhold stops scheduling new pings; `gpg-agent`'s normal idle-expiry
+behaviour then resumes from the most recent genuine key use, so the cache
+expires about ten minutes after the last ping (still subject to the
+`max-cache-ttl` cap).
 
 ## Daemon model
 
@@ -151,6 +160,12 @@ default 5-minute interval, it stays available for up to twelve hours
 - `keyhold on` starts it automatically, properly detached (`setsid`, no
   controlling terminal, stdio to `/dev/null`); it survives the terminal that
   launched it.
+- `off` (and hold replacement, and `--for` expiry) stops *scheduling* new
+  keepalives immediately. A keepalive gpg process that already started may
+  still run to completion — ordinary signing finishes in milliseconds, with
+  a 30-second timeout as the exceptional bound — but its outcome is
+  discarded: it can never re-enable, alter, or raise an error against a
+  hold that was disabled or replaced in the meantime.
 - `keyhold off` leaves the daemon running — it only stops the pings.
 - `keyhold daemon` runs the daemon in the foreground (for debugging or use
   under a service manager). A second instance refuses to start.

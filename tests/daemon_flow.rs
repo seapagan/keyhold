@@ -6,7 +6,7 @@ mod common;
 use std::{
     fs,
     io::{Read, Write},
-    os::unix::net::UnixStream,
+    os::unix::{fs::PermissionsExt, net::UnixStream},
     process::Stdio,
     time::Duration,
 };
@@ -313,6 +313,26 @@ fn daemon_stop_is_always_acknowledged() {
             "socket file was not removed"
         );
     }
+}
+
+#[test]
+fn runtime_dir_and_socket_are_private() {
+    let env = TestEnv::new();
+    // A pre-existing, too-loose runtime dir must be tightened; the socket
+    // must be 0700; $XDG_RUNTIME_DIR itself must not be touched.
+    let base = env.runtime.path().to_path_buf();
+    let dir = base.join("keyhold");
+    fs::create_dir_all(&dir).unwrap();
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
+    fs::set_permissions(&base, fs::Permissions::from_mode(0o755)).unwrap();
+
+    env.succeed(&["on"]);
+    let mode = |p: &std::path::Path| {
+        fs::metadata(p).unwrap().permissions().mode() & 0o777
+    };
+    assert_eq!(mode(&dir), 0o700, "runtime dir is not private");
+    assert_eq!(mode(&env.sock()), 0o700, "socket is not private");
+    assert_eq!(mode(&base), 0o755, "$XDG_RUNTIME_DIR was modified");
 }
 
 #[test]

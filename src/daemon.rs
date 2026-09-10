@@ -17,7 +17,7 @@ use std::{
         fs::PermissionsExt,
         net::{UnixListener, UnixStream},
     },
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::{Arc, Condvar, Mutex, MutexGuard},
     thread,
@@ -166,10 +166,20 @@ pub fn run(gpg: Gpg) -> Result<()> {
     Ok(())
 }
 
+/// Create the private runtime directory (or accept an existing one) with
+/// mode 0700, as documented. Failures are real errors: a runtime directory
+/// we could not make private must not silently pass. `$XDG_RUNTIME_DIR`
+/// itself is never modified.
+fn ensure_private_dir(dir: &Path) -> Result<()> {
+    fs::create_dir_all(dir)?;
+    fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
+    Ok(())
+}
+
 /// Bind the daemon socket, recovering from stale socket files and refusing to
 /// start when another daemon is live.
 fn bind(paths: &Paths) -> Result<UnixListener> {
-    fs::create_dir_all(&paths.dir)?;
+    ensure_private_dir(&paths.dir)?;
     for _ in 0..3 {
         if paths.sock.exists() && UnixStream::connect(&paths.sock).is_ok() {
             return Err(Error::Daemon(
@@ -179,11 +189,12 @@ fn bind(paths: &Paths) -> Result<UnixListener> {
         let _ = fs::remove_file(&paths.sock);
         match UnixListener::bind(&paths.sock) {
             Ok(listener) => {
-                // Belt and braces: XDG_RUNTIME_DIR is already 0700 per spec.
-                let _ = fs::set_permissions(
+                // Belt and braces: the umask could otherwise loosen the
+                // socket's mode below the documented 0700.
+                fs::set_permissions(
                     &paths.sock,
                     fs::Permissions::from_mode(0o700),
-                );
+                )?;
                 return Ok(listener);
             }
             // Someone else bound the socket between our probe and bind:
@@ -346,5 +357,41 @@ fn scheduler(pair: &Pair, gpg: &Gpg) {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn mode_of(path: &Path) -> u32 {
+        fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    #[test]
+    fn runtime_dir_is_created_private() {
+        let base = tempfile::TempDir::new().unwrap();
+        let dir = base.path().join("keyhold");
+        ensure_private_dir(&dir).unwrap();
+        assert_eq!(mode_of(&dir), 0o700);
+    }
+
+    #[test]
+    fn existing_runtime_dir_mode_is_tightened() {
+        let base = tempfile::TempDir::new().unwrap();
+        let dir = base.path().join("keyhold");
+        fs::create_dir_all(&dir).unwrap();
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
+        ensure_private_dir(&dir).unwrap();
+        assert_eq!(mode_of(&dir), 0o700);
+    }
+
+    #[test]
+    fn parent_directory_mode_is_left_alone() {
+        let base = tempfile::TempDir::new().unwrap();
+        fs::set_permissions(base.path(), fs::Permissions::from_mode(0o755))
+            .unwrap();
+        ensure_private_dir(&base.path().join("keyhold")).unwrap();
+        assert_eq!(mode_of(base.path()), 0o755);
     }
 }

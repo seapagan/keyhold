@@ -281,8 +281,38 @@ fn missing_gpg_executable_is_reported() {
     cmd.env("KEYHOLD_GPG", "/nonexistent/fake-gpg");
     let out = cmd.output().unwrap();
     assert!(!out.status.success());
+
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("gpg executable not found"), "{stderr}");
+}
+
+#[test]
+fn daemon_stop_is_always_acknowledged() {
+    // The shutdown acknowledgement must be written before daemon exit.
+    // Repeat the whole cycle so the ordering guarantee is exercised, not
+    // just sampled once: a lost acknowledgement makes `daemon --stop` fail
+    // with "daemon closed the connection without a response".
+    let env = TestEnv::new();
+    for _ in 0..10 {
+        let mut daemon = env
+            .keyhold(&["daemon"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        assert!(
+            wait_for_status(&env, "Daemon: running", 5 * SECS),
+            "daemon did not start: {}",
+            env.status()
+        );
+        assert_eq!(env.stdout(&["daemon", "--stop"]), "Daemon stopped.\n");
+        wait_with_kill(&mut daemon, 5 * SECS);
+        assert!(
+            common::wait_until(5 * SECS, || !env.sock().exists()),
+            "socket file was not removed"
+        );
+    }
 }
 
 #[test]

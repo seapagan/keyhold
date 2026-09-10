@@ -226,26 +226,40 @@ fn accept_loop(listener: UnixListener, pair: Pair) {
 fn handle(stream: UnixStream, pair: Pair) {
     let _ = stream.set_read_timeout(Some(REQUEST_TIMEOUT));
     let _ = stream.set_write_timeout(Some(REQUEST_TIMEOUT));
-    let response = match ipc::read_request(&stream) {
+    let (response, shutdown) = match ipc::read_request(&stream) {
         // Client disconnected without sending anything: nothing to do.
         Ok(None) => return,
         Ok(Some(request)) => apply(request, &pair),
-        Err(e) => Response::err(e.to_string()),
+        Err(e) => (Response::err(e.to_string()), false),
     };
+    // A shutdown request may only take effect once its acknowledgement has
+    // been written (and flushed) to the socket: after these bytes are handed
+    // to the kernel the client can read them even if the daemon exits
+    // immediately afterwards. Setting the flag before the write let the
+    // scheduler tear the daemon down while the response was still in flight.
     let _ = ipc::write_response(&stream, &response);
+    if shutdown {
+        lock(&pair).shutdown = true;
+        pair.1.notify_all();
+    }
 }
 
-fn apply(request: Request, pair: &Pair) -> Response {
+/// Apply one request, returning the response to send and whether the daemon
+/// should shut down once that response has been acknowledged.
+fn apply(request: Request, pair: &Pair) -> (Response, bool) {
     let mut shared = lock(pair);
     match request {
-        Request::Ping => Response::ok(),
+        Request::Ping => (Response::ok(), false),
         Request::On {
             key,
             interval_ms,
             hold_ms,
         } => {
             if interval_ms == 0 {
-                return Response::err("interval must be greater than zero");
+                return (
+                    Response::err("interval must be greater than zero"),
+                    false,
+                );
             }
             shared.hold.turn_on(
                 key,
@@ -254,20 +268,20 @@ fn apply(request: Request, pair: &Pair) -> Response {
                 Instant::now(),
             );
             pair.1.notify_all();
-            Response::ok()
+            (Response::ok(), false)
         }
         Request::Off => {
             shared.hold.turn_off();
             shared.hold.clear_error();
             pair.1.notify_all();
-            Response::ok()
+            (Response::ok(), false)
         }
-        Request::Status => Response::with_status(shared.hold.status()),
-        Request::Shutdown => {
-            shared.shutdown = true;
-            pair.1.notify_all();
-            Response::ok()
+        Request::Status => {
+            (Response::with_status(shared.hold.status()), false)
         }
+        // The flag itself is set by `handle` after the acknowledgement is
+        // written; setting it here would let the scheduler exit first.
+        Request::Shutdown => (Response::ok(), true),
     }
 }
 

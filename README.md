@@ -3,12 +3,15 @@
 Temporarily keep a GPG private key cached in `gpg-agent` while you explicitly
 allow it.
 
-`gpg-agent` forgets your passphrase after `default-cache-ttl` seconds of
-inactivity — a sensible default, but painful when you are actively signing
-things for an afternoon. `keyhold` periodically performs a harmless signing
-operation with your key, refreshing that *normal* idle timer for exactly as
-long as you allow it. Turn it off (or let a `--for` deadline lapse) and the
-key simply expires on its own again.
+`keyhold` was primarily created for long-running unattended coding-agent
+sessions that make GPG-signed commits. `gpg-agent` normally forgets your
+passphrase after `default-cache-ttl` seconds of inactivity, so a later commit
+can end up blocked on pinentry when nobody is there to answer it. `keyhold`
+periodically performs a harmless signing operation with your key, refreshing
+that normal idle timer for exactly as long as you allow it. Turn it off (or let
+a `--for` deadline lapse) and normal GnuPG cache expiry resumes. It is equally
+useful during attended development when repeatedly unlocking the same key is
+simply inconvenient.
 
 `keyhold` never sees, stores, or handles your passphrase. GnuPG and pinentry
 remain entirely responsible for unlocking the key.
@@ -263,11 +266,11 @@ Run `keyhold on` again to unlock via the normal pinentry flow and resume.
 
 ## Exit codes
 
-| Code | Meaning                                |
-| ---- | -------------------------------------- |
-| 0    | success                                |
+| Code | Meaning                                 |
+| ---- | --------------------------------------- |
+| 0    | success                                 |
 | 1    | operational failure (message on stderr) |
-| 2    | usage error (invalid arguments)        |
+| 2    | usage error (invalid arguments)         |
 
 ## Development
 

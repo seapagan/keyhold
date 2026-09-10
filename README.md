@@ -52,6 +52,12 @@ keyhold off                   # stop holding; cache expires naturally
 keyhold status                # what is happening right now
 ```
 
+Output uses restrained semantic colour when writing to a terminal —
+success in green, inactive states in yellow, errors in red. Colour is
+handled automatically (via the `colored_text` crate): redirected or piped
+output stays plain, and `NO_COLOR` plus the standard force-colour
+variables are honoured. There is no colour configuration option.
+
 A typical session:
 
 ```text

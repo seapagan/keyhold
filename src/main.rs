@@ -13,6 +13,7 @@ use keyhold::{
     error::{Error, Result},
     gpg::{Gpg, PingMode},
     ipc::{self, Request, Response},
+    presentation,
     state::StatusData,
 };
 
@@ -21,7 +22,7 @@ fn main() -> ExitCode {
     match run(cli.command) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            eprintln!("keyhold: error: {e}");
+            presentation::error(&e.to_string());
             ExitCode::FAILURE
         }
     }
@@ -85,10 +86,10 @@ fn on(
     check(ipc::request(&request)?)?;
 
     match hold_for {
-        Some(d) => {
-            println!("Keyhold enabled for {}.", humantime::format_duration(d))
-        }
-        None => println!("Keyhold enabled (no expiry)."),
+        Some(d) => presentation::enabled_for(
+            &humantime::format_duration(d).to_string(),
+        ),
+        None => presentation::enabled_indefinitely(),
     }
     Ok(())
 }
@@ -97,12 +98,12 @@ fn off() -> Result<()> {
     match daemon::connect() {
         Ok(_) => {
             check(ipc::request(&Request::Off)?)?;
-            println!("Keyhold disabled.");
+            presentation::disabled();
             Ok(())
         }
         // Nothing is running, so nothing is held: idempotent success.
         Err(Error::DaemonNotRunning) => {
-            println!("Keyhold disabled.");
+            presentation::disabled();
             Ok(())
         }
         Err(e) => Err(e),
@@ -133,11 +134,11 @@ fn daemon_stop() -> Result<()> {
     match daemon::connect() {
         Ok(_) => {
             check(ipc::request(&Request::Shutdown)?)?;
-            println!("Daemon stopped.");
+            presentation::daemon_stopped();
             Ok(())
         }
         Err(Error::DaemonNotRunning) => {
-            println!("Daemon not running.");
+            presentation::daemon_not_running();
             Ok(())
         }
         Err(e) => Err(e),

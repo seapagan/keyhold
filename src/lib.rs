@@ -22,4 +22,5 @@ pub mod daemon;
 pub mod error;
 pub mod gpg;
 pub mod ipc;
+pub mod presentation;
 pub mod state;

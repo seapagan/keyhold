@@ -1,3 +1,20 @@
 /target
 /dist
 *.sock
+
+# bundle-repo related
+packed-repo.xml
+packed-repo.xml.gz
+*.patch
+.bundlerepo.toml
+
+# changelog generator
+.changelog_generator.toml
+
+# AI stuff
+.agents/
+.codex/
+.claude/
+.codegraph/
+AGENTS.md
+CLAUDE.md

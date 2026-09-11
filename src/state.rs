@@ -117,8 +117,8 @@ pub struct Hold {
     pub last_ping: Option<SystemTime>,
     /// Last keepalive failure message.
     pub last_error: Option<String>,
-    /// Bumped on every on/off transition so pings racing a transition are
-    /// discarded.
+    /// Bumped on every successful `on`. Together with the enabled-state
+    /// check, this discards scheduled work racing a replacement or `off`.
     pub generation: u64,
     /// Fingerprint of the exact signing key backing the hold, when
     /// resolved at activation.

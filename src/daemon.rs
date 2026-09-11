@@ -528,8 +528,9 @@ fn apply(request: Request, pair: &Pair) -> (Response, bool) {
 ///
 /// Sleeps on the condvar until the next ping, renewal or deadline (or an
 /// IPC wake-up), then acts. All GPG/Secret Service work runs outside the
-/// shared lock; results are applied only if no `on`/`off` transition
-/// happened meanwhile (generation check).
+/// shared lock. The due action and its hold snapshot are captured under
+/// that lock; results are applied only if the generation still matches
+/// and the hold remains enabled.
 fn scheduler(pair: &Pair, services: &Services) {
     loop {
         let action = {
@@ -539,7 +540,7 @@ fn scheduler(pair: &Pair, services: &Services) {
                     return;
                 }
                 let now = Instant::now();
-                if let Some(action) = shared.hold.due_action(now) {
+                if let Some(action) = scheduled_action(&shared.hold, now) {
                     break action;
                 }
                 let timeout = match shared.hold.next_wake(now) {
@@ -564,9 +565,10 @@ fn scheduler(pair: &Pair, services: &Services) {
         };
 
         match action {
-            Action::Expire => lock(pair).hold.turn_off(),
-            Action::Ping => {
-                let snapshot = snapshot(pair);
+            ScheduledAction::Expire { generation } => {
+                apply_expiry(pair, generation);
+            }
+            ScheduledAction::Ping(snapshot) => {
                 let result = ping(&services.gpg, &snapshot);
                 // A stored-mode ping that failed before its scheduled
                 // renewal (agent restart, external clear, race) gets
@@ -586,24 +588,29 @@ fn scheduler(pair: &Pair, services: &Services) {
                 };
                 apply_ping_result(pair, snapshot.generation, result);
             }
-            Action::Renew => {
-                let snapshot = snapshot(pair);
+            ScheduledAction::Renew(snapshot) => {
                 let result = renew_once(services, &snapshot);
-                let mut shared = lock(pair);
-                if shared.hold.generation == snapshot.generation
-                    && shared.hold.enabled
-                {
-                    match result {
-                        Ok(()) => shared
-                            .hold
-                            .record_renewal(Instant::now(), SystemTime::now()),
-                        Err(e) => {
-                            shared.hold.record_ping_failure(e.to_string())
-                        }
-                    }
-                }
+                apply_renewal_result(pair, snapshot.generation, result);
             }
         }
+    }
+}
+
+enum ScheduledAction {
+    Ping(HoldSnapshot),
+    Renew(HoldSnapshot),
+    Expire { generation: u64 },
+}
+
+fn scheduled_action(hold: &Hold, now: Instant) -> Option<ScheduledAction> {
+    match hold.due_action(now)? {
+        Action::Ping => Some(ScheduledAction::Ping(HoldSnapshot::from(hold))),
+        Action::Renew => {
+            Some(ScheduledAction::Renew(HoldSnapshot::from(hold)))
+        }
+        Action::Expire => Some(ScheduledAction::Expire {
+            generation: hold.generation,
+        }),
     }
 }
 
@@ -618,14 +625,15 @@ struct HoldSnapshot {
     credential_mode: CredentialMode,
 }
 
-fn snapshot(pair: &Pair) -> HoldSnapshot {
-    let shared = lock(pair);
-    HoldSnapshot {
-        generation: shared.hold.generation,
-        key: shared.hold.key.clone(),
-        fingerprint: shared.hold.fingerprint.clone(),
-        keygrip: shared.hold.keygrip.clone(),
-        credential_mode: shared.hold.credential_mode,
+impl From<&Hold> for HoldSnapshot {
+    fn from(hold: &Hold) -> Self {
+        Self {
+            generation: hold.generation,
+            key: hold.key.clone(),
+            fingerprint: hold.fingerprint.clone(),
+            keygrip: hold.keygrip.clone(),
+            credential_mode: hold.credential_mode,
+        }
     }
 }
 
@@ -676,6 +684,13 @@ fn exact_target(snapshot: &HoldSnapshot) -> Option<SigningTarget> {
         })
 }
 
+fn apply_expiry(pair: &Pair, generation: u64) {
+    let mut shared = lock(pair);
+    if shared.hold.generation == generation && shared.hold.enabled {
+        shared.hold.turn_off();
+    }
+}
+
 /// Apply a ping outcome under the lock, discarding races.
 fn apply_ping_result(pair: &Pair, generation: u64, result: Result<()>) {
     let mut shared = lock(pair);
@@ -689,9 +704,170 @@ fn apply_ping_result(pair: &Pair, generation: u64, result: Result<()>) {
     }
 }
 
+fn apply_renewal_result(pair: &Pair, generation: u64, result: Result<()>) {
+    let mut shared = lock(pair);
+    if shared.hold.generation == generation && shared.hold.enabled {
+        match result {
+            Ok(()) => shared
+                .hold
+                .record_renewal(Instant::now(), SystemTime::now()),
+            Err(e) => shared.hold.record_ping_failure(e.to_string()),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn pair_with(hold: Hold) -> Pair {
+        Arc::new((
+            Mutex::new(Shared {
+                hold,
+                shutdown: false,
+            }),
+            Condvar::new(),
+        ))
+    }
+
+    fn target(fingerprint: &str, keygrip: &str) -> SigningTarget {
+        SigningTarget {
+            fingerprint: fingerprint.into(),
+            keygrip: Some(keygrip.into()),
+        }
+    }
+
+    fn replace_with_ordinary(pair: &Pair, now: Instant) {
+        let new_target = target("NEW-FINGERPRINT", "NEW-KEYGRIP");
+        lock(pair)
+            .hold
+            .turn_on(
+                Some("NEW".into()),
+                crate::state::KeySource::Explicit,
+                Duration::from_secs(60),
+                None,
+                now,
+                UNIX_EPOCH + Duration::from_secs(2),
+                Activation {
+                    target: Some(&new_target),
+                    cache: None,
+                },
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn selected_expiry_cannot_disable_a_replacement_hold() {
+        let start = Instant::now();
+        let mut hold = Hold::default();
+        hold.turn_on(
+            Some("OLD".into()),
+            crate::state::KeySource::Explicit,
+            Duration::from_secs(60),
+            Some(Duration::from_millis(1)),
+            start,
+            UNIX_EPOCH + Duration::from_secs(1),
+            Activation::none(),
+        )
+        .unwrap();
+        let action = scheduled_action(&hold, start + Duration::from_millis(1))
+            .expect("expiry due");
+        let pair = pair_with(hold);
+        replace_with_ordinary(&pair, start + Duration::from_millis(2));
+
+        let ScheduledAction::Expire { generation } = action else {
+            panic!("wrong action")
+        };
+        apply_expiry(&pair, generation);
+
+        let shared = lock(&pair);
+        assert!(shared.hold.enabled);
+        assert_eq!(shared.hold.key.as_deref(), Some("NEW"));
+    }
+
+    #[test]
+    fn selected_ping_keeps_the_old_snapshot_and_discards_late_results() {
+        let start = Instant::now();
+        let old_target = target("OLD-FINGERPRINT", "OLD-KEYGRIP");
+        let mut hold = Hold::default();
+        hold.turn_on(
+            Some("OLD".into()),
+            crate::state::KeySource::Explicit,
+            Duration::from_millis(1),
+            None,
+            start,
+            UNIX_EPOCH + Duration::from_secs(1),
+            Activation {
+                target: Some(&old_target),
+                cache: None,
+            },
+        )
+        .unwrap();
+        let action = scheduled_action(&hold, start + Duration::from_millis(1))
+            .expect("ping due");
+        let pair = pair_with(hold);
+        replace_with_ordinary(&pair, start + Duration::from_millis(2));
+
+        let ScheduledAction::Ping(snapshot) = action else {
+            panic!("wrong action")
+        };
+        assert_eq!(snapshot.key.as_deref(), Some("OLD"));
+        assert_eq!(snapshot.fingerprint.as_deref(), Some("OLD-FINGERPRINT"));
+        for result in [Ok(()), Err(Error::Message("old ping failed".into()))] {
+            apply_ping_result(&pair, snapshot.generation, result);
+        }
+
+        let shared = lock(&pair);
+        assert!(shared.hold.enabled);
+        assert_eq!(shared.hold.key.as_deref(), Some("NEW"));
+        assert!(shared.hold.last_error.is_none());
+    }
+
+    #[test]
+    fn selected_renewal_keeps_the_old_snapshot_and_discards_late_results() {
+        let start = Instant::now();
+        let activated = UNIX_EPOCH + Duration::from_secs(1);
+        let old_target = target("OLD-FINGERPRINT", "OLD-KEYGRIP");
+        let mut hold = Hold::default();
+        hold.turn_on(
+            Some("OLD".into()),
+            crate::state::KeySource::Explicit,
+            Duration::from_secs(60),
+            None,
+            start,
+            activated,
+            Activation {
+                target: Some(&old_target),
+                cache: Some(CachePlan {
+                    mode: CredentialMode::Session,
+                    default_ttl: Duration::from_secs(5),
+                    max_ttl: Duration::from_secs(10),
+                    started_wall: Some(activated),
+                }),
+            },
+        )
+        .unwrap();
+        let action = scheduled_action(&hold, start + Duration::from_secs(9))
+            .expect("renewal due");
+        let pair = pair_with(hold);
+        replace_with_ordinary(&pair, start + Duration::from_secs(10));
+
+        let ScheduledAction::Renew(snapshot) = action else {
+            panic!("wrong action")
+        };
+        assert_eq!(snapshot.keygrip.as_deref(), Some("OLD-KEYGRIP"));
+        assert_eq!(snapshot.credential_mode, CredentialMode::Session);
+        for result in
+            [Ok(()), Err(Error::Message("old renewal failed".into()))]
+        {
+            apply_renewal_result(&pair, snapshot.generation, result);
+        }
+
+        let shared = lock(&pair);
+        assert!(shared.hold.enabled);
+        assert_eq!(shared.hold.key.as_deref(), Some("NEW"));
+        assert!(shared.hold.last_error.is_none());
+    }
 
     fn mode_of(path: &Path) -> u32 {
         fs::metadata(path).unwrap().permissions().mode() & 0o777

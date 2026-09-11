@@ -762,7 +762,6 @@ fn apply_renewal_result(pair: &Pair, generation: u64, result: Result<()>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::mpsc;
 
     fn test_paths(base: &Path) -> Paths {
         let dir = base.join("keyhold");
@@ -788,17 +787,17 @@ mod tests {
         let paths = test_paths(base.path());
         fs::create_dir_all(&paths.dir).unwrap();
         drop(UnixListener::bind(&paths.sock).unwrap());
-        let sock = paths.sock.clone();
-        let (tx, rx) = mpsc::channel();
 
-        thread::spawn(move || {
-            tx.send(wait_until_stopped_at(&paths, Duration::from_secs(1)))
-                .unwrap();
-        });
+        let error = wait_until_stopped_at(&paths, Duration::ZERO).unwrap_err();
 
-        assert!(rx.recv_timeout(Duration::from_millis(50)).is_err());
-        fs::remove_file(sock).unwrap();
-        rx.recv_timeout(Duration::from_secs(1)).unwrap().unwrap();
+        assert!(matches!(
+            error,
+            Error::Daemon(message)
+                if message
+                    == "daemon acknowledged shutdown but did not finish stopping within 0s"
+        ));
+        fs::remove_file(&paths.sock).unwrap();
+        wait_until_stopped_at(&paths, Duration::from_millis(100)).unwrap();
     }
 
     #[test]
@@ -807,18 +806,18 @@ mod tests {
         let paths = test_paths(base.path());
         fs::create_dir_all(&paths.dir).unwrap();
         let listener = UnixListener::bind(&paths.sock).unwrap();
-        let sock = paths.sock.clone();
-        let (tx, rx) = mpsc::channel();
 
-        thread::spawn(move || {
-            tx.send(wait_until_stopped_at(&paths, Duration::from_secs(1)))
-                .unwrap();
-        });
+        let error = wait_until_stopped_at(&paths, Duration::ZERO).unwrap_err();
 
-        assert!(rx.recv_timeout(Duration::from_millis(50)).is_err());
+        assert!(matches!(
+            error,
+            Error::Daemon(message)
+                if message
+                    == "daemon acknowledged shutdown but did not finish stopping within 0s"
+        ));
         drop(listener);
-        fs::remove_file(sock).unwrap();
-        rx.recv_timeout(Duration::from_secs(1)).unwrap().unwrap();
+        fs::remove_file(&paths.sock).unwrap();
+        wait_until_stopped_at(&paths, Duration::from_millis(100)).unwrap();
     }
 
     #[test]

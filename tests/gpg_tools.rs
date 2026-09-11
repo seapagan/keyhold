@@ -260,6 +260,57 @@ fn probe_target_honours_explicit_subkey_selector() {
     assert_eq!(probed, target(PRIMARY_FPR, PRIMARY_GRIP));
 }
 
+/// Regression: a short (8-char) key id selecting the older signing
+/// subkey used to fall through to the newer subkey — the wrong
+/// keygrip. Every selector form GnuPG accepts (verified against 2.4)
+/// must resolve the same locked subkey.
+#[test]
+fn probe_target_resolves_locked_subkey_by_every_selector_form() {
+    let selectors = [
+        "4E7D2CD7".to_string(),
+        "4e7d2cd7".to_string(),
+        "0x4E7D2CD7".to_string(),
+        "0x4e7d2cd7".to_string(),
+        "212181504E7D2CD7".to_string(),
+        "0x212181504E7D2CD7".to_string(),
+        format!("0x{}", SUB_FPR.to_lowercase()),
+        format!("{}!", SUB_FPR),
+        "4E7D2CD7!".to_string(),
+    ];
+    for selector in &selectors {
+        let tools = Tools::new();
+        tools.marker("lock");
+        let probed = tools.gpg.probe_target(Some(selector)).unwrap();
+        assert_eq!(
+            probed,
+            target(SUB_FPR, SUB_GRIP),
+            "selector {selector} resolved the wrong key"
+        );
+    }
+}
+
+/// A selector naming the primary (in any form) keeps GPG's normal
+/// behaviour of signing with the newest signing subkey when not
+/// forced.
+#[test]
+fn probe_target_primary_selector_follows_gpg_default_selection() {
+    for selector in [
+        PRIMARY_FPR,
+        "8FACE96FA6D9DB48",
+        "0x8FACE96FA6D9DB48",
+        "A6D9DB48",
+    ] {
+        let tools = Tools::new();
+        tools.marker("lock");
+        let probed = tools.gpg.probe_target(Some(selector)).unwrap();
+        assert_eq!(
+            probed,
+            target(SUB2_FPR, SUB2_GRIP),
+            "primary selector {selector} must not force the primary"
+        );
+    }
+}
+
 #[test]
 fn probe_target_on_unlocked_key_uses_sig_created() {
     let tools = Tools::new();

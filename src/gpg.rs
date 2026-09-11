@@ -779,7 +779,6 @@ fn key_record(fields: &[&str], primary: bool) -> SecretKeyRecord {
         keygrip: None,
         created: fields.get(5).and_then(|t| t.parse::<u64>().ok()),
         capabilities: fields.get(11).unwrap_or(&"").to_string(),
-        // Validity (field 2): revoked (r), expired (e), invalid (n),
         // disabled (d) and invalid (i) records are unusable.
         usable: !matches!(
             fields.get(1),
@@ -794,63 +793,73 @@ fn field_id(value: Option<&&str>) -> Option<String> {
     (id.len() == 40 && is_hex_id(id)).then(|| id.to_ascii_uppercase())
 }
 
-/// Find the record matching an id: full fingerprint (case-insensitive),
-/// keygrip, long key id or short key id.
+/// Find the record matching an id: full fingerprint, keygrip, long key
+/// id, short key id (last 8 hex chars), each case-insensitive and with
+/// an optional `0x` prefix — every selector form GnuPG accepts.
 pub fn find_by_id<'a>(
     blocks: &'a [KeyBlock],
     id: &str,
 ) -> Option<&'a SecretKeyRecord> {
-    let needle = id.trim().to_ascii_uppercase();
-    let matches_one = |r: &&SecretKeyRecord| {
-        r.fingerprint == needle
-            || r.keygrip.as_deref() == Some(needle.as_str())
-    };
+    let (needle, _) = normalize_selector(id);
     blocks
         .iter()
         .flat_map(|b| std::iter::once(&b.primary).chain(b.subkeys.iter()))
-        .find(matches_one)
-        .or_else(|| {
-            blocks
-                .iter()
-                .flat_map(|b| {
-                    std::iter::once(&b.primary).chain(b.subkeys.iter())
-                })
-                .find(|r| {
-                    r.keyid == needle
-                        || needle.len() == 8 && r.keyid.ends_with(&needle)
-                })
-        })
+        .find(|r| matches_key_id(r, &needle))
+}
+
+/// Normalize a user key selector to its comparable form: trim, drop a
+/// trailing exact-match marker (`!`), drop an optional `0x`/`0X`
+/// prefix (accepted by GnuPG for every id form; verified against
+/// 2.4), and uppercase. Returns the normalized id and whether the `!`
+/// marker was present.
+fn normalize_selector(selector: &str) -> (String, bool) {
+    let trimmed = selector.trim();
+    let forced = trimmed.ends_with('!');
+    let body = trimmed.trim_end_matches('!').trim();
+    let body = body
+        .strip_prefix("0x")
+        .or_else(|| body.strip_prefix("0X"))
+        .unwrap_or(body);
+    (body.to_ascii_uppercase(), forced)
+}
+
+/// Whether `record` is named by an already-normalized selector id:
+/// full fingerprint, keygrip, long key id, or the last 8 hex chars of
+/// the key id (GnuPG's short key id).
+fn matches_key_id(record: &SecretKeyRecord, needle: &str) -> bool {
+    record.fingerprint == needle
+        || record.keygrip.as_deref() == Some(needle)
+        || record.keyid == needle
+        || (needle.len() == 8 && record.keyid.ends_with(needle))
 }
 
 /// The key GPG's default selection would use to sign within `block`:
-/// a selector naming a specific subkey wins; otherwise the newest usable
-/// signing-capable key (primary or subkey — GPG prefers the newest
-/// signing subkey, verified against GnuPG 2.4).
+/// a selector naming a specific subkey wins (in any id form —
+/// fingerprint, long id, short id, `0x`-prefixed — exactly like
+/// [`find_by_id`], so all selector forms behave consistently);
+/// otherwise the newest usable signing-capable key (primary or
+/// subkey — GPG prefers the newest signing subkey, verified against
+/// GnuPG 2.4).
 pub fn default_signing_key<'a>(
     block: &'a KeyBlock,
     selector: Option<&str>,
 ) -> Option<&'a SecretKeyRecord> {
     if let Some(selector) = selector {
-        let needle =
-            selector.trim().trim_end_matches('!').to_ascii_uppercase();
+        let (needle, forced) = normalize_selector(selector);
         if is_hex_id(&needle) {
             // A selector naming a subkey of this block is exact-key
-            // semantics: gpg signs with exactly that subkey. A selector
-            // naming the primary selects the key *block* (verified:
-            // `--local-user <primary>` still signs with the newest
-            // signing subkey), so it falls through to the default rule
-            // below unless it carries the force (`!`) suffix.
-            let forced = selector.trim().ends_with('!');
-            let primary_selected = block.primary.fingerprint == needle
-                || block.primary.keyid == needle;
-            if let Some(sub) = block
-                .subkeys
-                .iter()
-                .find(|r| r.fingerprint == needle || r.keyid == needle)
+            // semantics: gpg signs with exactly that subkey. A
+            // selector naming the primary selects the key *block*
+            // (verified: `--local-user <primary>` still signs with
+            // the newest signing subkey), so it falls through to the
+            // default rule below unless it carries the force (`!`)
+            // suffix.
+            if let Some(sub) =
+                block.subkeys.iter().find(|r| matches_key_id(r, &needle))
             {
                 return Some(sub);
             }
-            if forced && primary_selected {
+            if forced && matches_key_id(&block.primary, &needle) {
                 return Some(&block.primary);
             }
         }
@@ -1167,6 +1176,82 @@ mod tests {
             default_signing_key(&blocks[0], Some(&format!("{PRIMARY_FPR}!")))
                 .expect("a signer");
         assert_eq!(forced.fingerprint, PRIMARY_FPR);
+    }
+
+    #[test]
+    fn default_signing_key_resolves_the_older_subkey_by_short_id() {
+        let blocks = parse_key_blocks(&listing());
+        // The 8-char short id names the older signing subkey; without
+        // short-id matching this used to fall through to the newer
+        // subkey — silently operating on the wrong keygrip.
+        let target = default_signing_key(&blocks[0], Some("4E7D2CD7"))
+            .expect("a signer");
+        assert_eq!(target.fingerprint, SUB_FPR);
+        assert_eq!(target.keygrip.as_deref(), Some(SUB_GRIP));
+    }
+
+    #[test]
+    fn default_signing_key_selector_forms_agree() {
+        let blocks = parse_key_blocks(&listing());
+        // Every id form GnuPG accepts (verified against 2.4: `0x`
+        // prefixes and short ids are valid --local-user selectors)
+        // must resolve the same subkey, case-insensitively, with and
+        // without the exact (`!`) marker.
+        let forms = [
+            SUB_FPR.to_string(),
+            format!("{}!", SUB_FPR),
+            SUB_FPR.to_lowercase(),
+            SUB_ID.to_string(),
+            format!("0x{SUB_ID}"),
+            format!("0x{}", SUB_ID.to_lowercase()),
+            "4E7D2CD7".to_string(),
+            "4e7d2cd7".to_string(),
+            "0x4E7D2CD7".to_string(),
+            "0x4e7d2cd7".to_string(),
+            format!("{}!", SUB_ID),
+        ];
+        for form in &forms {
+            let target =
+                default_signing_key(&blocks[0], Some(form)).expect(form);
+            assert_eq!(target.fingerprint, SUB_FPR, "selector {form}");
+            assert_eq!(target.keygrip.as_deref(), Some(SUB_GRIP));
+        }
+    }
+
+    #[test]
+    fn default_signing_key_primary_selector_still_prefers_subkeys() {
+        let blocks = parse_key_blocks(&listing());
+        // A primary named in any form selects the key block: GPG signs
+        // with the newest signing subkey unless `!` forces the primary.
+        for primary in [PRIMARY_FPR, PRIMARY_ID, "A6D9DB48"] {
+            let target =
+                default_signing_key(&blocks[0], Some(primary)).unwrap();
+            assert_eq!(target.fingerprint, SUB2_FPR, "selector {primary}");
+            let forced =
+                default_signing_key(&blocks[0], Some(&format!("{primary}!")))
+                    .unwrap();
+            assert_eq!(forced.fingerprint, PRIMARY_FPR, "selector {primary}!");
+        }
+    }
+
+    #[test]
+    fn find_by_id_accepts_0x_prefixed_and_case_insensitive_ids() {
+        let blocks = parse_key_blocks(&listing());
+        assert_eq!(
+            find_by_id(&blocks, &format!("0x{SUB_ID}"))
+                .map(|r| &r.fingerprint),
+            Some(&SUB_FPR.to_string())
+        );
+        assert_eq!(
+            find_by_id(&blocks, "0x4e7d2cd7").map(|r| &r.fingerprint),
+            Some(&SUB_FPR.to_string())
+        );
+        // An `!` marker is tolerated by the shared normalization.
+        assert_eq!(
+            find_by_id(&blocks, &format!("{SUB_FPR}!"))
+                .map(|r| &r.fingerprint),
+            Some(&SUB_FPR.to_string())
+        );
     }
 
     #[test]

@@ -836,8 +836,8 @@ pub fn parse_keyinfo(text: &str) -> Option<AgentKeyState> {
     None
 }
 
-/// Resolve a tool executable: `$override` if set (made absolute, since the
-/// daemon runs with cwd `/`), else the first executable `name` on
+/// Resolve a tool executable: `$override` if set (made absolute, since
+/// the daemon runs with cwd `/`), else the first executable `name` on
 /// `$PATH`. `required` turns a missing tool into an error.
 fn detect_tool(
     override_env: &str,
@@ -852,9 +852,14 @@ fn detect_tool(
             path = cwd.join(path);
         }
         if !is_executable(&path) {
-            return Err(Error::GpgNotFound(
-                spec.to_string_lossy().into_owned(),
-            ));
+            let detail = spec.to_string_lossy().into_owned();
+            return Err(if required {
+                Error::GpgNotFound(detail)
+            } else {
+                Error::GpgToolNotFound(format!(
+                    "{name} (${override_env}={detail})"
+                ))
+            });
         }
         return Ok(Some(path));
     }

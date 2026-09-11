@@ -5,12 +5,7 @@
 
 mod common;
 
-use std::{
-    path::Path,
-    sync::Arc,
-    thread,
-    time::{Duration, SystemTime, UNIX_EPOCH},
-};
+use std::{path::Path, sync::Arc, thread, time::Duration};
 
 use common::{
     DaemonTools, FakeStore, SUB2_FPR, SUB2_GRIP, ipc_at, spawn_daemon,
@@ -25,13 +20,6 @@ use keyhold::{
 use zeroize::Zeroizing;
 
 const SECS: Duration = Duration::from_secs(1);
-
-fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
-}
 
 fn tmp() -> tempfile::TempDir {
     tempfile::TempDir::new().unwrap()
@@ -416,7 +404,7 @@ fn unexpected_cache_loss_is_recovered_once() {
 
     assert!(
         wait_until(5 * SECS, || {
-            running.tools.loopbacks() >= baseline_loopbacks + 1
+            running.tools.loopbacks() > baseline_loopbacks
                 && running.status()["last_error"].is_null()
         }),
         "recovery did not happen: {} / {}",
@@ -524,7 +512,7 @@ fn expiry_wins_over_renewal() {
     // expiry must win and no renewal may recreate the entry afterwards.
     running.tools.set_ttls(600, 5);
     let prepared = stored_activation(
-        &tools_gpg(&running),
+        tools_gpg(&running),
         &running.store,
         None,
         60_000,

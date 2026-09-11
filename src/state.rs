@@ -165,6 +165,31 @@ pub struct CachePlan {
     pub started_wall: Option<SystemTime>,
 }
 
+/// The resolved signing target and cache plan handed to
+/// [`Hold::turn_on`] as one unit.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Activation<'a> {
+    /// The resolved exact signing key, when identifiable.
+    pub target: Option<&'a SigningTarget>,
+    /// GPG cache tracking metadata for the daemon.
+    pub cache: Option<CachePlan>,
+}
+
+impl<'a> Activation<'a> {
+    /// No target and no cache tracking (an ordinary, unresolved hold).
+    pub fn none() -> Self {
+        Self::default()
+    }
+
+    /// Cache tracking without a resolved target.
+    pub fn cache_only(cache: CachePlan) -> Self {
+        Self {
+            target: None,
+            cache: Some(cache),
+        }
+    }
+}
+
 /// How long before GnuPG's hard maximum a proactive renewal runs.
 ///
 /// `min(60s, max_ttl/10)`, so a 2h maximum renews at 1h59m and a 5m
@@ -216,8 +241,7 @@ impl Hold {
         hold_for: Option<Duration>,
         now: Instant,
         activated: SystemTime,
-        target: Option<&SigningTarget>,
-        cache: Option<CachePlan>,
+        activation: Activation<'_>,
     ) -> Result<(), &'static str> {
         let next_ping = now
             .checked_add(interval)
@@ -226,7 +250,8 @@ impl Hold {
         if hold_for.is_some() && deadline.is_none() {
             return Err("hold duration is too large to schedule");
         }
-        let cache = match cache {
+        let target = activation.target;
+        let cache = match activation.cache {
             None => None,
             Some(plan) => {
                 let expires_wall = plan
@@ -440,8 +465,7 @@ mod tests {
             None,
             start,
             wall(1_000),
-            None,
-            None,
+            Activation::none(),
         )
         .unwrap();
         assert_eq!(hold.due_action(start), None);
@@ -461,8 +485,7 @@ mod tests {
             Some(MINUTE),
             start,
             wall(1_000),
-            None,
-            None,
+            Activation::none(),
         )
         .unwrap();
         assert_eq!(hold.due_action(start + MINUTE), Some(Action::Expire));
@@ -479,8 +502,7 @@ mod tests {
             Some(MINUTE),
             start,
             wall(1_000),
-            None,
-            None,
+            Activation::none(),
         )
         .unwrap();
         hold.turn_off();
@@ -501,8 +523,7 @@ mod tests {
             Some(MINUTE),
             start,
             wall(1_000),
-            None,
-            None,
+            Activation::none(),
         )
         .unwrap();
 
@@ -524,8 +545,7 @@ mod tests {
             Some(MINUTE),
             start,
             wall(1_000),
-            None,
-            None,
+            Activation::none(),
         )
         .unwrap();
 
@@ -548,8 +568,7 @@ mod tests {
             None,
             start,
             wall(1_000),
-            None,
-            None,
+            Activation::none(),
         )
         .unwrap();
         hold.record_ping_failure(
@@ -574,8 +593,7 @@ mod tests {
             None,
             start,
             wall(1_000),
-            None,
-            None,
+            Activation::none(),
         )
         .unwrap();
         let pinged_at = start + MINUTE;
@@ -596,8 +614,7 @@ mod tests {
             Some(MINUTE),
             start,
             wall(1_000),
-            None,
-            None,
+            Activation::none(),
         )
         .unwrap();
         let generation = hold.generation;
@@ -609,8 +626,7 @@ mod tests {
             None,
             later,
             wall(2_000),
-            None,
-            None,
+            Activation::none(),
         )
         .unwrap();
         assert_eq!(hold.generation, generation + 1);
@@ -630,8 +646,7 @@ mod tests {
             Some(Duration::from_secs(3600)),
             start,
             wall(1_000),
-            None,
-            None,
+            Activation::none(),
         )
         .unwrap();
         assert_eq!(
@@ -652,8 +667,7 @@ mod tests {
             None,
             start,
             activated,
-            None,
-            None,
+            Activation::none(),
         )
         .unwrap();
         assert_eq!(hold.last_ping, Some(activated));
@@ -674,8 +688,7 @@ mod tests {
             None,
             start,
             wall(1_000),
-            None,
-            None,
+            Activation::none(),
         )
         .unwrap();
         hold.record_ping_ok(start + MINUTE, wall(1_060));
@@ -688,8 +701,7 @@ mod tests {
             None,
             later,
             fresh,
-            None,
-            None,
+            Activation::none(),
         )
         .unwrap();
         assert_eq!(hold.last_ping, Some(fresh));
@@ -707,8 +719,7 @@ mod tests {
                 None,
                 start,
                 wall(1_000),
-                None,
-                None,
+                Activation::none(),
             )
             .unwrap_err();
         assert!(err.contains("interval"), "{err}");
@@ -729,8 +740,7 @@ mod tests {
                 Some(Duration::from_secs(u64::MAX)),
                 start,
                 wall(1_000),
-                None,
-                None,
+                Activation::none(),
             )
             .unwrap_err();
         assert!(err.contains("hold"), "{err}");
@@ -753,8 +763,7 @@ mod tests {
             Some(interval),
             start,
             wall(1_000),
-            None,
-            None,
+            Activation::none(),
         )
         .unwrap();
         assert_eq!(hold.next_ping, Some(start + interval));
@@ -775,8 +784,7 @@ mod tests {
             None,
             start,
             wall(1_000),
-            None,
-            None,
+            Activation::none(),
         )
         .unwrap();
         let status = hold.status();
@@ -794,8 +802,7 @@ mod tests {
             None,
             start,
             wall(1_000),
-            None,
-            None,
+            Activation::none(),
         )
         .unwrap();
         assert!(hold.next_ping.is_some(), "monotonic schedule kept");
@@ -846,8 +853,7 @@ mod tests {
             None,
             start,
             activated,
-            None,
-            Some(session_plan(max_ttl, activated)),
+            Activation::cache_only(session_plan(max_ttl, activated)),
         )
         .unwrap();
         let renew_at = hold
@@ -879,8 +885,10 @@ mod tests {
             None,
             start,
             activated,
-            None,
-            Some(session_plan(Duration::from_secs(300), activated)),
+            Activation::cache_only(session_plan(
+                Duration::from_secs(300),
+                activated,
+            )),
         )
         .unwrap();
         assert_eq!(
@@ -901,8 +909,10 @@ mod tests {
             Some(Duration::from_secs(300)),
             start,
             activated,
-            None,
-            Some(session_plan(Duration::from_secs(300), activated)),
+            Activation::cache_only(session_plan(
+                Duration::from_secs(300),
+                activated,
+            )),
         )
         .unwrap();
         let renew_at = start + Duration::from_secs(270);
@@ -933,8 +943,7 @@ mod tests {
             None,
             start,
             activated,
-            None,
-            Some(session_plan(max_ttl, activated)),
+            Activation::cache_only(session_plan(max_ttl, activated)),
         )
         .unwrap();
         let renewed_at = start + Duration::from_secs(270);
@@ -964,8 +973,10 @@ mod tests {
             None,
             start,
             activated,
-            None,
-            Some(session_plan(Duration::from_secs(300), activated)),
+            Activation::cache_only(session_plan(
+                Duration::from_secs(300),
+                activated,
+            )),
         )
         .unwrap();
         // A replacement hold without cache metadata drops the old plan.
@@ -976,8 +987,7 @@ mod tests {
             None,
             start + MINUTE,
             wall(2_000),
-            None,
-            None,
+            Activation::none(),
         )
         .unwrap();
         assert!(hold.cache.is_none());
@@ -995,8 +1005,10 @@ mod tests {
             None,
             start,
             wall(3_000),
-            None,
-            Some(session_plan(Duration::from_secs(300), wall(3_000))),
+            Activation::cache_only(session_plan(
+                Duration::from_secs(300),
+                wall(3_000),
+            )),
         )
         .unwrap();
         hold.turn_off();
@@ -1019,8 +1031,7 @@ mod tests {
                 None,
                 start,
                 activated,
-                None,
-                Some(CachePlan {
+                Activation::cache_only(CachePlan {
                     mode: CredentialMode::Session,
                     default_ttl: Duration::from_secs(30),
                     max_ttl: Duration::from_secs(300),
@@ -1039,8 +1050,10 @@ mod tests {
                 None,
                 start,
                 activated,
-                None,
-                Some(session_plan(Duration::from_secs(u64::MAX), activated)),
+                Activation::cache_only(session_plan(
+                    Duration::from_secs(u64::MAX),
+                    activated,
+                )),
             )
             .unwrap_err();
         assert!(err.contains("too large"), "{err}");
@@ -1059,8 +1072,7 @@ mod tests {
             None,
             start,
             wall(1_000),
-            None,
-            Some(CachePlan {
+            Activation::cache_only(CachePlan {
                 mode: CredentialMode::None,
                 default_ttl: Duration::from_secs(30),
                 max_ttl: Duration::from_secs(300),

@@ -106,16 +106,16 @@ impl TestEnv {
         fs::set_permissions(&gpg, fs::Permissions::from_mode(0o755))
             .expect("chmod fake gpg");
 
+        // The TTLs are read from the file by the shell itself, so the
+        // script is a constant.
         fs::write(
             &gpgconf,
-            format!(
-                "#!/bin/sh\n\
-                 [ -e \"$KEYHOLD_FAKE_GPGCONF_FAIL\" ] && exit 1\n\
-                 read def max < \"$KEYHOLD_FAKE_TTLS\" || exit 1\n\
-                 printf '%s\\n' \
-                 \"default-cache-ttl:24:0:expire cached PINs after N seconds:3:3:N:$def::\" \
-                 \"max-cache-ttl:24:2:set maximum PIN cache lifetime to N seconds:3:3:N:$max::\"\n",
-            ),
+            "#!/bin/sh\n\
+             [ -e \"$KEYHOLD_FAKE_GPGCONF_FAIL\" ] && exit 1\n\
+             read def max < \"$KEYHOLD_FAKE_TTLS\" || exit 1\n\
+             printf '%s\\n' \
+             \"default-cache-ttl:24:0:expire cached PINs after N seconds:3:3:N:$def::\" \
+             \"max-cache-ttl:24:2:set maximum PIN cache lifetime to N seconds:3:3:N:$max::\"\n",
         )
         .expect("write fake gpgconf");
         fs::set_permissions(&gpgconf, fs::Permissions::from_mode(0o755))

@@ -30,7 +30,7 @@ use crate::{
     error::{Error, Result},
     gpg::{Gpg, PingMode, SigningTarget},
     ipc::{self, Request, Response},
-    state::{Action, CachePlan, CredentialMode, Hold},
+    state::{Action, Activation, CachePlan, CredentialMode, Hold},
 };
 use signal_hook::{
     consts::{SIGINT, SIGTERM},
@@ -251,22 +251,16 @@ fn shutdown_cleanup(
             .then(|| shared.hold.keygrip.clone())
             .flatten()
     };
-    if policies.clear_secret {
-        if let Err(e) = services.store.clear_all() {
-            eprintln!(
-                "keyhold: daemon: clearing session credentials failed: {e}"
-            );
-        }
+    if policies.clear_secret
+        && let Err(e) = services.store.clear_all()
+    {
+        eprintln!("keyhold: daemon: clearing session credentials failed: {e}");
     }
-    if policies.lock_key {
-        if let Some(keygrip) = keygrip.as_deref() {
-            if let Err(e) = services.gpg.clear_passphrase(keygrip) {
-                eprintln!(
-                    "keyhold: daemon: clearing the GPG cache entry \
-                     failed: {e}"
-                );
-            }
-        }
+    if policies.lock_key
+        && let Some(keygrip) = keygrip.as_deref()
+        && let Err(e) = services.gpg.clear_passphrase(keygrip)
+    {
+        eprintln!("keyhold: daemon: clearing the GPG cache entry failed: {e}");
     }
 }
 
@@ -478,8 +472,10 @@ fn apply(request: Request, pair: &Pair) -> (Response, bool) {
                 hold_ms.map(Duration::from_millis),
                 Instant::now(),
                 activated,
-                target.as_ref(),
-                cache,
+                Activation {
+                    target: target.as_ref(),
+                    cache,
+                },
             ) {
                 Ok(()) => {
                     pair.1.notify_all();

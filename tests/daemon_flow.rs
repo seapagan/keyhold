@@ -35,9 +35,8 @@ fn on_enables_hold_after_foreground_ping() {
     assert_eq!(
         String::from_utf8_lossy(&out.stdout),
         "warning: GnuPG's hard max-cache-ttl (2h) will eventually end an \
-         ordinary hold unless the cache entry is recreated externally\n\
-         Keyhold enabled (no expiry).\n"
-            .replace("\\ ", "\\ ")
+ordinary hold unless the cache entry is recreated externally\n\
+Keyhold enabled (no expiry).\n"
     );
 
     let text = env.status();

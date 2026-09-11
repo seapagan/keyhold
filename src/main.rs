@@ -298,6 +298,9 @@ fn daemon_stop() -> Result<()> {
     match daemon::connect() {
         Ok(_) => {
             check(ipc::request(&Request::Shutdown)?)?;
+            // The ACK confirms acceptance. Success is not reported until the
+            // daemon has finished cleanup and removed its socket.
+            daemon::wait_until_stopped()?;
             presentation::daemon_stopped();
             Ok(())
         }

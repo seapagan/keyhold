@@ -40,6 +40,11 @@ use signal_hook::{
 /// How long `keyhold on` and `keyhold daemon --background` wait for a
 /// freshly spawned daemon to answer.
 const START_TIMEOUT: Duration = Duration::from_secs(5);
+/// Shutdown may include bounded GPG cleanup, so allow substantially longer
+/// than daemon startup while still preventing a wedged cleanup from hanging
+/// the client forever.
+const STOP_TIMEOUT: Duration = Duration::from_secs(60);
+const STOP_POLL_INTERVAL: Duration = Duration::from_millis(25);
 /// How long the daemon waits for a client to send its request.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long the accept loop waits before retrying after a failed `accept`,
@@ -75,7 +80,10 @@ pub fn paths() -> Result<Paths> {
 /// Connect to the daemon socket, mapping "nothing there" (absent socket,
 /// stale socket) to [`Error::DaemonNotRunning`].
 pub fn connect() -> Result<UnixStream> {
-    let paths = paths()?;
+    connect_at(&paths()?)
+}
+
+fn connect_at(paths: &Paths) -> Result<UnixStream> {
     match UnixStream::connect(&paths.sock) {
         Ok(stream) => Ok(stream),
         Err(e)
@@ -87,6 +95,41 @@ pub fn connect() -> Result<UnixStream> {
             Err(Error::DaemonNotRunning)
         }
         Err(e) => Err(e.into()),
+    }
+}
+
+/// Wait for an acknowledged shutdown request to finish cleanly.
+///
+/// The shutdown response means the request was accepted, not that teardown is
+/// complete. The daemon intentionally removes its socket only after scheduler
+/// exit and cleanup, so completion requires both an absent socket path and a
+/// failed connection. `ConnectionRefused` while the path remains is therefore
+/// not sufficient. The wait is bounded so wedged cleanup cannot hang the CLI.
+pub fn wait_until_stopped() -> Result<()> {
+    wait_until_stopped_at(&paths()?, STOP_TIMEOUT)
+}
+
+fn wait_until_stopped_at(paths: &Paths, timeout: Duration) -> Result<()> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        match connect_at(paths) {
+            Err(Error::DaemonNotRunning) => {
+                if !paths.sock.try_exists()? {
+                    return Ok(());
+                }
+            }
+            Ok(_) => {}
+            Err(e) => return Err(e),
+        }
+
+        let now = Instant::now();
+        if now >= deadline {
+            return Err(Error::Daemon(format!(
+                "daemon acknowledged shutdown but did not finish stopping within {}s",
+                timeout.as_secs()
+            )));
+        }
+        thread::sleep(STOP_POLL_INTERVAL.min(deadline.duration_since(now)));
     }
 }
 
@@ -719,6 +762,93 @@ fn apply_renewal_result(pair: &Pair, generation: u64, result: Result<()>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::mpsc;
+
+    fn test_paths(base: &Path) -> Paths {
+        let dir = base.join("keyhold");
+        Paths {
+            sock: dir.join("keyhold.sock"),
+            dir,
+        }
+    }
+
+    #[test]
+    fn shutdown_wait_returns_when_socket_is_absent() {
+        let base = tempfile::TempDir::new().unwrap();
+        wait_until_stopped_at(
+            &test_paths(base.path()),
+            Duration::from_millis(100),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn shutdown_wait_rejects_refused_socket_until_path_is_removed() {
+        let base = tempfile::TempDir::new().unwrap();
+        let paths = test_paths(base.path());
+        fs::create_dir_all(&paths.dir).unwrap();
+        drop(UnixListener::bind(&paths.sock).unwrap());
+        let sock = paths.sock.clone();
+        let (tx, rx) = mpsc::channel();
+
+        thread::spawn(move || {
+            tx.send(wait_until_stopped_at(&paths, Duration::from_secs(1)))
+                .unwrap();
+        });
+
+        assert!(rx.recv_timeout(Duration::from_millis(50)).is_err());
+        fs::remove_file(sock).unwrap();
+        rx.recv_timeout(Duration::from_secs(1)).unwrap().unwrap();
+    }
+
+    #[test]
+    fn shutdown_wait_rejects_live_socket_until_it_is_removed() {
+        let base = tempfile::TempDir::new().unwrap();
+        let paths = test_paths(base.path());
+        fs::create_dir_all(&paths.dir).unwrap();
+        let listener = UnixListener::bind(&paths.sock).unwrap();
+        let sock = paths.sock.clone();
+        let (tx, rx) = mpsc::channel();
+
+        thread::spawn(move || {
+            tx.send(wait_until_stopped_at(&paths, Duration::from_secs(1)))
+                .unwrap();
+        });
+
+        assert!(rx.recv_timeout(Duration::from_millis(50)).is_err());
+        drop(listener);
+        fs::remove_file(sock).unwrap();
+        rx.recv_timeout(Duration::from_secs(1)).unwrap().unwrap();
+    }
+
+    #[test]
+    fn shutdown_wait_times_out_while_socket_path_remains() {
+        let base = tempfile::TempDir::new().unwrap();
+        let paths = test_paths(base.path());
+        fs::create_dir_all(&paths.dir).unwrap();
+        drop(UnixListener::bind(&paths.sock).unwrap());
+
+        let error = wait_until_stopped_at(&paths, Duration::ZERO).unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "daemon error: daemon acknowledged shutdown but did not finish stopping within 0s"
+        );
+    }
+
+    #[test]
+    fn shutdown_wait_propagates_unexpected_connection_errors() {
+        let base = tempfile::TempDir::new().unwrap();
+        let paths = Paths {
+            dir: base.path().into(),
+            sock: base.path().join("x".repeat(256)),
+        };
+
+        assert!(matches!(
+            wait_until_stopped_at(&paths, Duration::from_millis(100)),
+            Err(Error::Io(error)) if error.kind() == io::ErrorKind::InvalidInput
+        ));
+    }
 
     fn pair_with(hold: Hold) -> Pair {
         Arc::new((

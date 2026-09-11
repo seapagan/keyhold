@@ -25,6 +25,20 @@ remain entirely responsible for unlocking the key.
 
 ## Installation
 
+Using [cargo-binstall](https://github.com/cargo-bins/cargo-binstall) —
+recommended and fastest if you already have it; downloads the prebuilt
+release binary from GitHub without compiling anything locally:
+
+```sh
+cargo binstall keyhold
+```
+
+Using Cargo — standard installation from crates.io (compiles from source):
+
+```sh
+cargo install keyhold
+```
+
 From source:
 
 ```sh
@@ -39,8 +53,6 @@ Or build and run in place:
 cargo build --release
 ./target/release/keyhold --help
 ```
-
-A `cargo install keyhold` path is intended once the crate is published.
 
 ## Usage
 

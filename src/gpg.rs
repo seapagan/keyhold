@@ -52,6 +52,14 @@ const GPG_ERR_CODE_MASK: u64 = 0x7FFF;
 /// `GPG_ERR_NOT_FOUND` (27): the agent's answer for an unknown keygrip.
 const GPG_ERR_NOT_FOUND: u64 = 27;
 
+/// Execution bound for unattended operations: the stored-mode loopback
+/// sign (renewal and recovery), `gpg-connect-agent` commands, secret
+/// key listings and `gpgconf` queries. None of these ever interact
+/// with a user, so a wedged child is killed and reported instead of
+/// hanging the scheduler or blocking daemon shutdown forever. Tests
+/// inject a shorter bound via [`Gpg::with_unattended_timeout`].
+const UNATTENDED_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// How long a background ping may run before it is killed.
 const BACKGROUND_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -226,6 +234,8 @@ pub struct Gpg {
     path: PathBuf,
     gpgconf: Option<PathBuf>,
     connect_agent: Option<PathBuf>,
+    /// Execution bound for unattended child operations.
+    unattended_timeout: Duration,
 }
 
 impl Gpg {
@@ -243,6 +253,7 @@ impl Gpg {
             path,
             gpgconf,
             connect_agent,
+            unattended_timeout: UNATTENDED_TIMEOUT,
         })
     }
 
@@ -256,7 +267,16 @@ impl Gpg {
             path,
             gpgconf,
             connect_agent,
+            unattended_timeout: UNATTENDED_TIMEOUT,
         }
+    }
+
+    /// Return a copy with a different execution bound for unattended
+    /// operations (test injection point; production always uses
+    /// [`UNATTENDED_TIMEOUT`]).
+    pub fn with_unattended_timeout(mut self, timeout: Duration) -> Self {
+        self.unattended_timeout = timeout;
+        self
     }
 
     /// Perform one keepalive key use: detached-sign empty input, discard
@@ -272,9 +292,11 @@ impl Gpg {
         let mut cmd = self.sign_command(key, mode);
         let output = match mode {
             PingMode::Foreground => run_blocking(&mut cmd),
-            PingMode::Background => {
-                run_with_timeout(&mut cmd, BACKGROUND_TIMEOUT)
-            }
+            PingMode::Background => run_with_timeout(
+                &mut cmd,
+                BACKGROUND_TIMEOUT,
+                "gpg keepalive sign",
+            ),
         }?;
         if !output.success {
             return Err(Error::GpgFailed(message(
@@ -307,7 +329,11 @@ impl Gpg {
     /// subkey).
     pub fn probe_target(&self, key: Option<&str>) -> Result<SigningTarget> {
         let mut cmd = self.sign_command(key, PingMode::Background);
-        let output = run_with_timeout(&mut cmd, BACKGROUND_TIMEOUT)?;
+        let output = run_with_timeout(
+            &mut cmd,
+            BACKGROUND_TIMEOUT,
+            "gpg keepalive sign",
+        )?;
         let status = parse_status(&String::from_utf8_lossy(&output.stdout));
         if output.success
             && let Some(fpr) = status.sig_created.as_deref()
@@ -383,11 +409,15 @@ impl Gpg {
         if let Some(key) = key {
             cmd.arg(key);
         }
-        let output = cmd.output().map_err(Error::GpgSpawn)?;
-        if !output.status.success() {
+        let output = run_with_timeout(
+            &mut cmd,
+            self.unattended_timeout,
+            "gpg --list-secret-keys",
+        )?;
+        if !output.success {
             return Err(Error::GpgFailed(message(
                 &output.stderr,
-                output.status.code(),
+                output.code,
             )));
         }
         Ok(parse_key_blocks(&String::from_utf8_lossy(&output.stdout)))
@@ -402,17 +432,17 @@ impl Gpg {
         let path = self.gpgconf.clone().ok_or_else(|| {
             Error::GpgToolNotFound("gpgconf (not located)".into())
         })?;
-        let output = Command::new(&path)
-            .args(["--list-options", "gpg-agent"])
+        let mut cmd = Command::new(&path);
+        cmd.args(["--list-options", "gpg-agent"])
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .output()
-            .map_err(Error::GpgSpawn)?;
-        if !output.status.success() {
+            .stderr(Stdio::piped());
+        let output =
+            run_with_timeout(&mut cmd, self.unattended_timeout, "gpgconf")?;
+        if !output.success {
             return Err(Error::CachePolicy(message(
                 &output.stderr,
-                output.status.code(),
+                output.code,
             )));
         }
         parse_cache_policy(&String::from_utf8_lossy(&output.stdout))
@@ -499,7 +529,14 @@ impl Gpg {
             let _ = stdin.write_all(passphrase);
             let _ = stdin.write_all(b"\n");
         }
-        let output = finish(&mut child)?;
+        // Loopback pinentry never prompts a user, so this is an
+        // unattended operation even in the activation flow: bound it
+        // so a wedged child cannot hang the caller.
+        let output = wait_with_timeout(
+            &mut child,
+            self.unattended_timeout,
+            "gpg loopback sign",
+        )?;
         if output.success {
             return Ok(());
         }
@@ -524,18 +561,21 @@ impl Gpg {
         let path = self.connect_agent.clone().ok_or_else(|| {
             Error::GpgToolNotFound("gpg-connect-agent (not located)".into())
         })?;
-        let output = Command::new(&path)
-            .arg(command)
+        let mut cmd = Command::new(&path);
+        cmd.arg(command)
             .arg("/bye")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .output()
-            .map_err(Error::GpgSpawn)?;
-        if !output.status.success() {
+            .stderr(Stdio::piped());
+        let output = run_with_timeout(
+            &mut cmd,
+            self.unattended_timeout,
+            "gpg-connect-agent",
+        )?;
+        if !output.success {
             return Err(Error::GpgFailed(message(
                 &output.stderr,
-                output.status.code(),
+                output.code,
             )));
         }
         let text = String::from_utf8_lossy(&output.stdout).into_owned();
@@ -619,8 +659,20 @@ fn run_blocking(cmd: &mut Command) -> Result<RunOutput> {
 fn run_with_timeout(
     cmd: &mut Command,
     timeout: Duration,
+    what: &str,
 ) -> Result<RunOutput> {
     let mut child = cmd.spawn().map_err(Error::GpgSpawn)?;
+    wait_with_timeout(&mut child, timeout, what)
+}
+
+/// Wait for an already-spawned child, killing and reaping it if the
+/// deadline passes first. `what` names the operation in the timeout
+/// error; it never includes secret material.
+fn wait_with_timeout(
+    child: &mut std::process::Child,
+    timeout: Duration,
+    what: &str,
+) -> Result<RunOutput> {
     let deadline = Instant::now() + timeout;
     loop {
         match child.try_wait().map_err(Error::GpgSpawn)? {
@@ -639,27 +691,13 @@ fn run_with_timeout(
             None if Instant::now() >= deadline => {
                 let _ = child.kill();
                 let _ = child.wait();
-                return Err(Error::GpgFailed(format!(
-                    "timed out after {timeout:?}"
+                return Err(Error::GpgTimeout(format!(
+                    "{what} (after {timeout:?})"
                 )));
             }
             None => std::thread::sleep(Duration::from_millis(25)),
         }
     }
-}
-
-/// Wait for the child, then drain both pipes (small outputs; safe after
-/// exit).
-fn finish(child: &mut std::process::Child) -> Result<RunOutput> {
-    let status = child.wait().map_err(Error::GpgSpawn)?;
-    let stdout = child.stdout.take().map(drain).unwrap_or_default();
-    let stderr = child.stderr.take().map(drain).unwrap_or_default();
-    Ok(RunOutput {
-        success: status.success(),
-        code: status.code(),
-        stdout,
-        stderr,
-    })
 }
 
 fn drain<R: Read>(mut reader: R) -> Vec<u8> {

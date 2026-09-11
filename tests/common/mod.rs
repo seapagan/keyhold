@@ -545,6 +545,11 @@ impl DaemonTools {
                  fi\n\
                  if [ \"$loopback\" = 1 ]; then\n\
                    if [ -e {root}/slow ]; then sleep 2; fi\n\
+                   if [ -e {root}/hang-loopback ]; then\n\
+                     i=0\n\
+                     while [ $i -lt 3000 ]; do echo b >> {root}/beats; sleep 0.1; i=$((i+1)); done\n\
+                     exit 0\n\
+                   fi\n\
                    IFS= read -r supplied\n\
                    expected=$(cat {root}/passphrase)\n\
                    if [ \"$supplied\" != \"$expected\" ]; then\n\

@@ -375,6 +375,67 @@ fn rejected_cache_clear_stops_renewal_before_any_loopback_sign() {
     );
 }
 
+/// A wedged loopback gpg during renewal must be killed and reported
+/// (the hold stops cleanly), and must never block daemon shutdown.
+#[test]
+fn wedged_renewal_stops_the_hold_and_never_blocks_shutdown() {
+    let runtime = tmp();
+    let mut tools = DaemonTools::new(runtime.path());
+    tools.gpg = tools
+        .gpg
+        .clone()
+        .with_unattended_timeout(Duration::from_millis(300));
+    let store = Arc::new(FakeStore::default());
+    store.preload(SUB2_GRIP, common::FAKE_PASSPHRASE.as_bytes());
+    let (daemon_runtime, sock) = spawn_daemon(
+        tools.gpg.clone(),
+        Arc::clone(&store),
+        Default::default(),
+    );
+
+    // 2s hard max renews ~1.8s in; the renewal's loopback sign hangs.
+    tools.set_ttls(600, 2);
+    let prepared =
+        stored_activation(&tools.gpg, &store, None, 60_000, None).unwrap();
+    let request = common::on_request(None, &prepared, 60_000, None);
+    assert_eq!(ipc_at(&sock, &request).unwrap()["ok"], true);
+    tools.marker("hang-loopback");
+
+    assert!(
+        wait_until(10 * SECS, || status_at(&sock)
+            .map(|s| s["hold_on"] == false)
+            .unwrap_or(false)),
+        "hold did not stop: {:?}",
+        status_at(&sock)
+    );
+    let error = status_at(&sock).unwrap()["last_error"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    assert!(error.contains("timed out"), "wrong error: {error}");
+
+    // The wedged child was really killed: its heartbeat file stopped
+    // growing.
+    let beats = tools.root.join("beats");
+    let count = || {
+        std::fs::read_to_string(&beats)
+            .unwrap_or_default()
+            .lines()
+            .count()
+    };
+    let first = count();
+    thread::sleep(Duration::from_millis(800));
+    assert_eq!(count(), first, "the wedged gpg kept running");
+
+    // The scheduler is free: shutdown still completes promptly.
+    assert_eq!(ipc_at(&sock, "{\"cmd\":\"shutdown\"}").unwrap()["ok"], true);
+    assert!(
+        wait_until(2 * SECS, || !sock.exists()),
+        "daemon shutdown was blocked by the wedged operation"
+    );
+    drop((daemon_runtime, tools));
+}
+
 // ---------------------------------------------------------------------------
 // Daemon: renewal, recovery, races, cleanup
 // ---------------------------------------------------------------------------
@@ -437,9 +498,13 @@ fn stored_hold_renews_proactively_before_the_hard_maximum() {
         .as_u64()
         .expect("expiry known");
     assert!(
-        wait_until(10 * SECS, || running.tools.clears() >= 3),
-        "renewals did not happen: {}",
-        running.tools.ca_log()
+        // The third clear is observed before its loopback sign
+        // completes; wait for both halves of all three renewals.
+        wait_until(10 * SECS, || running.tools.clears() >= 3
+            && running.tools.loopbacks() >= 3,),
+        "renewals did not happen: {} / {}",
+        running.tools.ca_log(),
+        running.tools.gpg_log()
     );
     let status = running.status();
     assert_eq!(status["hold_on"], true, "hold survived: {status}");

@@ -63,6 +63,12 @@ pub enum Error {
     #[error("gpg agent command failed: {0}")]
     AgentCommand(String),
 
+    /// An unattended GPG/agent operation exceeded its execution bound
+    /// and was killed. The message names the operation; it never
+    /// includes secret material.
+    #[error("gpg operation timed out: {0}")]
+    GpgTimeout(String),
+
     /// The Linux Secret Service session credential store failed.
     #[error("secret service error: {0}")]
     SecretService(String),

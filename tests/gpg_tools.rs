@@ -54,6 +54,11 @@ impl Tools {
                    echo 'gpg: signing failed: Operation cancelled' >&2\n\
                    exit 2\n\
                  fi\n\
+                 if [ \"$loopback\" = 1 ] && [ -e {root}/hang-loopback ]; then\n\
+                   i=0\n\
+                   while [ $i -lt 3000 ]; do echo b >> {root}/beats; sleep 0.1; i=$((i+1)); done\n\
+                   exit 0\n\
+                 fi\n\
                  if [ \"$loopback\" = 1 ]; then\n\
                    IFS= read -r supplied\n\
                    expected=$(cat {root}/passphrase)\n\
@@ -100,6 +105,11 @@ impl Tools {
                 "#!/bin/sh\n\
                  echo \"$*\" >> {ca_log}\n\
                  cmd=$1\n\
+                 if [ -e {root}/hang-ca ]; then\n\
+                   i=0\n\
+                   while [ $i -lt 3000 ]; do echo b >> {root}/beats; sleep 0.1; i=$((i+1)); done\n\
+                   exit 0\n\
+                 fi\n\
                  if [ -e {root}/malformed-ca ]; then echo 'gibberish, not assuan'; exit 0; fi\n\
                  if [ -e {root}/bare-ok ]; then echo OK; exit 0; fi\n\
                  case \"$cmd\" in\n\
@@ -491,6 +501,58 @@ fn key_state_reports_an_agent_rejection_despite_exit_zero() {
         tools.gpg.key_state(SUB2_GRIP).is_err(),
         "a rejected KEYINFO became a state"
     );
+}
+
+/// Regression: a wedged loopback gpg must be killed and reported, not
+/// waited on forever. Termination is proven by a heartbeat file the
+/// fake writes until it dies.
+#[test]
+fn wedged_loopback_sign_is_killed_and_reported() {
+    let mut tools = Tools::new();
+    tools.marker("hang-loopback");
+    tools.gpg = tools
+        .gpg
+        .clone()
+        .with_unattended_timeout(std::time::Duration::from_millis(300));
+    let t = target(SUB2_FPR, SUB2_GRIP);
+    let err = tools
+        .gpg
+        .use_key_with_passphrase(&t, b"seekrit")
+        .unwrap_err();
+    assert!(matches!(err, keyhold::error::Error::GpgTimeout(_)), "{err}");
+    assert!(err.to_string().contains("loopback"), "{err}");
+    heartbeat_stops(&tools);
+}
+
+/// The same bound for agent commands: a wedged `gpg-connect-agent` is
+/// killed and reported.
+#[test]
+fn wedged_agent_command_is_killed_and_reported() {
+    let mut tools = Tools::new();
+    tools.marker("hang-ca");
+    tools.gpg = tools
+        .gpg
+        .clone()
+        .with_unattended_timeout(std::time::Duration::from_millis(300));
+    let err = tools.gpg.clear_passphrase(SUB2_GRIP).unwrap_err();
+    assert!(matches!(err, keyhold::error::Error::GpgTimeout(_)), "{err}");
+    assert!(err.to_string().contains("gpg-connect-agent"), "{err}");
+    heartbeat_stops(&tools);
+}
+
+/// The heartbeat file the wedged fake writes stops growing once the
+/// child is killed.
+fn heartbeat_stops(tools: &Tools) {
+    let beats = tools.root.join("beats");
+    let count = || {
+        fs::read_to_string(&beats)
+            .unwrap_or_default()
+            .lines()
+            .count()
+    };
+    let first = count();
+    std::thread::sleep(std::time::Duration::from_millis(800));
+    assert_eq!(count(), first, "the wedged child kept running");
 }
 
 #[test]

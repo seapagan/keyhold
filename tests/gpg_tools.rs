@@ -48,7 +48,18 @@ impl Tools {
                    [ \"$a\" = cancel ] && background=1\n\
                  done\n\
                  echo \"$*\" >> {log}\n\
-                 if [ \"$list\" = 1 ]; then cat {root}/keys.txt; exit 0; fi\n\
+                 if [ \"$list\" = 1 ]; then\n\
+                   if [ -e {root}/large-stdout ]; then\n\
+                     dd if=/dev/zero bs=1024 count=512 2>/dev/null | tr '\\000' x\n\
+                     printf '\\n'\n\
+                   fi\n\
+                   if [ -e {root}/large-stderr ]; then\n\
+                     dd if=/dev/zero bs=1024 count=512 2>/dev/null | tr '\\000' e >&2\n\
+                     printf '\\n' >&2\n\
+                   fi\n\
+                   cat {root}/keys.txt\n\
+                   exit 0\n\
+                 fi\n\
                  if [ \"$background\" = 1 ] && [ -e {root}/lock ]; then\n\
                    echo '[GNUPG:] KEY_CONSIDERED {PRIMARY_FPR} 0'\n\
                    code=67108963\n\
@@ -220,6 +231,37 @@ fn target(fpr: &str, grip: &str) -> SigningTarget {
         fingerprint: fpr.to_string(),
         keygrip: Some(grip.to_string()),
     }
+}
+
+fn assert_large_listing_is_captured(markers: &[&str]) {
+    let mut tools = Tools::new();
+    for marker in markers {
+        tools.marker(marker);
+    }
+    tools.gpg = tools
+        .gpg
+        .clone()
+        .with_unattended_timeout(std::time::Duration::from_secs(2));
+
+    let blocks = tools.gpg.list_secret_keys(None).unwrap();
+    assert_eq!(blocks.len(), 1);
+    assert_eq!(blocks[0].primary.fingerprint, PRIMARY_FPR);
+    assert_eq!(blocks[0].subkeys.len(), 2);
+}
+
+#[test]
+fn large_secret_key_listing_stdout_completes() {
+    assert_large_listing_is_captured(&["large-stdout"]);
+}
+
+#[test]
+fn large_secret_key_listing_stderr_completes() {
+    assert_large_listing_is_captured(&["large-stderr"]);
+}
+
+#[test]
+fn large_secret_key_listing_stdout_and_stderr_complete() {
+    assert_large_listing_is_captured(&["large-stdout", "large-stderr"]);
 }
 
 #[test]

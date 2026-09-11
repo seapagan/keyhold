@@ -28,6 +28,7 @@ use std::{
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
     process::{Command, Stdio},
+    thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
 
@@ -698,30 +699,62 @@ fn wait_with_timeout(
     what: &str,
 ) -> Result<RunOutput> {
     let deadline = Instant::now() + timeout;
+    let stdout = match child.stdout.take().map(spawn_drain).transpose() {
+        Ok(stdout) => stdout,
+        Err(e) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(e);
+        }
+    };
+    let stderr = match child.stderr.take().map(spawn_drain).transpose() {
+        Ok(stderr) => stderr,
+        Err(e) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(e);
+        }
+    };
     loop {
-        match child.try_wait().map_err(Error::GpgSpawn)? {
-            Some(status) => {
-                let stdout =
-                    child.stdout.take().map(drain).unwrap_or_default();
-                let stderr =
-                    child.stderr.take().map(drain).unwrap_or_default();
+        match child.try_wait() {
+            Ok(Some(status)) => {
                 return Ok(RunOutput {
                     success: status.success(),
                     code: status.code(),
-                    stdout,
-                    stderr,
+                    stdout: join_drain(stdout),
+                    stderr: join_drain(stderr),
                 });
             }
-            None if Instant::now() >= deadline => {
+            Ok(None) if Instant::now() >= deadline => {
                 let _ = child.kill();
                 let _ = child.wait();
                 return Err(Error::GpgTimeout(format!(
                     "{what} (after {timeout:?})"
                 )));
             }
-            None => std::thread::sleep(Duration::from_millis(25)),
+            Ok(None) => thread::sleep(Duration::from_millis(25)),
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(Error::GpgSpawn(e));
+            }
         }
     }
+}
+
+fn spawn_drain<R: Read + Send + 'static>(
+    reader: R,
+) -> Result<JoinHandle<Vec<u8>>> {
+    thread::Builder::new()
+        .name("keyhold-gpg-output".into())
+        .spawn(move || drain(reader))
+        .map_err(Error::GpgSpawn)
+}
+
+fn join_drain(reader: Option<JoinHandle<Vec<u8>>>) -> Vec<u8> {
+    reader
+        .and_then(|thread| thread.join().ok())
+        .unwrap_or_default()
 }
 
 fn drain<R: Read>(mut reader: R) -> Vec<u8> {

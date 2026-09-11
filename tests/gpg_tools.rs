@@ -51,7 +51,12 @@ impl Tools {
                  if [ \"$list\" = 1 ]; then cat {root}/keys.txt; exit 0; fi\n\
                  if [ \"$background\" = 1 ] && [ -e {root}/lock ]; then\n\
                    echo '[GNUPG:] KEY_CONSIDERED {PRIMARY_FPR} 0'\n\
-                   echo 'gpg: signing failed: Operation cancelled' >&2\n\
+                   echo '[GNUPG:] FAILURE sign 67108963'\n\
+                   if [ -e {root}/non-english ]; then\n\
+                     echo 'gpg: signature echouee: operation annulee' >&2\n\
+                   else\n\
+                     echo 'gpg: signing failed: Operation cancelled' >&2\n\
+                   fi\n\
                    exit 2\n\
                  fi\n\
                  if [ \"$loopback\" = 1 ] && [ -e {root}/hang-loopback ]; then\n\
@@ -63,9 +68,19 @@ impl Tools {
                    IFS= read -r supplied\n\
                    expected=$(cat {root}/passphrase)\n\
                    if [ \"$supplied\" != \"$expected\" ]; then\n\
-                     echo 'gpg: signing failed: Bad passphrase' >&2\n\
+                     echo '[GNUPG:] FAILURE sign 67108875'\n\
+                     if [ -e {root}/non-english ]; then\n\
+                       echo 'gpg: signature echouee: mot de passe errone' >&2\n\
+                     else\n\
+                       echo 'gpg: signing failed: Bad passphrase' >&2\n\
+                     fi\n\
                      exit 2\n\
                    fi\n\
+                 fi\n\
+                 if [ \"$background\" = 1 ] && [ -e {root}/cancel-no-failure ]; then\n\
+                   echo '[GNUPG:] KEY_CONSIDERED {PRIMARY_FPR} 0'\n\
+                   echo 'gpg: signing failed: Operation cancelled' >&2\n\
+                   exit 2\n\
                  fi\n\
                  if [ -e {root}/fail-all ]; then exit 2; fi\n\
                  echo '[GNUPG:] KEY_CONSIDERED {PRIMARY_FPR} 0'\n\
@@ -319,6 +334,39 @@ fn probe_target_primary_selector_follows_gpg_default_selection() {
             "primary selector {selector} must not force the primary"
         );
     }
+}
+
+/// A locked key is classified from the machine-readable `FAILURE`
+/// code, never from stderr wording: a non-English "cancelled" message
+/// must still resolve the locked key.
+#[test]
+fn locked_probe_ignores_stderr_language() {
+    let tools = Tools::new();
+    tools.marker("lock");
+    tools.marker("non-english");
+    let probed = tools.gpg.probe_target(None).unwrap();
+    assert_eq!(probed, target(SUB2_FPR, SUB2_GRIP));
+}
+
+/// English "cancelled" stderr without a `FAILURE` record must not be
+/// classified as a locked key: fail conservatively.
+#[test]
+fn cancelled_stderr_without_a_failure_record_is_not_treated_as_locked() {
+    let tools = Tools::new();
+    tools.marker("cancel-no-failure");
+    assert!(
+        tools.gpg.probe_target(None).is_err(),
+        "English stderr alone must not resolve a locked key"
+    );
+}
+
+#[test]
+fn bad_passphrase_is_classified_without_english_stderr() {
+    let tools = Tools::new();
+    tools.marker("non-english");
+    let t = target(SUB2_FPR, SUB2_GRIP);
+    let err = tools.gpg.use_key_with_passphrase(&t, b"wrong").unwrap_err();
+    assert!(matches!(err, keyhold::error::Error::BadPassphrase), "{err}");
 }
 
 #[test]

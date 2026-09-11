@@ -374,6 +374,7 @@ fn fake_gpg_script() -> String {
     s.push_str("  IFS= read -r supplied\n");
     s.push_str("  expected=$(cat \"$KEYHOLD_FAKE_PASSPHRASE\")\n");
     s.push_str("  if [ \"$supplied\" != \"$expected\" ]; then\n");
+    s.push_str("    echo '[GNUPG:] FAILURE sign 67108875'\n");
     s.push_str("    echo 'gpg: signing failed: Bad passphrase' >&2\n");
     s.push_str("    exit 2\n");
     s.push_str("  fi\n");
@@ -382,6 +383,7 @@ fn fake_gpg_script() -> String {
         "if [ \"$background\" = 1 ] && [ -e \"$KEYHOLD_FAKE_LOCK\" ]; then\n",
     );
     s.push_str("  echo '[GNUPG:] KEY_CONSIDERED C1D6F8E1B1E8D5FBFF34ACE08FACE96FA6D9DB48 0'\n");
+    s.push_str("  echo '[GNUPG:] FAILURE sign 67108963'\n");
     s.push_str("  echo 'gpg: signing failed: Operation cancelled' >&2\n");
     s.push_str("  exit 2\n");
     s.push_str("fi\n");
@@ -539,6 +541,7 @@ impl DaemonTools {
                  if [ \"$background\" = 1 ]; then\n\
                    if [ -e {root}/locked ] || [ -e {root}/fail-bg ]; then\n\
                      echo '[GNUPG:] KEY_CONSIDERED {PRIMARY_FPR} 0'\n\
+                     echo '[GNUPG:] FAILURE sign 67108963'\n\
                      echo 'gpg: signing failed: Operation cancelled' >&2\n\
                      exit 2\n\
                    fi\n\
@@ -553,6 +556,7 @@ impl DaemonTools {
                    IFS= read -r supplied\n\
                    expected=$(cat {root}/passphrase)\n\
                    if [ \"$supplied\" != \"$expected\" ]; then\n\
+                     echo '[GNUPG:] FAILURE sign 67108875'\n\
                      echo 'gpg: signing failed: Bad passphrase' >&2\n\
                      exit 2\n\
                    fi\n\

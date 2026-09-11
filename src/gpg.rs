@@ -51,6 +51,11 @@ pub const CONNECT_AGENT_ENV: &str = "KEYHOLD_GPG_CONNECT_AGENT";
 const GPG_ERR_CODE_MASK: u64 = 0x7FFF;
 /// `GPG_ERR_NOT_FOUND` (27): the agent's answer for an unknown keygrip.
 const GPG_ERR_NOT_FOUND: u64 = 27;
+/// `GPG_ERR_BAD_PASSPHRASE` (11): gpg rejected the supplied passphrase.
+const GPG_ERR_BAD_PASSPHRASE: u64 = 11;
+/// `GPG_ERR_CANCELED` (99): pinentry was cancelled (or suppressed via
+/// `--pinentry-mode cancel`), i.e. the key was not unlocked.
+const GPG_ERR_CANCELED: u64 = 99;
 
 /// Execution bound for unattended operations: the stored-mode loopback
 /// sign (renewal and recovery), `gpg-connect-agent` commands, secret
@@ -189,6 +194,11 @@ pub struct GpgStatus {
     /// is no evidence either way about pinentry, so callers must treat
     /// `pinentry_launched` as unknown rather than false.
     pub saw_status: bool,
+    /// The numeric error code of the last `FAILURE` record, when gpg
+    /// emitted one. Machine-readable failure classification (the low
+    /// 15 bits are the libgpg-error code); the location token is
+    /// dropped. Localized stderr is never used for this.
+    pub failure_code: Option<u64>,
 }
 
 /// One `sec`/`ssb` record from a colon-separated secret-key listing,
@@ -346,9 +356,13 @@ impl Gpg {
                 )
             });
         }
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let locked = stderr.contains("Operation cancelled")
-            || stderr.contains("Operation canceled");
+        // A locked key (pinentry suppressed by `--pinentry-mode cancel`)
+        // is classified from the machine-readable FAILURE code, never
+        // from localized stderr (verified against GnuPG 2.4: cancelled
+        // sign → `FAILURE sign 67108963` = GPG_ERR_CANCELED).
+        let locked = status
+            .failure_code
+            .is_some_and(|code| code & GPG_ERR_CODE_MASK == GPG_ERR_CANCELED);
         let Some(primary_fpr) = status.key_considered.last() else {
             return Err(Error::GpgTarget(format!(
                 "gpg did not identify a signing key: {}",
@@ -541,8 +555,14 @@ impl Gpg {
             return Ok(());
         }
         // Distinguish a rejected passphrase from an unrelated signing
-        // failure; neither includes secret material.
-        if String::from_utf8_lossy(&output.stderr).contains("Bad passphrase") {
+        // failure via the machine-readable FAILURE code (verified
+        // against GnuPG 2.4: a rejected loopback passphrase → `FAILURE
+        // sign 67108875` = GPG_ERR_BAD_PASSPHRASE), never localized
+        // stderr. Neither path includes secret material.
+        let status = parse_status(&String::from_utf8_lossy(&output.stdout));
+        if status.failure_code.is_some_and(|code| {
+            code & GPG_ERR_CODE_MASK == GPG_ERR_BAD_PASSPHRASE
+        }) {
             return Err(Error::BadPassphrase);
         }
         Err(Error::GpgFailed(message(&output.stderr, output.code)))
@@ -749,6 +769,18 @@ pub fn parse_status(text: &str) -> GpgStatus {
                 }
             }
             "PINENTRY_LAUNCHED" => status.pinentry_launched = true,
+            "FAILURE" => {
+                // `FAILURE <location> <error_code>`; the code is the
+                // last token and may carry a `_SYMBOL` suffix. Only
+                // the numeric prefix classifies the failure.
+                if let Some(code) = tokens
+                    .last()
+                    .and_then(|t| t.split('_').next())
+                    .and_then(|c| c.parse::<u64>().ok())
+                {
+                    status.failure_code = Some(code);
+                }
+            }
             "KEY_CONSIDERED" => {
                 if let Some(fpr) = tokens.next()
                     && fpr.len() == 40
@@ -1116,6 +1148,30 @@ mod tests {
         assert!(status.pinentry_launched);
         assert_eq!(status.key_considered.len(), 1);
         assert!(status.sig_created.is_none());
+    }
+
+    #[test]
+    fn status_parser_extracts_failure_codes_without_stderr() {
+        // The last FAILURE record wins; a `_SYMBOL` suffix is stripped.
+        let status = parse_status(
+            "[GNUPG:] FAILURE sign 67108875\n\
+             [GNUPG:] FAILURE - 151011327_EOF\n",
+        );
+        assert_eq!(status.failure_code, Some(151_011_327));
+        assert_eq!(
+            parse_status("[GNUPG:] FAILURE sign 67108963\n").failure_code,
+            Some(67108963)
+        );
+        // Malformed/incomplete FAILURE records contribute nothing.
+        assert_eq!(
+            parse_status("[GNUPG:] FAILURE sign\n").failure_code,
+            None
+        );
+        assert_eq!(
+            parse_status("[GNUPG:] FAILURE sign not-a-number\n").failure_code,
+            None
+        );
+        assert_eq!(parse_status("[GNUPG:] FAILURE\n").failure_code, None);
     }
 
     #[test]

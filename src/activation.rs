@@ -80,7 +80,7 @@ fn ordinary(
             warnings.push(interval_warning(interval, policy.default_ttl));
         }
         if let Some(hold) = hold_for
-            && hold > policy.max_ttl
+            && hold >= policy.max_ttl
         {
             warnings.push(format!(
                 "GnuPG's max-cache-ttl is {}; an ordinary hold cannot be \

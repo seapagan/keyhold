@@ -925,6 +925,40 @@ fn ordinary_mode_warns_when_the_hold_exceeds_max_cache_ttl() {
 }
 
 #[test]
+fn ordinary_mode_warns_at_and_above_max_cache_ttl() {
+    // 30s hard max: a hold exactly at the maximum cannot be promised
+    // (scheduling/process timing can make the hard expiry coincide
+    // with or precede the endpoint), so the boundary is inclusive.
+    let env = TestEnv::new();
+    env.rich_gpg();
+    env.set_cache_ttls(10, 30);
+
+    // One unit below: no max-ttl warning.
+    let out = env.succeed(&["on", "--for", "29s"]);
+    assert!(
+        !String::from_utf8_lossy(&out.stdout).contains("max-cache-ttl is"),
+        "29s must not warn:\n{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+
+    // Exactly equal: warns.
+    let out = env.succeed(&["on", "--for", "30s"]);
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("max-cache-ttl is 30s"),
+        "30s must warn:\n{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+
+    // One unit above: warns.
+    let out = env.succeed(&["on", "--for", "31s"]);
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("max-cache-ttl is 30s"),
+        "31s must warn:\n{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+}
+
+#[test]
 fn ordinary_mode_warns_about_a_preexisting_cache_entry() {
     let env = TestEnv::new();
     env.rich_gpg();

@@ -1163,10 +1163,7 @@ mod tests {
             Some(67108963)
         );
         // Malformed/incomplete FAILURE records contribute nothing.
-        assert_eq!(
-            parse_status("[GNUPG:] FAILURE sign\n").failure_code,
-            None
-        );
+        assert_eq!(parse_status("[GNUPG:] FAILURE sign\n").failure_code, None);
         assert_eq!(
             parse_status("[GNUPG:] FAILURE sign not-a-number\n").failure_code,
             None

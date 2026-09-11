@@ -256,25 +256,24 @@ fn key_state_row(data: &StatusData, gpg: Option<&Gpg>) -> Option<String> {
 /// Secret Service degrades to `unavailable` rather than failing
 /// status.
 fn credential_row(data: &StatusData) -> Option<String> {
+    credential_row_with(data, |keygrip| {
+        SessionCredentialStore.contains(keygrip)
+    })
+}
+
+fn credential_row_with(
+    data: &StatusData,
+    contains: impl FnOnce(&str) -> Result<bool>,
+) -> Option<String> {
     let keygrip = data.keygrip.as_deref()?;
     match data.credential_mode {
         CredentialMode::NotNeeded => Some("not needed".into()),
-        CredentialMode::Session => {
-            match SessionCredentialStore.contains(keygrip) {
-                Ok(true) => Some("session stored".into()),
-                Ok(false) => Some("missing".into()),
-                Err(_) => Some("unavailable".into()),
-            }
-        }
-        // An off hold resets its mode; the live store decides whether
-        // a credential still exists for the retained key.
-        CredentialMode::None => {
-            match SessionCredentialStore.contains(keygrip) {
-                Ok(true) => Some("session stored (not in use)".into()),
-                Ok(false) => Some("not stored".into()),
-                Err(_) => Some("unavailable".into()),
-            }
-        }
+        CredentialMode::Session => match contains(keygrip) {
+            Ok(true) => Some("session stored".into()),
+            Ok(false) => Some("missing".into()),
+            Err(_) => Some("unavailable".into()),
+        },
+        CredentialMode::None => Some("not in use".into()),
     }
 }
 
@@ -345,4 +344,60 @@ fn now_ms() -> u64 {
 
 fn epoch_ms(t: SystemTime) -> Option<u64> {
     u64::try_from(t.duration_since(UNIX_EPOCH).ok()?.as_millis()).ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::Cell;
+
+    use super::*;
+
+    fn status(hold_on: bool, mode: CredentialMode) -> StatusData {
+        StatusData {
+            hold_on,
+            key: None,
+            key_source: KeySource::Default,
+            interval_ms: 1,
+            remaining_ms: None,
+            last_ping_ms: None,
+            next_ping_ms: None,
+            last_error: None,
+            fingerprint: Some("FINGERPRINT".into()),
+            keygrip: Some("KEYGRIP".into()),
+            credential_mode: mode,
+            default_cache_ttl_ms: None,
+            max_cache_ttl_ms: None,
+            max_expires_at_ms: None,
+        }
+    }
+
+    #[test]
+    fn ordinary_status_never_inspects_the_session_store() {
+        for hold_on in [true, false] {
+            let calls = Cell::new(0);
+            let row = credential_row_with(
+                &status(hold_on, CredentialMode::None),
+                |_| {
+                    calls.set(calls.get() + 1);
+                    Ok(true)
+                },
+            );
+            assert_eq!(row.as_deref(), Some("not in use"));
+            assert_eq!(calls.get(), 0);
+        }
+    }
+
+    #[test]
+    fn stopped_stored_status_inspects_the_session_store() {
+        let calls = Cell::new(0);
+        let row = credential_row_with(
+            &status(false, CredentialMode::Session),
+            |_| {
+                calls.set(calls.get() + 1);
+                Ok(true)
+            },
+        );
+        assert_eq!(row.as_deref(), Some("session stored"));
+        assert_eq!(calls.get(), 1);
+    }
 }

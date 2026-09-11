@@ -304,15 +304,15 @@ impl Hold {
 
     /// Disable the hold, leaving any last error intact for `status`.
     /// Renewal/cache metadata dies with the hold, but the resolved
-    /// fingerprint/keygrip (non-secret) are retained: the cache entry
-    /// can outlive the hold, and daemon-shutdown cleanup may still
-    /// need to clear it.
+    /// fingerprint/keygrip and credential mode (non-secret provenance)
+    /// are retained: the cache entry can outlive the hold, status needs
+    /// to know whether Secret Service access was opted into, and daemon-
+    /// shutdown cleanup may still need to clear it.
     pub fn turn_off(&mut self) {
         self.enabled = false;
         self.deadline = None;
         self.next_ping = None;
         self.cache = None;
-        self.credential_mode = CredentialMode::None;
     }
 
     /// Forget the last error (an explicit `off` acknowledges it).
@@ -1016,8 +1016,43 @@ mod tests {
         .unwrap();
         hold.turn_off();
         assert!(hold.cache.is_none());
+        assert_eq!(hold.credential_mode, CredentialMode::Session);
         assert_eq!(hold.due_action(start + Duration::from_secs(3600)), None);
         assert_eq!(hold.next_wake(start), None);
+    }
+
+    #[test]
+    fn ordinary_replacement_overwrites_retained_session_provenance() {
+        let mut hold = Hold::default();
+        let start = t0();
+        let activated = wall(1_000);
+        hold.turn_on(
+            None,
+            KeySource::Default,
+            MINUTE,
+            None,
+            start,
+            activated,
+            Activation::cache_only(session_plan(
+                Duration::from_secs(300),
+                activated,
+            )),
+        )
+        .unwrap();
+        hold.turn_off();
+
+        hold.turn_on(
+            None,
+            KeySource::Default,
+            MINUTE,
+            None,
+            start + MINUTE,
+            wall(2_000),
+            Activation::none(),
+        )
+        .unwrap();
+
+        assert_eq!(hold.credential_mode, CredentialMode::None);
     }
 
     #[test]

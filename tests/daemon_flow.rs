@@ -1050,9 +1050,7 @@ fn status_reports_live_key_and_credential_rows() {
     let text = env.status();
     for needle in [
         "Key state    unlocked",
-        // The test environment deliberately has no Secret Service, so
-        // the truthful live value is "unavailable" (not "not stored").
-        "Credential   unavailable",
+        "Credential   not in use",
         "GPG max TTL  30s",
         // A fresh foreground unlock established the epoch, so a
         // truthful countdown is shown (a pre-existing entry would read
@@ -1382,9 +1380,7 @@ fn status_after_off_reports_the_retained_key_state() {
     assert!(text.contains("Hold         off"), "{text}");
     assert!(text.contains("Key          default"), "{text}");
     assert!(text.contains("Key state    unlocked"), "{text}");
-    // No Secret Service in the test environment: the truthful live
-    // value for the retained key.
-    assert!(text.contains("Credential   unavailable"), "{text}");
+    assert!(text.contains("Credential   not in use"), "{text}");
     for absent in ["Interval", "Remaining", "Next ping", "Last ping"] {
         assert!(!text.contains(absent), "{absent} shown while off:\n{text}");
     }
@@ -1409,7 +1405,7 @@ fn status_after_expiry_reports_the_retained_key_state() {
     );
     let text = env.status();
     assert!(text.contains("Key state    unlocked"), "{text}");
-    assert!(text.contains("Credential   unavailable"), "{text}");
+    assert!(text.contains("Credential   not in use"), "{text}");
     assert!(!text.contains("Next ping"), "{text}");
 }
 

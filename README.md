@@ -104,7 +104,7 @@ Daemon       running
 Hold         on
 Key          default
 Key state    unlocked
-Credential   not stored
+Credential   not in use
 GPG max TTL  2h
 Max expiry   in 2h
 Interval     5m
@@ -124,7 +124,7 @@ Daemon       running
 Hold         off
 Key          default
 Key state    unlocked
-Credential   not stored
+Credential   not in use
 ```
 
 `Key state` and `Credential` answer the two questions that matter at a
@@ -138,6 +138,11 @@ age (`unknown` otherwise, for example when the key was already cached
 before activation), and reads `(auto-renew)` while a session credential is
 backing the hold; the timing rows (`Interval`, `Remaining`, `Last ping`,
 `Next ping`) appear only while a hold is actually on.
+
+For an ordinary hold, `Credential not in use` is known from the hold mode
+alone and does not query Secret Service. A retained stored-mode hold may
+still query its explicitly opted-in session credential after `off` or
+expiry.
 
 ### What `on` does
 

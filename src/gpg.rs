@@ -2,7 +2,7 @@
 //!
 //! The keepalive operation is a detached signature of empty input written to
 //! `/dev/null`: a real private-key operation with no lasting effect and no
-//! artefacts. Two modes exist:
+//! artefacts. Two ping modes exist:
 //!
 //! * [`PingMode::Foreground`] — normal pinentry behaviour, used by
 //!   `keyhold on` so the user can unlock the key if it is not cached yet.
@@ -10,15 +10,24 @@
 //!   daemon. If the cache has expired, gpg fails promptly
 //!   ("Operation cancelled") instead of opening an unattended pinentry.
 //!
-//! keyhold never uses loopback passphrase handling and never sees, stores or
-//! transmits the passphrase: GnuPG and pinentry remain entirely responsible
-//! for unlocking the key.
+//! Ordinary mode never uses loopback passphrase handling and never sees,
+//! stores or transmits the passphrase: GnuPG and pinentry remain entirely
+//! responsible for unlocking the key. The explicit opt-in session-credential
+//! mode additionally offers [`Gpg::use_key_with_passphrase`], which feeds a
+//! passphrase through the child's stdin only (`--passphrase-fd 0`); it is
+//! never placed in argv, the environment or any file.
+//!
+//! All identity information (which key actually signed, its keygrip, agent
+//! cache state, effective cache TTLs) comes from machine-readable output:
+//! `--status-fd` records, `--with-colons --with-keygrip` listings,
+//! `gpgconf --list-options` and `gpg-connect-agent` responses. Free-form
+//! localized stderr is used for messages only, never for identity.
 
 use std::{
     io::Read,
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
-    process::{ChildStderr, Command, Stdio},
+    process::{Command, Stdio},
     time::{Duration, Instant},
 };
 
@@ -29,6 +38,12 @@ use crate::error::{Error, Result};
 /// Intended for the test suite and staged debugging; it does not change the
 /// arguments keyhold passes to gpg.
 pub const GPG_ENV: &str = "KEYHOLD_GPG";
+
+/// Environment variable overriding the `gpgconf` executable path.
+pub const GPGCONF_ENV: &str = "KEYHOLD_GPGCONF";
+
+/// Environment variable overriding the `gpg-connect-agent` executable path.
+pub const CONNECT_AGENT_ENV: &str = "KEYHOLD_GPG_CONNECT_AGENT";
 
 /// How long a background ping may run before it is killed.
 const BACKGROUND_TIMEOUT: Duration = Duration::from_secs(30);
@@ -42,54 +57,420 @@ pub enum PingMode {
     Background,
 }
 
-/// A located `gpg` executable.
+/// The exact key the hold keeps cached: the fingerprint of the key that
+/// actually signs (a signing subkey, not blindly the primary) plus its
+/// agent keygrip, which identifies the passphrase cache entry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SigningTarget {
+    /// Fingerprint of the signing key (primary or subkey).
+    pub fingerprint: String,
+    /// Agent keygrip of the signing key (`None` only when gpg could not be
+    /// consulted for it; stored-credential mode requires one).
+    pub keygrip: Option<String>,
+}
+
+/// How the agent protects a key's passphrase entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyProtection {
+    /// Passphrase protected: a cache entry exists and can expire.
+    Passphrase,
+    /// Clear: the key is stored without a passphrase (no cache involved).
+    Clear,
+    /// The agent reported no usable protection information.
+    Unknown,
+}
+
+/// Snapshot of one keygrip's cache/protection state in the agent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AgentKeyState {
+    /// Whether a passphrase is currently cached (unlocked).
+    pub cached: bool,
+    /// How the key is protected.
+    pub protection: KeyProtection,
+}
+
+/// GnuPG's effective cache TTL policy for the agent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CachePolicy {
+    /// Idle timeout each key use refreshes.
+    pub default_ttl: Duration,
+    /// Absolute ceiling GnuPG enforces on a cache entry.
+    pub max_ttl: Duration,
+}
+
+/// Result of one real key use: the exact key that signed, if gpg's
+/// machine-readable status could be mapped, and whether a fresh foreground
+/// unlock (pinentry) was required.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GpgUse {
+    /// The resolved signing target, when identifiable.
+    pub target: Option<SigningTarget>,
+    /// Whether gpg launched pinentry during this use (a fresh unlock).
+    pub pinentry_launched: bool,
+}
+
+/// Machine-readable status records distilled from one gpg `--status-fd`
+/// stream.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct GpgStatus {
+    /// Fingerprint of the key that actually signed (`SIG_CREATED`).
+    pub sig_created: Option<String>,
+    /// Whether pinentry was launched (`PINENTRY_LAUNCHED`).
+    pub pinentry_launched: bool,
+    /// Primary fingerprints gpg considered (`KEY_CONSIDERED`), in order.
+    pub key_considered: Vec<String>,
+}
+
+/// One `sec`/`ssb` record from a colon-separated secret-key listing,
+/// with its trailing `fpr` and `grp` records attached.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SecretKeyRecord {
+    /// Whether this is the primary key (`sec`) or a subkey (`ssb`).
+    pub primary: bool,
+    /// Long key id (16 hex chars).
+    pub keyid: String,
+    /// Full fingerprint (40 hex chars).
+    pub fingerprint: String,
+    /// Agent keygrip, when the listing provided one.
+    pub keygrip: Option<String>,
+    /// Creation time as a Unix timestamp, when present.
+    pub created: Option<u64>,
+    /// Capability string (`scSC`, `s`, `e`, ...).
+    pub capabilities: String,
+    /// Whether the record is usable (not revoked/expired/disabled/invalid).
+    pub usable: bool,
+}
+
+impl SecretKeyRecord {
+    /// Whether this key can create signatures.
+    pub fn can_sign(&self) -> bool {
+        self.capabilities.contains('s')
+    }
+}
+
+/// A primary key and its subkeys, as one unit from the listing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeyBlock {
+    /// The primary (`sec`) record.
+    pub primary: SecretKeyRecord,
+    /// The subkey (`ssb`) records that followed it.
+    pub subkeys: Vec<SecretKeyRecord>,
+}
+
+/// A located `gpg` executable plus the companion tools keyhold shells out
+/// to for cache management.
 #[derive(Debug, Clone)]
 pub struct Gpg {
     path: PathBuf,
+    gpgconf: Option<PathBuf>,
+    connect_agent: Option<PathBuf>,
 }
 
 impl Gpg {
-    /// Locate `gpg`: `$KEYHOLD_GPG` if set (resolved to an absolute path,
-    /// since the daemon runs with cwd `/`), otherwise the first executable
-    /// `gpg` on `$PATH`.
+    /// Locate `gpg` plus companion tools: the `KEYHOLD_*` overrides if
+    /// set (resolved to absolute paths, since the daemon runs with cwd
+    /// `/`), otherwise the first executables on `$PATH`.
     pub fn detect() -> Result<Self> {
-        if let Some(spec) = std::env::var_os(GPG_ENV) {
-            let mut path = PathBuf::from(&spec);
-            if !path.is_absolute() {
-                let cwd = std::env::current_dir()
-                    .unwrap_or_else(|_| PathBuf::from("/"));
-                path = cwd.join(path);
-            }
-            if !is_executable(&path) {
-                return Err(Error::GpgNotFound(
-                    spec.to_string_lossy().into_owned(),
-                ));
-            }
-            return Ok(Self { path });
-        }
-        if let Some(search) = std::env::var_os("PATH") {
-            for dir in std::env::split_paths(&search) {
-                let candidate = dir.join("gpg");
-                if is_executable(&candidate) {
-                    return Ok(Self { path: candidate });
-                }
-            }
-        }
-        Err(Error::GpgNotFound("gpg (not found on $PATH)".into()))
+        let path = detect_tool(GPG_ENV, "gpg", true)?.ok_or_else(|| {
+            Error::GpgNotFound("gpg (not found on $PATH)".into())
+        })?;
+        let gpgconf = detect_tool(GPGCONF_ENV, "gpgconf", false)?;
+        let connect_agent =
+            detect_tool(CONNECT_AGENT_ENV, "gpg-connect-agent", false)?;
+        Ok(Self {
+            path,
+            gpgconf,
+            connect_agent,
+        })
     }
 
-    /// Perform one keepalive ping: detached-sign empty input, discard output.
+    /// Build an instance from explicit tool paths (test injection point).
+    pub fn with_tools(
+        path: PathBuf,
+        gpgconf: Option<PathBuf>,
+        connect_agent: Option<PathBuf>,
+    ) -> Self {
+        Self {
+            path,
+            gpgconf,
+            connect_agent,
+        }
+    }
+
+    /// Perform one keepalive key use: detached-sign empty input, discard
+    /// the signature, and report what gpg's status stream says about the
+    /// key that signed.
     ///
     /// With `key` unset, GPG's normal default-key selection applies.
-    pub fn ping(&self, key: Option<&str>, mode: PingMode) -> Result<()> {
+    pub fn use_key(
+        &self,
+        key: Option<&str>,
+        mode: PingMode,
+    ) -> Result<GpgUse> {
+        let mut cmd = self.sign_command(key, mode);
+        let output = match mode {
+            PingMode::Foreground => run_blocking(&mut cmd),
+            PingMode::Background => {
+                run_with_timeout(&mut cmd, BACKGROUND_TIMEOUT)
+            }
+        }?;
+        if !output.success {
+            return Err(Error::GpgFailed(message(
+                &output.stderr,
+                output.code,
+            )));
+        }
+        let status = parse_status(&String::from_utf8_lossy(&output.stdout));
+        let target = status
+            .sig_created
+            .as_deref()
+            .and_then(|fpr| self.target_for_fingerprint(fpr).ok().flatten());
+        Ok(GpgUse {
+            target,
+            pinentry_launched: status.pinentry_launched,
+        })
+    }
+
+    /// Resolve the exact signing target for `key` without any interactive
+    /// prompt, whether the key is currently cached or locked.
+    ///
+    /// A cached key is probed by a successful harmless sign (`SIG_CREATED`
+    /// names the signing key). A locked key fails with `Operation
+    /// cancelled`; the `KEY_CONSIDERED` record names the primary key and
+    /// the secret-key listing supplies the signing key/keygrip GPG's
+    /// default selection would use (the newest usable signing-capable key
+    /// of that keyblock, honouring a selector that names a specific
+    /// subkey).
+    pub fn probe_target(&self, key: Option<&str>) -> Result<SigningTarget> {
+        let mut cmd = self.sign_command(key, PingMode::Background);
+        let output = run_with_timeout(&mut cmd, BACKGROUND_TIMEOUT)?;
+        let status = parse_status(&String::from_utf8_lossy(&output.stdout));
+        if output.success
+            && let Some(fpr) = status.sig_created.as_deref()
+        {
+            return self.target_for_fingerprint(fpr)?.ok_or_else(|| {
+                Error::GpgTarget(
+                    "gpg signed but the signing key could not be \
+                     resolved to a fingerprint/keygrip"
+                        .into(),
+                )
+            });
+        }
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let locked = stderr.contains("Operation cancelled")
+            || stderr.contains("Operation canceled");
+        let Some(primary_fpr) = status.key_considered.last() else {
+            return Err(Error::GpgTarget(format!(
+                "gpg did not identify a signing key: {}",
+                message(&output.stderr, output.code)
+            )));
+        };
+        if !locked {
+            return Err(Error::GpgFailed(message(
+                &output.stderr,
+                output.code,
+            )));
+        }
+        let blocks = self.list_secret_keys(key)?;
+        let block = blocks
+            .iter()
+            .find(|b| &b.primary.fingerprint == primary_fpr)
+            .ok_or_else(|| {
+                Error::GpgTarget(format!(
+                    "key considered by gpg ({primary_fpr}) was not found \
+                     in the secret-key listing"
+                ))
+            })?;
+        let record = default_signing_key(block, key).ok_or_else(|| {
+            Error::GpgTarget(format!(
+                "no usable signing key found for {primary_fpr}"
+            ))
+        })?;
+        record.keygrip.is_some().then_some(()).ok_or_else(|| {
+            Error::GpgTarget(format!(
+                "no keygrip reported for signing key {}",
+                record.fingerprint
+            ))
+        })?;
+        Ok(SigningTarget {
+            fingerprint: record.fingerprint.clone(),
+            keygrip: record.keygrip.clone(),
+        })
+    }
+
+    /// List secret keys (optionally restricted to a selector) as parsed
+    /// key blocks with fingerprints and keygrips.
+    pub fn list_secret_keys(
+        &self,
+        key: Option<&str>,
+    ) -> Result<Vec<KeyBlock>> {
+        let mut cmd = Command::new(&self.path);
+        cmd.args([
+            "--batch",
+            "--with-colons",
+            "--with-keygrip",
+            "--fingerprint",
+            "--fingerprint",
+            "--list-secret-keys",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+        if let Some(key) = key {
+            cmd.arg(key);
+        }
+        let output = cmd.output().map_err(Error::GpgSpawn)?;
+        if !output.status.success() {
+            return Err(Error::GpgFailed(message(
+                &output.stderr,
+                output.status.code(),
+            )));
+        }
+        Ok(parse_key_blocks(&String::from_utf8_lossy(&output.stdout)))
+    }
+
+    /// Read GnuPG's effective `default-cache-ttl` and `max-cache-ttl` via
+    /// `gpgconf --list-options gpg-agent`.
+    ///
+    /// The explicitly configured value wins over the advertised default.
+    /// Missing, malformed or zero values are rejected.
+    pub fn cache_policy(&self) -> Result<CachePolicy> {
+        let path = self.gpgconf.clone().ok_or_else(|| {
+            Error::GpgToolNotFound("gpgconf (not located)".into())
+        })?;
+        let output = Command::new(&path)
+            .args(["--list-options", "gpg-agent"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .map_err(Error::GpgSpawn)?;
+        if !output.status.success() {
+            return Err(Error::CachePolicy(message(
+                &output.stderr,
+                output.status.code(),
+            )));
+        }
+        parse_cache_policy(&String::from_utf8_lossy(&output.stdout))
+    }
+
+    /// Query the agent's cache/protection state for exactly one keygrip.
+    pub fn key_state(&self, keygrip: &str) -> Result<AgentKeyState> {
+        let answer = self.connect_agent(&format!("KEYINFO {keygrip}"))?;
+        Ok(parse_keyinfo(&answer).unwrap_or(AgentKeyState {
+            // No usable KEYINFO record: either the agent does not know
+            // the keygrip (`ERR ... Not found`) or the response was
+            // unusable. Either way the key is not cached and its
+            // protection is unknown — never a fabricated state.
+            cached: false,
+            protection: KeyProtection::Unknown,
+        }))
+    }
+
+    /// Clear only the given keygrip's normal passphrase cache entry
+    /// (`CLEAR_PASSPHRASE --mode=normal`). Nothing cached is success. The
+    /// agent is never restarted and no other key is affected.
+    pub fn clear_passphrase(&self, keygrip: &str) -> Result<()> {
+        self.connect_agent(&format!(
+            "CLEAR_PASSPHRASE --mode=normal {keygrip}"
+        ))?;
+        Ok(())
+    }
+
+    /// Unlock and perform the harmless sign with exactly `target`, feeding
+    /// the passphrase through the child's stdin (`--passphrase-fd 0`,
+    /// loopback pinentry). The caller must already have cleared the
+    /// target's cache entry when it needs a deterministic cache epoch:
+    /// a hot cache entry would satisfy the sign without validating.
+    pub fn use_key_with_passphrase(
+        &self,
+        target: &SigningTarget,
+        passphrase: &[u8],
+    ) -> Result<()> {
+        if passphrase.is_empty() {
+            return Err(Error::Message(
+                "the passphrase is empty; gpg must validate it \
+                 (an empty passphrase is only meaningful for an \
+                 unprotected key, which needs no stored credential)"
+                    .into(),
+            ));
+        }
+        if passphrase.contains(&b'\n') || passphrase.contains(&b'\r') {
+            return Err(Error::Message(
+                "the passphrase contains a newline; keyhold feeds it to \
+                 gpg as a single line via --passphrase-fd 0"
+                    .into(),
+            ));
+        }
+        let mut cmd = self.sign_command(None, PingMode::Foreground);
+        cmd.arg("--local-user")
+            .arg(format!("{}!", target.fingerprint));
+        cmd.arg("--pinentry-mode").arg("loopback");
+        cmd.arg("--passphrase-fd").arg("0");
+        cmd.stdin(Stdio::piped());
+        let mut child = cmd.spawn().map_err(Error::GpgSpawn)?;
+        {
+            use std::io::Write;
+            let mut stdin = child.stdin.take().expect("piped stdin");
+            // A single trailing newline terminates the line; it is not
+            // part of the passphrase. A write error here is ignored:
+            // gpg may have exited early (for example after rejecting
+            // the passphrase) before reading all input, and the wait
+            // below reports the real error.
+            let _ = stdin.write_all(passphrase);
+            let _ = stdin.write_all(b"\n");
+        }
+        let output = finish(&mut child)?;
+        if output.success {
+            return Ok(());
+        }
+        // Distinguish a rejected passphrase from an unrelated signing
+        // failure; neither includes secret material.
+        if String::from_utf8_lossy(&output.stderr).contains("Bad passphrase") {
+            return Err(Error::BadPassphrase);
+        }
+        Err(Error::GpgFailed(message(&output.stderr, output.code)))
+    }
+
+    /// Run one `gpg-connect-agent` command (already including `/bye`
+    /// handling) and return its response text. Fails on agent errors.
+    fn connect_agent(&self, command: &str) -> Result<String> {
+        let path = self.connect_agent.clone().ok_or_else(|| {
+            Error::GpgToolNotFound("gpg-connect-agent (not located)".into())
+        })?;
+        let output = Command::new(&path)
+            .arg(command)
+            .arg("/bye")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .map_err(Error::GpgSpawn)?;
+        let text = String::from_utf8_lossy(&output.stdout).into_owned();
+        if !output.status.success() {
+            return Err(Error::GpgFailed(message(
+                &output.stderr,
+                output.status.code(),
+            )));
+        }
+        // `ERR ...` lines are agent-level errors (e.g. KEYINFO of an
+        // unknown keygrip); the caller decides how to interpret them.
+        Ok(text)
+    }
+
+    /// The harmless detached-sign command, stdout reserved for
+    /// `--status-fd=1` (the signature itself goes to `/dev/null`).
+    fn sign_command(&self, key: Option<&str>, mode: PingMode) -> Command {
         let mut cmd = Command::new(&self.path);
         cmd.arg("--batch")
             .arg("--yes")
             .arg("--detach-sign")
             .arg("--output")
             .arg("/dev/null")
+            .arg("--status-fd")
+            .arg("1")
             .stdin(Stdio::null())
-            .stdout(Stdio::null())
+            .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         if mode == PingMode::Background {
             // Prompt-free failure when the key is no longer cached.
@@ -98,43 +479,63 @@ impl Gpg {
         if let Some(key) = key {
             cmd.arg("--local-user").arg(key);
         }
-        match mode {
-            PingMode::Foreground => run_blocking(cmd),
-            PingMode::Background => run_with_timeout(cmd, BACKGROUND_TIMEOUT),
-        }
+        cmd
+    }
+
+    /// Map a signing fingerprint to a full target (fingerprint + keygrip)
+    /// via the secret-key listing. `Ok(None)` means the listing does not
+    /// know the fingerprint.
+    fn target_for_fingerprint(
+        &self,
+        fingerprint: &str,
+    ) -> Result<Option<SigningTarget>> {
+        let blocks = self.list_secret_keys(None)?;
+        Ok(
+            find_by_id(&blocks, fingerprint).map(|record| SigningTarget {
+                fingerprint: record.fingerprint.clone(),
+                keygrip: record.keygrip.clone(),
+            }),
+        )
     }
 }
 
-fn is_executable(path: &Path) -> bool {
-    let Ok(meta) = std::fs::metadata(path) else {
-        return false;
-    };
-    meta.is_file() && meta.permissions().mode() & 0o111 != 0
+/// Outcome of one gpg invocation.
+struct RunOutput {
+    success: bool,
+    code: Option<i32>,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
 }
 
-fn run_blocking(mut cmd: Command) -> Result<()> {
+fn run_blocking(cmd: &mut Command) -> Result<RunOutput> {
     let output = cmd.output().map_err(Error::GpgSpawn)?;
-    if output.status.success() {
-        return Ok(());
-    }
-    Err(Error::GpgFailed(message(
-        &output.stderr,
-        output.status.code(),
-    )))
+    Ok(RunOutput {
+        success: output.status.success(),
+        code: output.status.code(),
+        stdout: output.stdout,
+        stderr: output.stderr,
+    })
 }
 
-fn run_with_timeout(mut cmd: Command, timeout: Duration) -> Result<()> {
+fn run_with_timeout(
+    cmd: &mut Command,
+    timeout: Duration,
+) -> Result<RunOutput> {
     let mut child = cmd.spawn().map_err(Error::GpgSpawn)?;
     let deadline = Instant::now() + timeout;
     loop {
         match child.try_wait().map_err(Error::GpgSpawn)? {
             Some(status) => {
+                let stdout =
+                    child.stdout.take().map(drain).unwrap_or_default();
                 let stderr =
                     child.stderr.take().map(drain).unwrap_or_default();
-                if status.success() {
-                    return Ok(());
-                }
-                return Err(Error::GpgFailed(message(&stderr, status.code())));
+                return Ok(RunOutput {
+                    success: status.success(),
+                    code: status.code(),
+                    stdout,
+                    stderr,
+                });
             }
             None if Instant::now() >= deadline => {
                 let _ = child.kill();
@@ -148,7 +549,21 @@ fn run_with_timeout(mut cmd: Command, timeout: Duration) -> Result<()> {
     }
 }
 
-fn drain(mut reader: ChildStderr) -> Vec<u8> {
+/// Wait for the child, then drain both pipes (small outputs; safe after
+/// exit).
+fn finish(child: &mut std::process::Child) -> Result<RunOutput> {
+    let status = child.wait().map_err(Error::GpgSpawn)?;
+    let stdout = child.stdout.take().map(drain).unwrap_or_default();
+    let stderr = child.stderr.take().map(drain).unwrap_or_default();
+    Ok(RunOutput {
+        success: status.success(),
+        code: status.code(),
+        stdout,
+        stderr,
+    })
+}
+
+fn drain<R: Read>(mut reader: R) -> Vec<u8> {
     let mut buf = Vec::new();
     let _ = reader.read_to_end(&mut buf);
     buf
@@ -167,4 +582,570 @@ fn message(stderr: &[u8], code: Option<i32>) -> String {
         .map(|c| format!(" (exit status {c})"))
         .unwrap_or_default();
     format!("{}{}", line.chars().take(200).collect::<String>(), suffix)
+}
+
+/// True for a hexadecimal key id / fingerprint string.
+fn is_hex_id(s: &str) -> bool {
+    !s.is_empty() && s.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+/// Parse a gpg `--status-fd` stream into the records keyhold needs.
+pub fn parse_status(text: &str) -> GpgStatus {
+    let mut status = GpgStatus::default();
+    for line in text.lines() {
+        let Some(rest) = line.strip_prefix("[GNUPG:] ") else {
+            continue;
+        };
+        let mut tokens = rest.split_whitespace();
+        let Some(keyword) = tokens.next() else {
+            continue;
+        };
+        match keyword {
+            "SIG_CREATED" => {
+                // `SIG_CREATED <D|C|S> <digest> <hash> <class> <ts> <fpr>`:
+                // the final field is the fingerprint of the key that
+                // actually signed (a subkey signs with its own
+                // fingerprint).
+                if let Some(fpr) = tokens.last()
+                    && fpr.len() == 40
+                    && is_hex_id(fpr)
+                {
+                    status.sig_created = Some(fpr.to_ascii_uppercase());
+                }
+            }
+            "PINENTRY_LAUNCHED" => status.pinentry_launched = true,
+            "KEY_CONSIDERED" => {
+                if let Some(fpr) = tokens.next()
+                    && fpr.len() == 40
+                    && is_hex_id(fpr)
+                    && !status.key_considered.iter().any(|k| k == fpr)
+                {
+                    status.key_considered.push(fpr.to_ascii_uppercase());
+                }
+            }
+            _ => {}
+        }
+    }
+    status
+}
+
+/// Parse a `--with-colons --with-keygrip --list-secret-keys` listing into
+/// key blocks. `fpr:`/`grp:` records attach to the preceding key record.
+pub fn parse_key_blocks(text: &str) -> Vec<KeyBlock> {
+    let mut blocks: Vec<KeyBlock> = Vec::new();
+    for line in text.lines() {
+        let fields: Vec<&str> = line.split(':').collect();
+        // Attach to the record most recently seen: the primary while no
+        // subkey has followed, otherwise the newest subkey.
+        fn last(b: &mut KeyBlock) -> &mut SecretKeyRecord {
+            b.subkeys.last_mut().unwrap_or(&mut b.primary)
+        }
+        match fields.first().copied().unwrap_or_default() {
+            "sec" => {
+                blocks.push(KeyBlock {
+                    primary: key_record(&fields, true),
+                    subkeys: Vec::new(),
+                });
+            }
+            "ssb" => {
+                if let Some(block) = blocks.last_mut() {
+                    block.subkeys.push(key_record(&fields, false));
+                }
+            }
+            "fpr" => {
+                if let Some(fpr) = field_id(fields.get(9))
+                    && let Some(block) = blocks.last_mut()
+                {
+                    last(block).fingerprint = fpr;
+                }
+            }
+            "grp" => {
+                if let Some(grip) = field_id(fields.get(9))
+                    && let Some(block) = blocks.last_mut()
+                {
+                    last(block).keygrip = Some(grip);
+                }
+            }
+            _ => {}
+        }
+    }
+    blocks
+}
+
+/// One `sec`/`ssb` row of the colon listing. `fields` is the split line;
+/// `primary` distinguishes `sec` from `ssb`.
+fn key_record(fields: &[&str], primary: bool) -> SecretKeyRecord {
+    SecretKeyRecord {
+        primary,
+        keyid: fields.get(4).unwrap_or(&"").to_string(),
+        fingerprint: String::new(),
+        keygrip: None,
+        created: fields.get(5).and_then(|t| t.parse::<u64>().ok()),
+        capabilities: fields.get(11).unwrap_or(&"").to_string(),
+        // Validity (field 2): revoked (r), expired (e), invalid (n),
+        // disabled (d) and invalid (i) records are unusable.
+        usable: !matches!(
+            fields.get(1),
+            Some(&"r") | Some(&"e") | Some(&"n") | Some(&"d") | Some(&"i")
+        ),
+    }
+}
+
+/// A 40-hex-char uppercase id from an `fpr:`/`grp:` field, if usable.
+fn field_id(value: Option<&&str>) -> Option<String> {
+    let id = value.unwrap_or(&"").trim();
+    (id.len() == 40 && is_hex_id(id)).then(|| id.to_ascii_uppercase())
+}
+
+/// Find the record matching an id: full fingerprint (case-insensitive),
+/// keygrip, long key id or short key id.
+pub fn find_by_id<'a>(
+    blocks: &'a [KeyBlock],
+    id: &str,
+) -> Option<&'a SecretKeyRecord> {
+    let needle = id.trim().to_ascii_uppercase();
+    let matches_one = |r: &&SecretKeyRecord| {
+        r.fingerprint == needle
+            || r.keygrip.as_deref() == Some(needle.as_str())
+    };
+    blocks
+        .iter()
+        .flat_map(|b| std::iter::once(&b.primary).chain(b.subkeys.iter()))
+        .find(matches_one)
+        .or_else(|| {
+            blocks
+                .iter()
+                .flat_map(|b| {
+                    std::iter::once(&b.primary).chain(b.subkeys.iter())
+                })
+                .find(|r| {
+                    r.keyid == needle
+                        || needle.len() == 8 && r.keyid.ends_with(&needle)
+                })
+        })
+}
+
+/// The key GPG's default selection would use to sign within `block`:
+/// a selector naming a specific subkey wins; otherwise the newest usable
+/// signing-capable key (primary or subkey — GPG prefers the newest
+/// signing subkey, verified against GnuPG 2.4).
+pub fn default_signing_key<'a>(
+    block: &'a KeyBlock,
+    selector: Option<&str>,
+) -> Option<&'a SecretKeyRecord> {
+    if let Some(selector) = selector {
+        let needle =
+            selector.trim().trim_end_matches('!').to_ascii_uppercase();
+        if is_hex_id(&needle) {
+            // A selector naming a subkey of this block is exact-key
+            // semantics: gpg signs with exactly that subkey. A selector
+            // naming the primary selects the key *block* (verified:
+            // `--local-user <primary>` still signs with the newest
+            // signing subkey), so it falls through to the default rule
+            // below unless it carries the force (`!`) suffix.
+            let forced = selector.trim().ends_with('!');
+            let primary_selected = block.primary.fingerprint == needle
+                || block.primary.keyid == needle;
+            if let Some(sub) = block
+                .subkeys
+                .iter()
+                .find(|r| r.fingerprint == needle || r.keyid == needle)
+            {
+                return Some(sub);
+            }
+            if forced && primary_selected {
+                return Some(&block.primary);
+            }
+        }
+    }
+    let candidates = std::iter::once(&block.primary)
+        .chain(block.subkeys.iter())
+        .filter(|r| r.usable && r.can_sign());
+    candidates.max_by_key(|r| (r.created.unwrap_or(0), r.primary))
+}
+
+/// Parse `gpgconf --list-options gpg-agent` output for the effective
+/// cache TTLs. An explicitly configured value (trailing field) wins over
+/// the advertised default.
+pub fn parse_cache_policy(text: &str) -> Result<CachePolicy> {
+    let mut default_ttl = None;
+    let mut max_ttl = None;
+    for line in text.lines() {
+        let fields: Vec<&str> = line.split(':').collect();
+        let name = fields.first().copied().unwrap_or_default();
+        if name != "default-cache-ttl" && name != "max-cache-ttl" {
+            continue;
+        }
+        // Fields: name:argcount:level:desc:type:alttype:format:default:...:explicit
+        let value = if fields.len() > 9 && !fields[9].is_empty() {
+            Some(fields[9])
+        } else {
+            fields.get(7).copied()
+        };
+        let ttl = value
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|secs| *secs > 0)
+            .ok_or_else(|| {
+                Error::CachePolicy(format!(
+                    "option '{name}' has no usable value"
+                ))
+            })?;
+        let ttl = Duration::from_secs(ttl);
+        match name {
+            "default-cache-ttl" => default_ttl = Some(ttl),
+            "max-cache-ttl" => max_ttl = Some(ttl),
+            _ => {}
+        }
+    }
+    match (default_ttl, max_ttl) {
+        (Some(default_ttl), Some(max_ttl)) => Ok(CachePolicy {
+            default_ttl,
+            max_ttl,
+        }),
+        _ => Err(Error::CachePolicy(
+            "gpgconf did not report both cache TTLs".into(),
+        )),
+    }
+}
+
+/// Parse a `KEYINFO` response. `None` means the agent reported no usable
+/// information (e.g. an unknown keygrip errors with `ERR ... Not found`).
+///
+/// Format (verified against GnuPG 2.4):
+/// `S KEYINFO <keygrip> <D|T|-> <serial> <idstr> <cached 1|-> <P|C|-> ...`
+pub fn parse_keyinfo(text: &str) -> Option<AgentKeyState> {
+    for line in text.lines() {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        if fields.len() < 8 || fields[0] != "S" || fields[1] != "KEYINFO" {
+            continue;
+        }
+        let cached = fields[6] == "1";
+        let protection = match fields[7] {
+            "P" => KeyProtection::Passphrase,
+            "C" => KeyProtection::Clear,
+            _ => KeyProtection::Unknown,
+        };
+        return Some(AgentKeyState { cached, protection });
+    }
+    None
+}
+
+/// Resolve a tool executable: `$override` if set (made absolute, since the
+/// daemon runs with cwd `/`), else the first executable `name` on
+/// `$PATH`. `required` turns a missing tool into an error.
+fn detect_tool(
+    override_env: &str,
+    name: &str,
+    required: bool,
+) -> Result<Option<PathBuf>> {
+    if let Some(spec) = std::env::var_os(override_env) {
+        let mut path = PathBuf::from(&spec);
+        if !path.is_absolute() {
+            let cwd =
+                std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
+            path = cwd.join(path);
+        }
+        if !is_executable(&path) {
+            return Err(Error::GpgNotFound(
+                spec.to_string_lossy().into_owned(),
+            ));
+        }
+        return Ok(Some(path));
+    }
+    if let Some(search) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&search) {
+            let candidate = dir.join(name);
+            if is_executable(&candidate) {
+                return Ok(Some(candidate));
+            }
+        }
+    }
+    if required {
+        return Err(Error::GpgNotFound(format!(
+            "{name} (not found on $PATH)"
+        )));
+    }
+    Ok(None)
+}
+
+fn is_executable(path: &Path) -> bool {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return false;
+    };
+    meta.is_file() && meta.permissions().mode() & 0o111 != 0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const PRIMARY_FPR: &str = "C1D6F8E1B1E8D5FBFF34ACE08FACE96FA6D9DB48";
+    const PRIMARY_ID: &str = "8FACE96FA6D9DB48";
+    const PRIMARY_GRIP: &str = "554FB2F0C3F74666FEE23A13A628C32C2310EBAF";
+    const SUB_FPR: &str = "54BD088B3AC62D6BC6E4F888212181504E7D2CD7";
+    const SUB_ID: &str = "212181504E7D2CD7";
+    const SUB_GRIP: &str = "4B88DD924C36F6085738E95FB112B482E33A3220";
+    const SUB2_FPR: &str = "97CF31DBA5F6012341995ED8F3C83A12ADCE45A1";
+    const SUB2_GRIP: &str = "F097020B875D80D64C742456496ECA8F47CED17F";
+
+    /// Real listing shape: primary + two signing subkeys (GnuPG 2.4.8).
+    fn listing() -> String {
+        format!(
+            "sec:u:255:22:{PRIMARY_ID}:1789136976:::u:::scSC:::+::ed25519:::0:\n\
+             fpr:::::::::{PRIMARY_FPR}:\n\
+             grp:::::::::{PRIMARY_GRIP}:\n\
+             uid:u::::1789136976::78F8::keyhold-test::::::::::0:\n\
+             ssb:u:255:22:{SUB_ID}:1789136986::::::s:::+::ed25519::\n\
+             fpr:::::::::{SUB_FPR}:\n\
+             grp:::::::::{SUB_GRIP}:\n\
+             ssb:u:255:22:F3C83A12ADCE45A1:1789137207::::::s:::+::ed25519::\n\
+             fpr:::::::::{SUB2_FPR}:\n\
+             grp:::::::::{SUB2_GRIP}:\n"
+        )
+    }
+
+    #[test]
+    fn status_parser_extracts_sig_created_fingerprint() {
+        let status = parse_status(
+            "[GNUPG:] KEY_CONSIDERED C1D6F8E1B1E8D5FBFF34ACE08FACE96FA6D9DB48 0\n\
+             [GNUPG:] BEGIN_SIGNING H10\n\
+             [GNUPG:] SIG_CREATED D 22 10 00 1789136997 54bd088b3ac62d6bc6e4f888212181504e7d2cd7\n",
+        );
+        assert_eq!(
+            status.sig_created.as_deref(),
+            Some("54BD088B3AC62D6BC6E4F888212181504E7D2CD7")
+        );
+        assert!(!status.pinentry_launched);
+        assert_eq!(
+            status.key_considered,
+            vec!["C1D6F8E1B1E8D5FBFF34ACE08FACE96FA6D9DB48"]
+        );
+    }
+
+    #[test]
+    fn status_parser_handles_pinentry_launched_and_dedupes_key_considered() {
+        let status = parse_status(
+            "[GNUPG:] KEY_CONSIDERED C1D6F8E1B1E8D5FBFF34ACE08FACE96FA6D9DB48 0\n\
+             [GNUPG:] KEY_CONSIDERED C1D6F8E1B1E8D5FBFF34ACE08FACE96FA6D9DB48 0\n\
+             [GNUPG:] PINENTRY_LAUNCHED 2503588 gnome3 1.3.2 not a tty dumb :0 ? 1000/1000 -\n",
+        );
+        assert!(status.pinentry_launched);
+        assert_eq!(status.key_considered.len(), 1);
+        assert!(status.sig_created.is_none());
+    }
+
+    #[test]
+    fn status_parser_ignores_unrelated_and_malformed_records() {
+        let status = parse_status(
+            "[GNUPG:] BEGIN_SIGNING H10\n\
+             [GNUPG:] INV_SGNR 9 <no-key>\n\
+             [GNUPG:] SIG_CREATED D 22 10 00\n\
+             [GNUPG:] SIG_CREATED truncated\n\
+             [GNUPG:] KEY_CONSIDERED not-a-fpr 0\n\
+             [GNUPG:] KEY_CONSIDERED\n\
+             plain stderr-ish noise\n\
+             [GNUPG:] NEED_PASSPHRASE this that more\n",
+        );
+        assert_eq!(status, GpgStatus::default());
+    }
+
+    #[test]
+    fn status_parser_takes_the_last_field_of_sig_created() {
+        // Standard (non-detached) prefixes must not confuse the parser.
+        let status = parse_status(
+            "[GNUPG:] SIG_CREATED S 22 10 00 1789136997 54BD088B3AC62D6BC6E4F888212181504E7D2CD7\n",
+        );
+        assert_eq!(status.sig_created.as_deref(), Some(SUB_FPR));
+    }
+
+    #[test]
+    fn key_blocks_parse_primary_and_subkeys_with_grips() {
+        let blocks = parse_key_blocks(&listing());
+        assert_eq!(blocks.len(), 1);
+        let block = &blocks[0];
+        assert_eq!(block.primary.fingerprint, PRIMARY_FPR);
+        assert_eq!(block.primary.keygrip.as_deref(), Some(PRIMARY_GRIP));
+        assert_eq!(block.subkeys.len(), 2);
+        assert_eq!(block.subkeys[0].fingerprint, SUB_FPR);
+        assert_eq!(block.subkeys[0].keygrip.as_deref(), Some(SUB_GRIP));
+        assert_eq!(block.subkeys[1].fingerprint, SUB2_FPR);
+        assert!(block.primary.can_sign());
+        assert!(block.subkeys[0].can_sign());
+    }
+
+    #[test]
+    fn find_by_id_matches_fingerprint_keygrip_and_key_ids() {
+        let blocks = parse_key_blocks(&listing());
+        assert_eq!(
+            find_by_id(&blocks, PRIMARY_FPR).map(|r| &r.fingerprint),
+            Some(&PRIMARY_FPR.to_string())
+        );
+        assert_eq!(
+            find_by_id(&blocks, SUB_GRIP).map(|r| &r.fingerprint),
+            Some(&SUB_FPR.to_string())
+        );
+        assert_eq!(
+            find_by_id(&blocks, PRIMARY_ID).map(|r| &r.fingerprint),
+            Some(&PRIMARY_FPR.to_string())
+        );
+        // Short (8-hex) key id.
+        assert_eq!(
+            find_by_id(&blocks, "4E7D2CD7").map(|r| &r.fingerprint),
+            Some(&SUB_FPR.to_string())
+        );
+        // Case-insensitive, and unknown ids find nothing.
+        assert!(
+            find_by_id(&blocks, "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef")
+                .is_none()
+        );
+        assert!(find_by_id(&blocks, "not-an-id").is_none());
+    }
+
+    #[test]
+    fn default_signing_key_prefers_newest_signing_subkey() {
+        let blocks = parse_key_blocks(&listing());
+        let target = default_signing_key(&blocks[0], None).expect("a signer");
+        // The second subkey was created later; GPG signs with it.
+        assert_eq!(target.fingerprint, SUB2_FPR);
+    }
+
+    #[test]
+    fn default_signing_key_honours_exact_subkey_selector() {
+        let blocks = parse_key_blocks(&listing());
+        let target =
+            default_signing_key(&blocks[0], Some(SUB_FPR)).expect("a signer");
+        assert_eq!(target.fingerprint, SUB_FPR);
+        // An `!`-suffixed primary forces the primary itself.
+        let forced =
+            default_signing_key(&blocks[0], Some(&format!("{PRIMARY_FPR}!")))
+                .expect("a signer");
+        assert_eq!(forced.fingerprint, PRIMARY_FPR);
+    }
+
+    #[test]
+    fn default_signing_key_falls_back_to_primary_without_subkeys() {
+        let text = format!(
+            "sec:u:255:22:{PRIMARY_ID}:1789136976:::u:::scSC:::+::ed25519:::0:\n\
+             fpr:::::::::{PRIMARY_FPR}:\n\
+             grp:::::::::{PRIMARY_GRIP}:\n\
+             ssb:u:255:22:{SUB_ID}:1789136986::::::e:::+::cv25519::\n\
+             fpr:::::::::{SUB_FPR}:\n"
+        );
+        let blocks = parse_key_blocks(&text);
+        // The only subkey encrypts (`e`), so the primary signs.
+        assert_eq!(
+            default_signing_key(&blocks[0], None)
+                .expect("a signer")
+                .fingerprint,
+            PRIMARY_FPR
+        );
+    }
+
+    #[test]
+    fn default_signing_key_skips_revoked_subkeys() {
+        let text = format!(
+            "sec:u:255:22:{PRIMARY_ID}:1789136976:::u:::scSC:::+::ed25519:::0:\n\
+             fpr:::::::::{PRIMARY_FPR}:\n\
+             grp:::::::::{PRIMARY_GRIP}:\n\
+             ssb:r:255:22:{SUB_ID}:1789136986::::::s:::+::ed25519::\n\
+             fpr:::::::::{SUB_FPR}:\n"
+        );
+        let blocks = parse_key_blocks(&text);
+        assert_eq!(
+            default_signing_key(&blocks[0], None)
+                .expect("a signer")
+                .fingerprint,
+            PRIMARY_FPR
+        );
+    }
+
+    #[test]
+    fn cache_policy_prefers_explicit_values_over_defaults() {
+        // Real gpgconf 2.4.8 shape (explicit max, default-only default).
+        let text = "\
+default-cache-ttl:24:0:expire cached PINs after N seconds:3:3:N:600::\n\
+max-cache-ttl:24:2:set maximum PIN cache lifetime to N seconds:3:3:N:7200::999\n\
+max-cache-ttl-ssh:24:2:set maximum SSH key lifetime to N seconds:3:3:N:7200::\n";
+        let policy = parse_cache_policy(text).unwrap();
+        assert_eq!(policy.default_ttl, Duration::from_secs(600));
+        assert_eq!(policy.max_ttl, Duration::from_secs(999));
+    }
+
+    #[test]
+    fn cache_policy_uses_advertised_defaults_when_unset() {
+        let text = "\
+default-cache-ttl:24:0:expire cached PINs after N seconds:3:3:N:600::\n\
+max-cache-ttl:24:2:set maximum PIN cache lifetime to N seconds:3:3:N:7200::\n";
+        let policy = parse_cache_policy(text).unwrap();
+        assert_eq!(policy.max_ttl, Duration::from_secs(7200));
+    }
+
+    #[test]
+    fn cache_policy_rejects_missing_zero_and_malformed_values() {
+        let missing = "unrelated:1:0:x:0:0:N:5::\n";
+        assert!(parse_cache_policy(missing).is_err());
+        let zero = "default-cache-ttl:24:0:d:3:3:N:0::\nmax-cache-ttl:24:2:d:3:3:N:10::\n";
+        assert!(parse_cache_policy(zero).is_err());
+        let malformed = "default-cache-ttl:24:0:d:3:3:N:banana::\nmax-cache-ttl:24:2:d:3:3:N:10::\n";
+        assert!(parse_cache_policy(malformed).is_err());
+        // -ssh twins must not satisfy the non-ssh lookups.
+        let ssh_only = "\
+max-cache-ttl-ssh:24:2:d:3:3:N:10::\ndefault-cache-ttl-ssh:24:0:d:3:3:N:10::\n";
+        assert!(parse_cache_policy(ssh_only).is_err());
+    }
+
+    #[test]
+    fn keyinfo_parses_cached_protected_locked_and_clear_states() {
+        let cached = parse_keyinfo(&format!(
+            "S KEYINFO {SUB_GRIP} D - - 1 P - - -\nOK\n"
+        ));
+        assert_eq!(
+            cached,
+            Some(AgentKeyState {
+                cached: true,
+                protection: KeyProtection::Passphrase,
+            })
+        );
+        let locked = parse_keyinfo(&format!(
+            "S KEYINFO {SUB_GRIP} D - - - P - - -\nOK\n"
+        ));
+        assert_eq!(
+            locked,
+            Some(AgentKeyState {
+                cached: false,
+                protection: KeyProtection::Passphrase,
+            })
+        );
+        let clear = parse_keyinfo(&format!(
+            "S KEYINFO {SUB_GRIP} D - - - C - - -\nOK\n"
+        ));
+        assert_eq!(
+            clear,
+            Some(AgentKeyState {
+                cached: false,
+                protection: KeyProtection::Clear,
+            })
+        );
+        let unknown = parse_keyinfo(&format!(
+            "S KEYINFO {SUB_GRIP} D - - - - - - -\nOK\n"
+        ));
+        assert_eq!(
+            unknown,
+            Some(AgentKeyState {
+                cached: false,
+                protection: KeyProtection::Unknown,
+            })
+        );
+    }
+
+    #[test]
+    fn keyinfo_agent_error_or_malformed_yields_none() {
+        assert!(
+            parse_keyinfo("ERR 67108891 Not found <GPG Agent>\nOK\n")
+                .is_none()
+        );
+        assert!(parse_keyinfo("OK\n").is_none());
+        assert!(parse_keyinfo("S KEYINFO grip\nOK\n").is_none());
+        assert!(parse_keyinfo("").is_none());
+    }
 }

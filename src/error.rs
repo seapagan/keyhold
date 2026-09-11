@@ -39,6 +39,27 @@ pub enum Error {
         reason: String,
     },
 
+    /// A companion gpg tool (`gpgconf`, `gpg-connect-agent`) could not
+    /// be located.
+    #[error("gpg tool executable not found: {0}")]
+    GpgToolNotFound(String),
+
+    /// The GPG signing key/target could not be resolved.
+    #[error("could not resolve the GPG signing key: {0}")]
+    GpgTarget(String),
+
+    /// GnuPG's effective cache TTL values could not be read.
+    #[error("could not read GnuPG cache TTL settings: {0}")]
+    CachePolicy(String),
+
+    /// GPG rejected the supplied passphrase.
+    #[error("gpg rejected the passphrase")]
+    BadPassphrase,
+
+    /// The Linux Secret Service session credential store failed.
+    #[error("secret service error: {0}")]
+    SecretService(String),
+
     /// `$XDG_RUNTIME_DIR` is missing or not absolute.
     #[error(
         "$XDG_RUNTIME_DIR is not set to an absolute path; keyhold needs it for its per-user socket"

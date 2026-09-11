@@ -88,7 +88,10 @@ fn on(
     // Foreground unlock/ping with normal pinentry behaviour. Only when this
     // succeeds does the daemon start holding the key; on failure the hold is
     // not enabled.
-    if let Err(e) = gpg.ping(key.as_deref(), PingMode::Foreground) {
+    if let Err(e) = gpg
+        .use_key(key.as_deref(), PingMode::Foreground)
+        .map(|_| ())
+    {
         return Err(Error::Message(format!("{e}; the hold was NOT enabled")));
     }
 

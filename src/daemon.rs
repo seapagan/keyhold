@@ -127,14 +127,20 @@ fn start_background() -> Result<()> {
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
-    // The daemon re-detects gpg itself, but runs with cwd "/": hand it an
-    // absolute KEYHOLD_GPG so relative overrides keep working.
-    if let Some(spec) = std::env::var_os(crate::gpg::GPG_ENV) {
-        let path = PathBuf::from(&spec);
-        if !path.is_absolute()
-            && let Ok(cwd) = std::env::current_dir()
-        {
-            cmd.env(crate::gpg::GPG_ENV, cwd.join(path));
+    // The daemon re-detects the gpg tools itself, but runs with cwd "/":
+    // hand it absolute overrides so relative paths keep working.
+    for env_key in [
+        crate::gpg::GPG_ENV,
+        crate::gpg::GPGCONF_ENV,
+        crate::gpg::CONNECT_AGENT_ENV,
+    ] {
+        if let Some(spec) = std::env::var_os(env_key) {
+            let path = PathBuf::from(&spec);
+            if !path.is_absolute()
+                && let Ok(cwd) = std::env::current_dir()
+            {
+                cmd.env(env_key, cwd.join(path));
+            }
         }
     }
     // SAFETY: the closure runs in the child between fork and exec and must be
@@ -406,7 +412,9 @@ fn scheduler(pair: &Pair, gpg: &Gpg) {
                     let shared = lock(pair);
                     (shared.hold.generation, shared.hold.key.clone())
                 };
-                let result = gpg.ping(key.as_deref(), PingMode::Background);
+                let result = gpg
+                    .use_key(key.as_deref(), PingMode::Background)
+                    .map(|_| ());
                 let mut shared = lock(pair);
                 if shared.hold.generation == generation && shared.hold.enabled
                 {

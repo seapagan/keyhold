@@ -100,9 +100,16 @@ impl Tools {
                 "#!/bin/sh\n\
                  echo \"$*\" >> {ca_log}\n\
                  cmd=$1\n\
+                 if [ -e {root}/malformed-ca ]; then echo 'gibberish, not assuan'; exit 0; fi\n\
+                 if [ -e {root}/bare-ok ]; then echo OK; exit 0; fi\n\
                  case \"$cmd\" in\n\
-                   'CLEAR_PASSPHRASE '*) echo OK; exit 0;;\n\
+                   'CLEAR_PASSPHRASE '*)\n\
+                     if [ -e {root}/fail-clear ]; then\n\
+                       echo 'ERR 67109139 Unknown IPC command <GPG Agent>'; exit 0; fi\n\
+                     echo OK; exit 0;;\n\
                    KEYINFO\\ *)\n\
+                     if [ -e {root}/fail-keyinfo ]; then\n\
+                       echo 'ERR 67109139 Unknown IPC command <GPG Agent>'; exit 0; fi\n\
                      grip=$(echo \"$cmd\" | cut -d' ' -f2)\n\
                      case \"$grip\" in\n\
                        0000000000000000000000000000000000000000)\n\
@@ -384,6 +391,77 @@ fn clear_passphrase_clears_only_the_given_keygrip() {
     assert!(!log.contains("RELOADAGENT"), "{log}");
     assert!(!log.contains("KILLAGENT"), "{log}");
     assert_eq!(log.lines().count(), 1, "{log}");
+}
+
+/// Regression: `gpg-connect-agent` exits 0 even when the agent rejects
+/// the command with an Assuan `ERR` line. A rejected clear must be an
+/// error, never success: stored mode relies on the clear establishing
+/// a deterministic cache epoch.
+#[test]
+fn clear_passphrase_fails_when_the_agent_returns_err_despite_exit_zero() {
+    let tools = Tools::new();
+    tools.marker("fail-clear");
+    let err = tools.gpg.clear_passphrase(SUB2_GRIP).unwrap_err();
+    assert!(
+        matches!(err, keyhold::error::Error::AgentCommand(_)),
+        "{err}"
+    );
+    assert!(
+        err.to_string().contains("ERR 67109139"),
+        "error lacks the agent's answer: {err}"
+    );
+    // The fake tool really ran and really exited 0.
+    let log = tools.ca_log();
+    assert!(
+        log.contains(&format!("CLEAR_PASSPHRASE --mode=normal {SUB2_GRIP}")),
+        "{log}"
+    );
+}
+
+/// A response with no terminal `OK`/`ERR` line is malformed and must
+/// not silently pass as success.
+#[test]
+fn clear_passphrase_rejects_a_malformed_agent_response() {
+    let tools = Tools::new();
+    tools.marker("malformed-ca");
+    let err = tools.gpg.clear_passphrase(SUB2_GRIP).unwrap_err();
+    assert!(
+        matches!(err, keyhold::error::Error::AgentCommand(_)),
+        "{err}"
+    );
+    assert!(err.to_string().contains("malformed"), "{err}");
+}
+
+#[test]
+fn key_state_reports_an_agent_rejection_despite_exit_zero() {
+    let tools = Tools::new();
+    tools.marker("fail-keyinfo");
+    assert!(
+        tools.gpg.key_state(SUB2_GRIP).is_err(),
+        "a rejected KEYINFO became a state"
+    );
+}
+
+#[test]
+fn key_state_rejects_a_malformed_agent_response() {
+    let tools = Tools::new();
+    tools.marker("malformed-ca");
+    assert!(
+        tools.gpg.key_state(SUB2_GRIP).is_err(),
+        "a malformed reply became a state"
+    );
+}
+
+/// `OK` without a `S KEYINFO` record is an ambiguous answer, not a
+/// usable state.
+#[test]
+fn key_state_rejects_ok_without_a_keyinfo_record() {
+    let tools = Tools::new();
+    tools.marker("bare-ok");
+    assert!(
+        tools.gpg.key_state(SUB2_GRIP).is_err(),
+        "a record-less OK became a state"
+    );
 }
 
 #[test]

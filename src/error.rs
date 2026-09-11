@@ -56,6 +56,13 @@ pub enum Error {
     #[error("gpg rejected the passphrase")]
     BadPassphrase,
 
+    /// A `gpg-connect-agent` command failed: the agent rejected the
+    /// command with an Assuan `ERR` response, or its response could not
+    /// be understood. The message carries the command and the agent's
+    /// machine-readable answer; never secret material.
+    #[error("gpg agent command failed: {0}")]
+    AgentCommand(String),
+
     /// The Linux Secret Service session credential store failed.
     #[error("secret service error: {0}")]
     SecretService(String),

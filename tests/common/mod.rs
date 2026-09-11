@@ -592,6 +592,8 @@ impl DaemonTools {
                  cmd=$1\n\
                  case \"$cmd\" in\n\
                    'CLEAR_PASSPHRASE '*)\n\
+                     if [ -e {root}/fail-clear ]; then\n\
+                       echo 'ERR 67109139 Unknown IPC command <GPG Agent>'; exit 0; fi\n\
                      touch {root}/locked\n\
                      echo OK; exit 0;;\n\
                    KEYINFO\\ *)\n\

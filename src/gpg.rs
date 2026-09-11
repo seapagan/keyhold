@@ -45,6 +45,13 @@ pub const GPGCONF_ENV: &str = "KEYHOLD_GPGCONF";
 /// Environment variable overriding the `gpg-connect-agent` executable path.
 pub const CONNECT_AGENT_ENV: &str = "KEYHOLD_GPG_CONNECT_AGENT";
 
+/// libgpg-error packs the error code into the low 15 bits of the value
+/// printed in Assuan `ERR <code>` replies and `--status-fd` `FAILURE`
+/// records; the upper bits carry the error source.
+const GPG_ERR_CODE_MASK: u64 = 0x7FFF;
+/// `GPG_ERR_NOT_FOUND` (27): the agent's answer for an unknown keygrip.
+const GPG_ERR_NOT_FOUND: u64 = 27;
+
 /// How long a background ping may run before it is killed.
 const BACKGROUND_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -87,6 +94,55 @@ pub struct AgentKeyState {
     pub cached: bool,
     /// How the key is protected.
     pub protection: KeyProtection,
+}
+
+/// The parsed outcome of one `gpg-connect-agent` command exchange.
+///
+/// GnuPG exits 0 even when the agent rejects the command with an
+/// Assuan `ERR` response (verified against GnuPG 2.4), so the terminal
+/// response line — not the child's exit status — is the result.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AgentReply {
+    /// Terminal `OK [info]`: the agent accepted the command. Carries
+    /// every non-empty response line, information lines included.
+    Ok(Vec<String>),
+    /// Terminal `ERR <code> [<text>]`: the agent rejected the command.
+    Err {
+        /// The full numeric error code (a libgpg-error value).
+        code: u64,
+        /// The human-readable remainder of the line, when present.
+        text: String,
+    },
+    /// No terminal line at all: an empty or malformed response.
+    Malformed,
+}
+
+impl AgentReply {
+    /// Convert into a result for commands whose only success criterion
+    /// is the terminal `OK`: `ERR` and malformed replies become
+    /// [`Error::AgentCommand`] carrying the command and the agent's
+    /// machine-readable answer (never secret material).
+    fn into_result(self, command: &str) -> Result<Vec<String>> {
+        match self {
+            AgentReply::Ok(lines) => Ok(lines),
+            AgentReply::Err { code, text } => Err(Error::AgentCommand(
+                format!("{command}: agent returned ERR {code} {text}"),
+            )),
+            AgentReply::Malformed => Err(Error::AgentCommand(format!(
+                "{command}: no terminal OK/ERR line in the agent's reply"
+            ))),
+        }
+    }
+
+    /// Whether this is an `ERR` reply carrying the given libgpg-error
+    /// code (masked to its low 15 bits).
+    fn has_code(&self, wanted: u64) -> bool {
+        matches!(
+            self,
+            AgentReply::Err { code, .. }
+                if code & GPG_ERR_CODE_MASK == wanted
+        )
+    }
 }
 
 /// GnuPG's effective cache TTL policy for the agent.
@@ -363,25 +419,40 @@ impl Gpg {
     }
 
     /// Query the agent's cache/protection state for exactly one keygrip.
+    ///
+    /// An unknown keygrip is a known answer, not a failure: the agent
+    /// rejects `KEYINFO` with `ERR ... Not found` (GPG_ERR_NOT_FOUND)
+    /// and the key is simply not cached. Any other rejection, or a
+    /// response without a usable `S KEYINFO` record, is an error — a
+    /// state is never fabricated.
     pub fn key_state(&self, keygrip: &str) -> Result<AgentKeyState> {
-        let answer = self.connect_agent(&format!("KEYINFO {keygrip}"))?;
-        Ok(parse_keyinfo(&answer).unwrap_or(AgentKeyState {
-            // No usable KEYINFO record: either the agent does not know
-            // the keygrip (`ERR ... Not found`) or the response was
-            // unusable. Either way the key is not cached and its
-            // protection is unknown — never a fabricated state.
-            cached: false,
-            protection: KeyProtection::Unknown,
-        }))
+        let reply = self.connect_agent(&format!("KEYINFO {keygrip}"))?;
+        if reply.has_code(GPG_ERR_NOT_FOUND) {
+            return Ok(AgentKeyState {
+                cached: false,
+                protection: KeyProtection::Unknown,
+            });
+        }
+        let lines = reply.into_result("KEYINFO")?;
+        parse_keyinfo(&lines.join("\n")).ok_or_else(|| {
+            Error::AgentCommand(
+                "KEYINFO: the agent accepted the command but sent no \
+                 usable KEYINFO record"
+                    .into(),
+            )
+        })
     }
 
     /// Clear only the given keygrip's normal passphrase cache entry
-    /// (`CLEAR_PASSPHRASE --mode=normal`). Nothing cached is success. The
-    /// agent is never restarted and no other key is affected.
+    /// (`CLEAR_PASSPHRASE --mode=normal`). Succeeds only when the agent
+    /// accepted the clear with a terminal `OK` (clearing an uncached
+    /// keygrip is documented success). The agent is never restarted and
+    /// no other key is affected.
     pub fn clear_passphrase(&self, keygrip: &str) -> Result<()> {
         self.connect_agent(&format!(
             "CLEAR_PASSPHRASE --mode=normal {keygrip}"
-        ))?;
+        ))?
+        .into_result("CLEAR_PASSPHRASE")?;
         Ok(())
     }
 
@@ -440,9 +511,16 @@ impl Gpg {
         Err(Error::GpgFailed(message(&output.stderr, output.code)))
     }
 
-    /// Run one `gpg-connect-agent` command (already including `/bye`
-    /// handling) and return its response text. Fails on agent errors.
-    fn connect_agent(&self, command: &str) -> Result<String> {
+    /// Run one `gpg-connect-agent` command (with `/bye`) and parse its
+    /// response into an [`AgentReply`].
+    ///
+    /// A non-zero exit status (for example an unreachable agent) is an
+    /// error, but the exit status alone can never indicate success:
+    /// GnuPG exits 0 even when the agent rejects the command with an
+    /// Assuan `ERR` line (verified against GnuPG 2.4: an unknown
+    /// command produces `ERR 67109139 Unknown IPC command` with exit
+    /// status 0). The parsed terminal line therefore decides.
+    fn connect_agent(&self, command: &str) -> Result<AgentReply> {
         let path = self.connect_agent.clone().ok_or_else(|| {
             Error::GpgToolNotFound("gpg-connect-agent (not located)".into())
         })?;
@@ -454,16 +532,29 @@ impl Gpg {
             .stderr(Stdio::piped())
             .output()
             .map_err(Error::GpgSpawn)?;
-        let text = String::from_utf8_lossy(&output.stdout).into_owned();
         if !output.status.success() {
             return Err(Error::GpgFailed(message(
                 &output.stderr,
                 output.status.code(),
             )));
         }
-        // `ERR ...` lines are agent-level errors (e.g. KEYINFO of an
-        // unknown keygrip); the caller decides how to interpret them.
-        Ok(text)
+        let text = String::from_utf8_lossy(&output.stdout).into_owned();
+        let word = command.split_whitespace().next().unwrap_or(command);
+        match parse_agent_reply(&text) {
+            // An unusable reply must never pass as success.
+            AgentReply::Malformed => {
+                let shown = text
+                    .lines()
+                    .map(str::trim)
+                    .find(|l| !l.is_empty())
+                    .map(|l| l.chars().take(120).collect::<String>())
+                    .unwrap_or_else(|| "(no output)".into());
+                Err(Error::AgentCommand(format!(
+                    "{word}: malformed agent response ({shown})"
+                )))
+            }
+            reply => Ok(reply),
+        }
     }
 
     /// The harmless detached-sign command, stdout reserved for
@@ -812,6 +903,41 @@ pub fn parse_cache_policy(text: &str) -> Result<CachePolicy> {
             "gpgconf did not report both cache TTLs".into(),
         )),
     }
+}
+
+/// Parse one `gpg-connect-agent` response into its terminal result.
+///
+/// The last non-empty line decides (Assuan protocol: information lines
+/// precede the terminal status): `OK [info]` succeeds, `ERR <code>
+/// [<text>]` fails, and anything else — or no lines at all — is
+/// malformed and must not be treated as success.
+pub fn parse_agent_reply(text: &str) -> AgentReply {
+    let Some(terminal) =
+        text.lines().rev().map(str::trim).find(|l| !l.is_empty())
+    else {
+        return AgentReply::Malformed;
+    };
+    if terminal == "OK" || terminal.starts_with("OK ") {
+        return AgentReply::Ok(
+            text.lines()
+                .map(str::trim)
+                .filter(|l| !l.is_empty())
+                .map(str::to_owned)
+                .collect(),
+        );
+    }
+    if let Some(rest) = terminal.strip_prefix("ERR ") {
+        // `ERR <code> [<text>]`: the code is required and numeric; the
+        // text is optional.
+        let mut parts = rest.splitn(2, char::is_whitespace);
+        if let Some(code) = parts.next().and_then(|c| c.parse::<u64>().ok()) {
+            return AgentReply::Err {
+                code,
+                text: parts.next().unwrap_or_default().trim().to_owned(),
+            };
+        }
+    }
+    AgentReply::Malformed
 }
 
 /// Parse a `KEYINFO` response. `None` means the agent reported no usable
@@ -1168,5 +1294,75 @@ max-cache-ttl-ssh:24:2:d:3:3:N:10::\ndefault-cache-ttl-ssh:24:0:d:3:3:N:10::\n";
         assert!(parse_keyinfo("OK\n").is_none());
         assert!(parse_keyinfo("S KEYINFO grip\nOK\n").is_none());
         assert!(parse_keyinfo("").is_none());
+    }
+
+    #[test]
+    fn agent_reply_recognises_terminal_ok_and_err() {
+        assert_eq!(parse_agent_reply(""), AgentReply::Malformed);
+        assert_eq!(parse_agent_reply("OK"), AgentReply::Ok(vec!["OK".into()]));
+        // `OK` may carry info text (Assuan allows it; our commands
+        // never produce it).
+        assert_eq!(
+            parse_agent_reply("OK Getinfo\n"),
+            AgentReply::Ok(vec!["OK Getinfo".into()])
+        );
+        // Information lines precede the terminal status.
+        assert_eq!(
+            parse_agent_reply("S KEYINFO GRIP D - - 1 P - - -\nOK\n"),
+            AgentReply::Ok(vec![
+                "S KEYINFO GRIP D - - 1 P - - -".into(),
+                "OK".into()
+            ])
+        );
+        assert_eq!(
+            parse_agent_reply("ERR 67108891 Not found <GPG Agent>\n"),
+            AgentReply::Err {
+                code: 67108891,
+                text: "Not found <GPG Agent>".into()
+            }
+        );
+        // An ERR line may carry no text.
+        assert_eq!(
+            parse_agent_reply("ERR 67108891"),
+            AgentReply::Err {
+                code: 67108891,
+                text: String::new(),
+            }
+        );
+    }
+
+    #[test]
+    fn agent_reply_rejects_malformed_and_misplaced_lines() {
+        // A bare data line, a non-numeric code, a keyword that is
+        // neither OK nor ERR, and a terminal line that is not last.
+        assert_eq!(parse_agent_reply("D abcdef"), AgentReply::Malformed);
+        assert_eq!(
+            parse_agent_reply("ERR not-a-code nope\n"),
+            AgentReply::Malformed
+        );
+        assert_eq!(parse_agent_reply("junk\n"), AgentReply::Malformed);
+        assert_eq!(
+            parse_agent_reply("OK\nS KEYINFO trailing\n"),
+            AgentReply::Malformed
+        );
+        // Blank noise and CRLF endings do not confuse the parser.
+        assert_eq!(
+            parse_agent_reply("\r\nS KEYINFO G D - - 1 P - - -\r\nOK\r\n"),
+            AgentReply::Ok(vec![
+                "S KEYINFO G D - - 1 P - - -".into(),
+                "OK".into()
+            ])
+        );
+    }
+
+    #[test]
+    fn agent_err_code_matching_uses_the_libgpg_error_bits() {
+        // GPG_ERR_NOT_FOUND (27) rides in the low 15 bits; the high
+        // bits are the error source and must not disturb the match.
+        let not_found = parse_agent_reply("ERR 67108891 Not found\n");
+        assert!(not_found.has_code(GPG_ERR_NOT_FOUND));
+        let other = parse_agent_reply("ERR 67109139 Unknown IPC command\n");
+        assert!(!other.has_code(GPG_ERR_NOT_FOUND));
+        assert!(!parse_agent_reply("OK\n").has_code(GPG_ERR_NOT_FOUND));
     }
 }

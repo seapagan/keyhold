@@ -310,6 +310,71 @@ fn store_failure_after_unlock_fails_the_activation() {
     );
 }
 
+/// Regression: the agent can reject a command while
+/// `gpg-connect-agent` still exits 0. When the cache clear is
+/// rejected, stored activation must fail before any loopback sign —
+/// a failed clear followed by a successful sign would validate
+/// nothing (a hot cache would satisfy it).
+#[test]
+fn rejected_cache_clear_aborts_the_stored_activation() {
+    let tools = DaemonTools::new(tmp().path());
+    let store = FakeStore::default();
+    store.preload(SUB2_GRIP, common::FAKE_PASSPHRASE.as_bytes());
+    tools.marker("fail-clear");
+
+    let err =
+        stored_activation(&tools.gpg, &store, None, 60_000, None).unwrap_err();
+    let text = err.to_string();
+    assert!(
+        text.contains("clearing the GPG cache entry failed"),
+        "{text}"
+    );
+    assert!(
+        text.contains("ERR 67109139"),
+        "the agent's rejection is missing from the error: {text}"
+    );
+    assert!(text.contains("NOT enabled"), "{text}");
+    // No loopback sign ran: the credential was never "validated"
+    // against a possibly-hot cache.
+    assert_eq!(
+        tools.loopbacks(),
+        0,
+        "a loopback sign ran after the failed clear: {}",
+        tools.gpg_log()
+    );
+}
+
+/// The same guarantee for the daemon's proactive renewal: a rejected
+/// clear stops the hold before any loopback sign.
+#[test]
+fn rejected_cache_clear_stops_renewal_before_any_loopback_sign() {
+    let running = Running::start(ShutdownPolicies::default());
+    // 2s hard max renews ~1.8s in.
+    running.hold(60_000, 2);
+    running.tools.marker("fail-clear");
+    let loopbacks_before = running.tools.loopbacks();
+
+    assert!(
+        wait_until(10 * SECS, || running.status()["hold_on"] == false),
+        "hold did not stop: {}",
+        running.status()
+    );
+    let error = running.status()["last_error"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        error.contains("gpg agent command failed"),
+        "wrong error: {error}"
+    );
+    assert_eq!(
+        running.tools.loopbacks(),
+        loopbacks_before,
+        "a loopback sign ran after the failed clear: {}",
+        running.tools.gpg_log()
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Daemon: renewal, recovery, races, cleanup
 // ---------------------------------------------------------------------------

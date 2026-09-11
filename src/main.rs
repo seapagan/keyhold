@@ -8,15 +8,18 @@ use std::{
 use clap::Parser;
 
 use keyhold::{
-    cli::{Cli, Command},
+    activation,
+    cli::{Cli, Command, CredentialAction},
     config::{self, Config},
+    credential::CredentialStore as _,
+    credential::SessionCredentialStore,
     daemon,
     error::{Error, Result},
     git,
-    gpg::{Gpg, PingMode},
+    gpg::Gpg,
     ipc::{self, Request, Response},
     presentation,
-    state::KeySource,
+    state::{CredentialMode, KeySource, StatusData},
 };
 
 fn main() -> ExitCode {
@@ -35,11 +38,23 @@ fn run(command: Command) -> Result<()> {
         Command::On {
             key,
             git_key,
+            store_passphrase,
+            no_store_passphrase,
             r#for,
             interval,
-        } => on(key, git_key, r#for, interval),
+        } => on(
+            key,
+            git_key,
+            store_passphrase,
+            no_store_passphrase,
+            r#for,
+            interval,
+        ),
         Command::Off => off(),
         Command::Status => status(),
+        Command::Credential { action } => match action {
+            CredentialAction::Clear => credential_clear(),
+        },
         Command::Daemon { stop, background } => {
             if stop {
                 daemon_stop()
@@ -68,6 +83,8 @@ fn daemon_background() -> Result<()> {
 fn on(
     key: Option<String>,
     git_key: bool,
+    store_passphrase: bool,
+    no_store_passphrase: bool,
     hold_for: Option<Duration>,
     interval: Option<Duration>,
 ) -> Result<()> {
@@ -81,19 +98,28 @@ fn on(
     // schedule something the user never asked for.
     let interval_ms = duration_ms(&interval)?;
     let hold_ms = hold_for.map(|d| duration_ms(&d)).transpose()?;
+    // Effective mode: explicit CLI enable/disable > config > built-in
+    // default (false). Storage is never the implicit default.
+    let store_enabled =
+        store_passphrase || (config.store_passphrase && !no_store_passphrase);
+
     let gpg = Gpg::detect()?;
 
     daemon::ensure_running()?;
 
-    // Foreground unlock/ping with normal pinentry behaviour. Only when this
-    // succeeds does the daemon start holding the key; on failure the hold is
-    // not enabled.
-    if let Err(e) = gpg
-        .use_key(key.as_deref(), PingMode::Foreground)
-        .map(|_| ())
-    {
-        return Err(Error::Message(format!("{e}; the hold was NOT enabled")));
-    }
+    // The activation flow performs the foreground key use (and, in
+    // stored mode, the credential/epoch dance) before anything is
+    // enabled; on failure the hold is not enabled.
+    let prepared = activation::activate(
+        &gpg,
+        store_enabled,
+        key.as_deref(),
+        key_source,
+        interval,
+        hold_for,
+        &SessionCredentialStore,
+        &keyhold::credential::prompt_passphrase,
+    )?;
 
     // The foreground success is a genuine key use: send its wall-clock
     // moment so the daemon records it as the hold's first successful ping
@@ -106,9 +132,31 @@ fn on(
         interval_ms,
         hold_ms,
         activated_at_ms,
+        fingerprint: prepared.target.as_ref().map(|t| t.fingerprint.clone()),
+        keygrip: prepared.target.as_ref().and_then(|t| t.keygrip.clone()),
+        credential_mode: prepared
+            .cache
+            .map(|cache| cache.mode)
+            .unwrap_or_default(),
+        default_cache_ttl_ms: prepared
+            .cache
+            .map(|cache| duration_ms(&cache.default_ttl))
+            .transpose()?,
+        max_cache_ttl_ms: prepared
+            .cache
+            .map(|cache| duration_ms(&cache.max_ttl))
+            .transpose()?,
+        cache_started_at_ms: prepared
+            .cache
+            .and_then(|cache| cache.started_wall)
+            .map(|t| epoch_ms(t).unwrap_or(0))
+            .filter(|_| {
+                prepared.cache.is_some_and(|c| c.started_wall.is_some())
+            }),
     };
     check(ipc::request(&request)?)?;
 
+    presentation::warnings(&prepared.warnings);
     match hold_for {
         Some(d) => presentation::enabled_for(
             &humantime::format_duration(d).to_string(),
@@ -169,13 +217,93 @@ fn status() -> Result<()> {
         Ok(_) => {
             let response = ipc::request(&Request::Status)?;
             check(response.clone())?;
-            let data = response.status.ok_or_else(|| {
+            let data: StatusData = response.status.ok_or_else(|| {
                 Error::Message("daemon returned no status".into())
             })?;
-            presentation::print_status(&data);
+            // Live key/credential state is queried at command time (a
+            // snapshot, not a promise), not cached in the daemon.
+            let gpg = Gpg::detect().ok();
+            presentation::print_status(
+                &data,
+                key_state_row(&data, gpg.as_ref()),
+                credential_row(&data),
+            );
             Ok(())
         }
     }
+}
+
+/// The live `Key state` value for an active hold, when one is resolvable.
+fn key_state_row(data: &StatusData, gpg: Option<&Gpg>) -> Option<String> {
+    if !data.hold_on {
+        return None;
+    }
+    let keygrip = data.keygrip.as_deref()?;
+    let gpg = gpg?;
+    let state = gpg.key_state(keygrip).ok()?;
+    Some(match state.protection {
+        keyhold::gpg::KeyProtection::Passphrase => {
+            if state.cached {
+                "unlocked".to_string()
+            } else {
+                "locked".to_string()
+            }
+        }
+        keyhold::gpg::KeyProtection::Clear => "unlocked (unprotected)".into(),
+        keyhold::gpg::KeyProtection::Unknown => "unknown".into(),
+    })
+}
+
+/// The `Credential` row value for an active hold: whether keyhold could
+/// recover the key when GnuPG drops the cache. Unavailability of the
+/// Secret Service degrades to `unavailable` rather than failing status.
+fn credential_row(data: &StatusData) -> Option<String> {
+    if !data.hold_on {
+        return None;
+    }
+    let keygrip = data.keygrip.as_deref()?;
+    match data.credential_mode {
+        CredentialMode::NotNeeded => Some("not needed".into()),
+        CredentialMode::Session => {
+            match SessionCredentialStore.contains(keygrip) {
+                Ok(true) => Some("session stored".into()),
+                Ok(false) => Some("missing".into()),
+                Err(_) => Some("unavailable".into()),
+            }
+        }
+        CredentialMode::None => {
+            match SessionCredentialStore.contains(keygrip) {
+                Ok(true) => Some("session stored (not in use)".into()),
+                Ok(false) => Some("not stored".into()),
+                Err(_) => Some("unavailable".into()),
+            }
+        }
+    }
+}
+
+/// `keyhold credential clear`: delete keyhold's passphrases from the
+/// Secret Service session collection. The GPG cache, the daemon and any
+/// active hold are deliberately left untouched.
+fn credential_clear() -> Result<()> {
+    let removed = SessionCredentialStore.clear_all()?;
+    match removed {
+        0 => presentation::no_session_credentials(),
+        _ => presentation::session_credentials_cleared(),
+    }
+    // A stored-mode hold keeps running on its existing cache entry, but
+    // automatic recovery is gone once that entry disappears.
+    if let Ok(response) = ipc::request(&Request::Status)
+        && let Some(status) = response.status
+        && status.hold_on
+        && status.credential_mode == CredentialMode::Session
+    {
+        presentation::warning(
+            "an active hold still uses the existing GPG cache entry, but \
+             automatic recovery is no longer available once it expires; \
+             the next --store-passphrase activation will prompt again",
+        );
+    }
+    Ok(())
 }
 
 fn daemon_stop() -> Result<()> {
@@ -215,10 +343,9 @@ fn check(response: Response) -> Result<()> {
 }
 
 fn now_ms() -> u64 {
-    u64::try_from(
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_or(0, |d| d.as_millis()),
-    )
-    .unwrap_or(0)
+    epoch_ms(SystemTime::now()).unwrap_or(0)
+}
+
+fn epoch_ms(t: SystemTime) -> Option<u64> {
+    u64::try_from(t.duration_since(UNIX_EPOCH).ok()?.as_millis()).ok()
 }

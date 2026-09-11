@@ -133,9 +133,9 @@ fn no_color_beats_forced_color() {
 #[test]
 fn status_uses_aligned_two_column_layout() {
     const STOPPED: &str =
-        "Keyhold status\n\nDaemon     stopped\nHold       off\n";
+        "Keyhold status\n\nDaemon       stopped\nHold         off\n";
     const RUNNING_OFF: &str =
-        "Keyhold status\n\nDaemon     running\nHold       off\n";
+        "Keyhold status\n\nDaemon       running\nHold         off\n";
 
     // Stopped daemon: heading plus two rows, values in one column.
     let env = TestEnv::new();
@@ -146,18 +146,18 @@ fn status_uses_aligned_two_column_layout() {
     let text = env.status();
     assert!(text.starts_with("Keyhold status\n\n"), "{text}");
     let rows: Vec<&str> = text.lines().skip(2).collect();
-    assert_eq!(rows[0], "Daemon     running", "{text}");
-    assert_eq!(rows[1], "Hold       on", "{text}");
-    assert!(text.contains("Key        default"), "{text}");
-    assert!(text.contains("Interval   5m"), "{text}");
-    assert!(text.contains("Remaining  "), "{text}");
-    assert!(text.contains("Last ping  "), "{text}");
-    assert!(text.contains("Next ping  in "), "{text}");
+    assert_eq!(rows[0], "Daemon       running", "{text}");
+    assert_eq!(rows[1], "Hold         on", "{text}");
+    assert!(text.contains("Key          default"), "{text}");
+    assert!(text.contains("Interval     5m"), "{text}");
+    assert!(text.contains("Remaining    "), "{text}");
+    assert!(text.contains("Last ping    "), "{text}");
+    assert!(text.contains("Next ping    in "), "{text}");
     for row in &rows {
         assert!(
-            row.len() > 11
-                && !row[11..].is_empty()
-                && row[..11].ends_with("  "),
+            row.len() > 13
+                && !row[13..].is_empty()
+                && row[..13].ends_with("  "),
             "misaligned row: {row:?}"
         );
     }
@@ -182,12 +182,12 @@ fn status_styling_does_not_shift_alignment() {
     assert!(plain.starts_with("Keyhold status\n\n"), "{plain}");
     for row in plain.lines().skip(2) {
         assert!(
-            row.len() > 11
-                && !row[11..].is_empty()
-                && row[..11].ends_with("  "),
+            row.len() > 13
+                && !row[13..].is_empty()
+                && row[..13].ends_with("  "),
             "misaligned styled row: {row:?}"
         );
     }
-    assert!(plain.contains("Daemon     running"), "{plain}");
-    assert!(plain.contains("Hold       on"), "{plain}");
+    assert!(plain.contains("Daemon       running"), "{plain}");
+    assert!(plain.contains("Hold         on"), "{plain}");
 }

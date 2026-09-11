@@ -22,7 +22,7 @@ use std::{
     fs,
     io::{Read, Write},
     os::unix::{fs::PermissionsExt, net::UnixStream},
-    path::{Path, PathBuf},
+    path::PathBuf,
     process::{Command, Output},
     thread,
     time::{Duration, Instant},
@@ -43,9 +43,10 @@ pub const SUB2_GRIP: &str = "F097020B875D80D64C742456496ECA8F47CED17F";
 /// The passphrase the fake gpg accepts in loopback mode.
 pub const FAKE_PASSPHRASE: &str = "correct horse battery staple";
 
-/// Default fake agent TTLs (seconds): 10s idle, 30s hard max.
-pub const DEFAULT_TTL_SECS: u64 = 10;
-pub const MAX_TTL_SECS: u64 = 30;
+/// Default fake agent TTLs (seconds), mirroring GnuPG's compiled-in
+/// defaults: 10m idle, 2h hard max.
+pub const DEFAULT_TTL_SECS: u64 = 600;
+pub const MAX_TTL_SECS: u64 = 7200;
 
 pub struct TestEnv {
     pub runtime: TempDir,
@@ -259,6 +260,8 @@ impl TestEnv {
             .env("KEYHOLD_FAKE_LOCK", &self.lock)
             .env("KEYHOLD_FAKE_PASSPHRASE", &self.passphrase)
             .env("KEYHOLD_FAKE_KEYS", &self.keys_fixture)
+            .env("KEYHOLD_FAKE_TTLS", &self.ttls)
+            .env("KEYHOLD_FAKE_GPGCONF_FAIL", &self.gpgconf_fail)
             .env("KEYHOLD_FAKE_CA_LOG", &self.ca_log)
             .env("KEYHOLD_FAKE_KEY_CACHED", &self.key_cached)
             .env("KEYHOLD_FAKE_KEY_PROT", &self.key_prot)
@@ -479,4 +482,460 @@ pub fn wait_with_kill(child: &mut std::process::Child, timeout: Duration) {
         let _ = child.wait();
         panic!("daemon process did not exit within {timeout:?}");
     }
+}
+
+// ---------------------------------------------------------------------------
+// In-process daemon harness (for stored-mode flows, which need a fake
+// credential store injected into `daemon::run_with`).
+// ---------------------------------------------------------------------------
+
+use std::{path::Path, sync::Mutex};
+
+use keyhold::{
+    config::ShutdownPolicies,
+    credential::CredentialStore,
+    daemon,
+    gpg::{Gpg, SigningTarget},
+};
+use zeroize::Zeroizing;
+
+/// A stateful fake gpg toolchain with paths baked into the scripts (no
+/// environment mutation, so tests are parallel-safe). The fake agent's
+/// cache lifecycle is modelled by a `locked` marker: CLEAR_PASSPHRASE
+/// creates it, a successful loopback sign removes it, background
+/// (cancel-mode) signs fail while it exists, and KEYINFO reports it.
+pub struct DaemonTools {
+    pub gpg: Gpg,
+    _dir: TempDir,
+    pub root: PathBuf,
+    pub gpg_log: PathBuf,
+    pub ca_log: PathBuf,
+    pub sock: PathBuf,
+}
+
+impl DaemonTools {
+    pub fn new(runtime_root: &Path) -> Self {
+        let dir = TempDir::new().expect("scratch dir");
+        let root = dir.path().to_path_buf();
+        let gpg_path = root.join("fake-gpg");
+        let gpgconf_path = root.join("fake-gpgconf");
+        let ca_path = root.join("fake-connect-agent");
+        let gpg_log = root.join("gpg.log");
+        let ca_log = root.join("ca.log");
+
+        fs::write(
+            &gpg_path,
+            format!(
+                "#!/bin/sh\n\
+                 list=0; loopback=0; background=0\n\
+                 for a in \"$@\"; do\n\
+                   [ \"$a\" = --list-secret-keys ] && list=1\n\
+                   [ \"$a\" = --passphrase-fd ] && loopback=1\n\
+                   [ \"$a\" = cancel ] && background=1\n\
+                 done\n\
+                 echo \"$*\" >> {log}\n\
+                 if [ \"$list\" = 1 ]; then cat {root}/keys.txt; exit 0; fi\n\
+                 if [ -e {root}/fail-all ]; then exit 2; fi\n\
+                 if [ \"$background\" = 1 ]; then\n\
+                   if [ -e {root}/locked ] || [ -e {root}/fail-bg ]; then\n\
+                     echo '[GNUPG:] KEY_CONSIDERED {PRIMARY_FPR} 0'\n\
+                     echo 'gpg: signing failed: Operation cancelled' >&2\n\
+                     exit 2\n\
+                   fi\n\
+                 fi\n\
+                 if [ \"$loopback\" = 1 ]; then\n\
+                   if [ -e {root}/slow ]; then sleep 2; fi\n\
+                   IFS= read -r supplied\n\
+                   expected=$(cat {root}/passphrase)\n\
+                   if [ \"$supplied\" != \"$expected\" ]; then\n\
+                     echo 'gpg: signing failed: Bad passphrase' >&2\n\
+                     exit 2\n\
+                   fi\n\
+                   rm -f {root}/locked\n\
+                 fi\n\
+                 echo '[GNUPG:] KEY_CONSIDERED {PRIMARY_FPR} 0'\n\
+                 if [ \"$background\" != 1 ] && [ \"$loopback\" != 1 ] && \
+                    [ ! -e {root}/cached ]; then\n\
+                   echo '[GNUPG:] PINENTRY_LAUNCHED 2718 gnome3 1.3.2 x'\n\
+                   rm -f {root}/locked\n\
+                 fi\n\
+                 echo '[GNUPG:] SIG_CREATED D 22 10 00 1789136997 {SUB2_FPR}'\n\
+                 exit 0\n",
+                log = gpg_log.display(),
+                root = root.display(),
+            ),
+        )
+        .expect("write fake gpg");
+        fs::set_permissions(&gpg_path, fs::Permissions::from_mode(0o755))
+            .expect("chmod fake gpg");
+
+        fs::write(
+            &gpgconf_path,
+            format!(
+                "#!/bin/sh\n\
+                 read def max < {root}/ttls\n\
+                 printf '%s\\n' \
+                 \"default-cache-ttl:24:0:expire cached PINs after N seconds:3:3:N:$def::\" \
+                 \"max-cache-ttl:24:2:set maximum PIN cache lifetime to N seconds:3:3:N:$max::\"\n",
+                root = root.display(),
+            ),
+        )
+        .expect("write fake gpgconf");
+        fs::set_permissions(&gpgconf_path, fs::Permissions::from_mode(0o755))
+            .expect("chmod fake gpgconf");
+
+        fs::write(
+            &ca_path,
+            format!(
+                "#!/bin/sh\n\
+                 echo \"$*\" >> {ca_log}\n\
+                 cmd=$1\n\
+                 case \"$cmd\" in\n\
+                   'CLEAR_PASSPHRASE '*)\n\
+                     touch {root}/locked\n\
+                     echo OK; exit 0;;\n\
+                   KEYINFO\\ *)\n\
+                     grip=$(echo \"$cmd\" | cut -d' ' -f2)\n\
+                     case \"$grip\" in\n\
+                       0000000000000000000000000000000000000000)\n\
+                         echo 'ERR 67108891 Not found <GPG Agent>'; exit 0;;\n\
+                     esac\n\
+                     prot=P\n\
+                     [ -f {root}/prot ] && prot=$(cat {root}/prot)\n\
+                     cached=-\n\
+                     [ ! -e {root}/locked ] && cached=1\n\
+                     echo \"S KEYINFO $grip D - - $cached $prot - - -\"\n\
+                     echo OK\n\
+                     exit 0;;\n\
+                 esac\n\
+                 echo OK\n",
+                ca_log = ca_log.display(),
+                root = root.display(),
+            ),
+        )
+        .expect("write fake connect-agent");
+        fs::set_permissions(&ca_path, fs::Permissions::from_mode(0o755))
+            .expect("chmod fake connect-agent");
+
+        let runtime = runtime_root.to_path_buf();
+        let sock = runtime.join("keyhold").join("keyhold.sock");
+        let tools = Self {
+            gpg: Gpg::with_tools(gpg_path, Some(gpgconf_path), Some(ca_path)),
+            _dir: dir,
+            gpg_log,
+            ca_log,
+            root,
+            sock,
+        };
+        tools.set_keys(&daemon_keys());
+        tools.set_ttls(600, 7200);
+        tools.set_passphrase(FAKE_PASSPHRASE);
+        tools
+    }
+
+    pub fn set_keys(&self, fixture: &str) {
+        fs::write(self.root.join("keys.txt"), fixture).unwrap();
+    }
+
+    pub fn set_ttls(&self, default_secs: u64, max_secs: u64) {
+        fs::write(
+            self.root.join("ttls"),
+            format!("{default_secs} {max_secs}\n"),
+        )
+        .unwrap();
+    }
+
+    pub fn set_passphrase(&self, value: &str) {
+        fs::write(self.root.join("passphrase"), value).unwrap();
+    }
+
+    /// The fake agent's KEYINFO protection field (`P`, `C`, `-`).
+    pub fn set_key_protection(&self, protection: &str) {
+        fs::write(self.root.join("prot"), protection).unwrap();
+    }
+
+    pub fn marker(&self, name: &str) {
+        fs::write(self.root.join(name), b"1").unwrap();
+    }
+
+    pub fn unmark(&self, name: &str) {
+        let _ = fs::remove_file(self.root.join(name));
+    }
+
+    pub fn has(&self, name: &str) -> bool {
+        self.root.join(name).exists()
+    }
+
+    /// Simulate an external program dropping the cache entry.
+    pub fn drop_cache(&self) {
+        self.marker("locked");
+    }
+
+    pub fn gpg_log(&self) -> String {
+        fs::read_to_string(&self.gpg_log).unwrap_or_default()
+    }
+
+    pub fn ca_log(&self) -> String {
+        fs::read_to_string(&self.ca_log).unwrap_or_default()
+    }
+
+    /// Number of CLEAR_PASSPHRASE operations logged so far.
+    pub fn clears(&self) -> usize {
+        self.ca_log()
+            .lines()
+            .filter(|l| l.starts_with("CLEAR_PASSPHRASE"))
+            .count()
+    }
+
+    /// Number of loopback (passphrase-fed) signing invocations.
+    pub fn loopbacks(&self) -> usize {
+        self.gpg_log()
+            .lines()
+            .filter(|l| l.contains("--passphrase-fd"))
+            .count()
+    }
+}
+
+/// The default in-process key hierarchy: primary + two signing subkeys.
+fn daemon_keys() -> String {
+    format!(
+        "sec:u:255:22:{PRIMARY_ID}:1789136976:::u:::scSC:::+::ed25519:::0:\n\
+         fpr:::::::::{PRIMARY_FPR}:\n\
+         grp:::::::::{PRIMARY_GRIP}:\n\
+         uid:u::::1789136976::78F8::keyhold-test::::::::::0:\n\
+         ssb:u:255:22:212181504E7D2CD7:1789136986::::::s:::+::ed25519::\n\
+         fpr:::::::::{SUB_FPR}:\n\
+         grp:::::::::{SUB_GRIP}:\n\
+         ssb:u:255:22:F3C83A12ADCE45A1:1789137207::::::s:::+::ed25519::\n\
+         fpr:::::::::{SUB2_FPR}:\n\
+         grp:::::::::{SUB2_GRIP}:\n"
+    )
+}
+
+/// A thread-safe in-memory credential store with an operation log and
+/// failure injection.
+#[derive(Default)]
+pub struct FakeStore {
+    state: Mutex<FakeState>,
+}
+
+#[derive(Default)]
+struct FakeState {
+    items: std::collections::HashMap<String, Vec<u8>>,
+    fail_load: bool,
+    fail_store: bool,
+    ops: Vec<String>,
+}
+
+impl FakeStore {
+    fn state(&self) -> std::sync::MutexGuard<'_, FakeState> {
+        // Matching the daemon's locking style: a poisoned lock is
+        // recovered from, never panicked on.
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Preload a credential for `keygrip`.
+    pub fn preload(&self, keygrip: &str, secret: &[u8]) {
+        self.state()
+            .items
+            .insert(keygrip.to_string(), secret.to_vec());
+    }
+
+    pub fn make_loads_fail(&self) {
+        self.state().fail_load = true;
+    }
+
+    pub fn make_stores_fail(&self) {
+        self.state().fail_store = true;
+    }
+
+    /// Remove a stored credential, as `keyhold credential clear` would.
+    pub fn remove(&self, keygrip: &str) {
+        self.state().items.remove(keygrip);
+    }
+
+    pub fn contains_key(&self, keygrip: &str) -> bool {
+        self.state().items.contains_key(keygrip)
+    }
+
+    pub fn operations(&self) -> Vec<String> {
+        self.state().ops.clone()
+    }
+}
+
+impl CredentialStore for FakeStore {
+    fn load(
+        &self,
+        keygrip: &str,
+    ) -> keyhold::error::Result<Option<Zeroizing<Vec<u8>>>> {
+        let mut state = self.state();
+        state.ops.push(format!("load:{keygrip}"));
+        if state.fail_load {
+            return Err(keyhold::error::Error::SecretService(
+                "injected load failure".into(),
+            ));
+        }
+        Ok(state
+            .items
+            .get(keygrip)
+            .map(|secret| Zeroizing::new(secret.clone())))
+    }
+
+    fn contains(&self, keygrip: &str) -> keyhold::error::Result<bool> {
+        let mut state = self.state();
+        state.ops.push(format!("contains:{keygrip}"));
+        Ok(state.items.contains_key(keygrip))
+    }
+
+    fn store(
+        &self,
+        target: &SigningTarget,
+        secret: &[u8],
+    ) -> keyhold::error::Result<()> {
+        let mut state = self.state();
+        state.ops.push(format!(
+            "store:{}",
+            target.keygrip.as_deref().unwrap_or("?")
+        ));
+        if state.fail_store {
+            return Err(keyhold::error::Error::SecretService(
+                "injected store failure".into(),
+            ));
+        }
+        let grip = target.keygrip.clone().unwrap_or_default();
+        state.items.insert(grip, secret.to_vec());
+        Ok(())
+    }
+
+    fn delete(&self, keygrip: &str) -> keyhold::error::Result<bool> {
+        let mut state = self.state();
+        state.ops.push(format!("delete:{keygrip}"));
+        Ok(state.items.remove(keygrip).is_some())
+    }
+
+    fn clear_all(&self) -> keyhold::error::Result<usize> {
+        let mut state = self.state();
+        state.ops.push("clear_all".into());
+        let count = state.items.len();
+        state.items.clear();
+        Ok(count)
+    }
+}
+
+/// Spawn an in-process daemon against the given tools and store; the
+/// runtime directory is a fresh tempdir per call. Returns once the
+/// socket answers.
+pub fn spawn_daemon(
+    gpg: Gpg,
+    store: std::sync::Arc<FakeStore>,
+    policies: ShutdownPolicies,
+) -> (TempDir, PathBuf) {
+    let runtime = TempDir::new().expect("runtime dir");
+    let sock = runtime.path().join("keyhold").join("keyhold.sock");
+    let paths = daemon::Paths {
+        dir: runtime.path().join("keyhold"),
+        sock: sock.clone(),
+    };
+    let join = {
+        let paths = paths.clone();
+        thread::Builder::new()
+            .name("test-daemon".into())
+            .spawn(move || {
+                let _ = daemon::run_with(&paths, gpg, store, policies);
+            })
+            .expect("spawn daemon thread")
+    };
+    std::mem::forget(join); // detached; the socket outlives the test
+    assert!(
+        wait_until(Duration::from_secs(5), || {
+            UnixStream::connect(&sock).is_ok()
+        }),
+        "in-process daemon never answered on {sock:?}"
+    );
+    (runtime, sock)
+}
+
+/// Raw IPC against an explicit socket path.
+pub fn ipc_at(sock: &Path, request: &str) -> Option<serde_json::Value> {
+    let mut stream = UnixStream::connect(sock).ok()?;
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+    stream.write_all(request.as_bytes()).ok()?;
+    stream.write_all(b"\n").ok()?;
+    let mut response = String::new();
+    stream.read_to_string(&mut response).ok()?;
+    serde_json::from_str(response.trim()).ok()
+}
+
+pub fn status_at(sock: &Path) -> Option<serde_json::Value> {
+    ipc_at(sock, "{\"cmd\":\"status\"}").and_then(|v| v.get("status").cloned())
+}
+
+/// Run the stored-mode activation flow in-process and feed its result to
+/// the daemon as a normal `on` request would.
+pub fn stored_activation(
+    gpg: &Gpg,
+    store: &FakeStore,
+    key: Option<&str>,
+    interval_ms: u64,
+    hold_ms: Option<u64>,
+) -> keyhold::error::Result<keyhold::activation::Prepared> {
+    keyhold::activation::activate(
+        gpg,
+        true,
+        key,
+        keyhold::state::KeySource::Default,
+        Duration::from_millis(interval_ms),
+        hold_ms.map(Duration::from_millis),
+        store,
+        &|| Err(keyhold::error::Error::Message("unexpected prompt".into())),
+    )
+}
+
+/// An `on` request carrying the prepared activation metadata.
+pub fn on_request(
+    key: Option<&str>,
+    prepared: &keyhold::activation::Prepared,
+    interval_ms: u64,
+    hold_ms: Option<u64>,
+) -> String {
+    let cache = prepared.cache.expect("stored activation has a plan");
+    let started = cache
+        .started_wall
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_millis() as u64);
+    format!(
+        "{{\"cmd\":\"on\",\"key\":{key},\"key_source\":\"default\",\
+         \"interval_ms\":{interval_ms},\"hold_ms\":{hold},\
+         \"activated_at_ms\":{activated},\
+         \"fingerprint\":\"{fpr}\",\"keygrip\":\"{grip}\",\
+         \"credential_mode\":\"session\",\
+         \"default_cache_ttl_ms\":{def_ttl},\"max_cache_ttl_ms\":{max_ttl},\
+         \"cache_started_at_ms\":{started}}}",
+        key = match key {
+            Some(k) => format!("\"{k}\""),
+            None => "null".to_string(),
+        },
+        hold = match hold_ms {
+            Some(ms) => ms.to_string(),
+            None => "null".to_string(),
+        },
+        activated = 1_700_000_000_000_u64,
+        fpr = prepared
+            .target
+            .as_ref()
+            .map(|t| t.fingerprint.clone())
+            .unwrap_or_default(),
+        grip = prepared
+            .target
+            .as_ref()
+            .and_then(|t| t.keygrip.clone())
+            .unwrap_or_default(),
+        def_ttl = cache.default_ttl.as_millis() as u64,
+        max_ttl = cache.max_ttl.as_millis() as u64,
+        started = started
+            .map(|ms| ms.to_string())
+            .unwrap_or_else(|| "null".into()),
+    )
 }

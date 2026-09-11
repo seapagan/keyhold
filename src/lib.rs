@@ -21,7 +21,7 @@
 //! keyhold can recreate the selected key's cache entry before GnuPG's
 //! absolute `max-cache-ttl` expires; see [`credential`] for that mode's
 //! contract.
-
+pub mod activation;
 pub mod cli;
 pub mod config;
 pub mod credential;

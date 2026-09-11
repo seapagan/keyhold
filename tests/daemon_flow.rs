@@ -22,7 +22,7 @@ fn status_reports_stopped_when_no_daemon() {
     let text = env.status();
     assert_eq!(
         text,
-        "Keyhold status\n\nDaemon     stopped\nHold       off\n"
+        "Keyhold status\n\nDaemon       stopped\nHold         off\n"
     );
 }
 
@@ -30,21 +30,26 @@ fn status_reports_stopped_when_no_daemon() {
 fn on_enables_hold_after_foreground_ping() {
     let env = TestEnv::new();
     let out = env.succeed(&["on"]);
+    // An indefinite ordinary hold truthfully warns about the hard
+    // maximum; a finite hold under it stays silent.
     assert_eq!(
         String::from_utf8_lossy(&out.stdout),
-        "Keyhold enabled (no expiry).\n"
+        "warning: GnuPG's hard max-cache-ttl (2h) will eventually end an \
+         ordinary hold unless the cache entry is recreated externally\n\
+         Keyhold enabled (no expiry).\n"
+            .replace("\\ ", "\\ ")
     );
 
     let text = env.status();
     for needle in [
-        "Daemon     running",
-        "Hold       on",
-        "Key        default",
-        "Interval   5m",
+        "Daemon       running",
+        "Hold         on",
+        "Key          default",
+        "Interval     5m",
     ] {
         assert!(text.contains(needle), "status missing {needle:?}:\n{text}");
     }
-    assert!(text.contains("Remaining  no deadline"), "{text}");
+    assert!(text.contains("Remaining    no deadline"), "{text}");
 
     // The foreground ping must be a real signing invocation without the
     // background `cancel` pinentry mode.
@@ -61,9 +66,9 @@ fn on_with_key_and_duration_reports_details() {
     let env = TestEnv::new();
     env.succeed(&["on", "--key", "DEADBEEF", "--for", "2h"]);
     let text = env.status();
-    assert!(text.contains("Key        DEADBEEF"), "{text}");
-    assert!(text.contains("Remaining  2h"), "{text}");
-    assert!(text.contains("Interval   5m"), "{text}");
+    assert!(text.contains("Key          DEADBEEF"), "{text}");
+    assert!(text.contains("Remaining    2h"), "{text}");
+    assert!(text.contains("Interval     5m"), "{text}");
 
     let log = env.gpg_log();
     assert!(log.contains("--local-user DEADBEEF"), "{log}");
@@ -75,12 +80,12 @@ fn repeated_on_replaces_the_hold() {
     env.succeed(&["on", "--for", "1h"]);
     env.succeed(&["on", "--for", "3h"]);
     // A fresh hold rounds to the nearest minute, so it still reads `3h`.
-    assert!(env.status().contains("Remaining  3h"));
+    assert!(env.status().contains("Remaining    3h"));
 
     env.succeed(&["on", "--key", "XYZ"]);
     let text = env.status();
-    assert!(text.contains("Remaining  no deadline"), "{text}");
-    assert!(text.contains("Key        XYZ"), "{text}");
+    assert!(text.contains("Remaining    no deadline"), "{text}");
+    assert!(text.contains("Key          XYZ"), "{text}");
 }
 
 #[test]
@@ -93,8 +98,8 @@ fn off_disables_and_is_idempotent() {
     assert_eq!(env.stdout(&["off"]), "Keyhold disabled.\n");
 
     let text = env.status();
-    assert!(text.contains("Daemon     running"), "{text}");
-    assert!(text.contains("Hold       off"), "{text}");
+    assert!(text.contains("Daemon       running"), "{text}");
+    assert!(text.contains("Hold         off"), "{text}");
 
     assert_eq!(env.stdout(&["off"]), "Keyhold disabled.\n");
 }
@@ -103,15 +108,15 @@ fn off_disables_and_is_idempotent() {
 fn timed_hold_expires_by_itself() {
     let env = TestEnv::new();
     env.succeed(&["on", "--for", "1s", "--interval", "200ms"]);
-    assert!(env.status().contains("Hold       on"));
+    assert!(env.status().contains("Hold         on"));
     assert!(
-        wait_for_status(&env, "Hold       off", 5 * SECS),
+        wait_for_status(&env, "Hold         off", 5 * SECS),
         "hold did not expire: {}",
         env.status()
     );
     let text = env.status();
-    assert!(text.contains("Daemon     running"), "{text}");
-    assert!(!text.contains("Error      "), "{text}");
+    assert!(text.contains("Daemon       running"), "{text}");
+    assert!(!text.contains("Error        "), "{text}");
 }
 
 #[test]
@@ -155,27 +160,27 @@ fn relative_gpg_override_survives_daemon_detachment() {
         "daemon did not ping via relative override, log: {}",
         env.gpg_log()
     );
-    assert!(env.status().contains("Hold       on"));
+    assert!(env.status().contains("Hold         on"));
 }
 
 #[test]
 fn background_ping_failure_stops_hold_and_reports_error() {
     let env = TestEnv::new();
     env.succeed(&["on", "--interval", "200ms", "--for", "1h"]);
-    assert!(env.status().contains("Hold       on"));
+    assert!(env.status().contains("Hold         on"));
 
     // Simulate the GPG cache disappearing: background pings now fail.
     env.fail_background_pings();
 
     assert!(
-        wait_for_status(&env, "Hold       off", 5 * SECS),
+        wait_for_status(&env, "Hold         off", 5 * SECS),
         "hold did not stop: {}",
         env.status()
     );
     let text = env.status();
-    assert!(text.contains("Error      "), "{text}");
+    assert!(text.contains("Error        "), "{text}");
     assert!(text.contains("cancelled"), "{text}");
-    assert!(text.contains("Daemon     running"), "{text}");
+    assert!(text.contains("Daemon       running"), "{text}");
 }
 
 #[test]
@@ -189,7 +194,7 @@ fn failed_foreground_unlock_leaves_hold_off() {
     assert!(stderr.contains("NOT enabled"), "{stderr}");
 
     let text = env.status();
-    assert!(text.contains("Hold       off"), "{text}");
+    assert!(text.contains("Hold         off"), "{text}");
     // The failed activation enabled nothing and recorded no successful use.
     let status = common::status_of(&env).expect("status via IPC");
     assert_eq!(status["hold_on"], false);
@@ -213,7 +218,7 @@ fn activation_is_reported_as_the_last_ping() {
     assert!(last >= before, "stale or missing activation: {status}");
 
     let text = env.status();
-    assert!(text.contains("Last ping  "), "{text}");
+    assert!(text.contains("Last ping    "), "{text}");
 
     // The activation is not itself a background ping: the first keepalive
     // stays one full interval after activation.
@@ -225,7 +230,7 @@ fn replacing_a_hold_records_a_fresh_activation() {
     let env = TestEnv::new();
     // Start a hold whose last background ping is now in the past.
     env.succeed(&["on", "--interval", "100ms", "--for", "1s"]);
-    assert!(wait_for_status(&env, "Hold       off", 5 * SECS));
+    assert!(wait_for_status(&env, "Hold         off", 5 * SECS));
 
     let replaced_at = now_ms();
     env.succeed(&["on"]);
@@ -265,9 +270,9 @@ fn in_flight_ping_cannot_mutate_a_disabled_hold() {
         env.gpg_log()
     );
     let text = env.status();
-    assert!(text.contains("Hold       off"), "{text}");
-    assert!(!text.contains("Error      "), "{text}");
-    assert!(text.contains("Daemon     running"), "{text}");
+    assert!(text.contains("Hold         off"), "{text}");
+    assert!(!text.contains("Error        "), "{text}");
+    assert!(text.contains("Daemon       running"), "{text}");
 }
 
 #[test]
@@ -295,10 +300,10 @@ fn in_flight_ping_cannot_mutate_a_replaced_hold() {
         env.gpg_log()
     );
     let text = env.status();
-    assert!(text.contains("Hold       on"), "{text}");
-    assert!(text.contains("Key        NEWKEY"), "{text}");
-    assert!(!text.contains("Error      "), "{text}");
-    assert!(text.contains("Daemon     running"), "{text}");
+    assert!(text.contains("Hold         on"), "{text}");
+    assert!(text.contains("Key          NEWKEY"), "{text}");
+    assert!(!text.contains("Error        "), "{text}");
+    assert!(text.contains("Daemon       running"), "{text}");
 
     // The replacement's activation remains the latest successful use.
     let status = common::status_of(&env).expect("status via IPC");
@@ -333,10 +338,10 @@ fn extreme_timing_values_cannot_kill_the_daemon() {
     assert_eq!(status["interval_ms"].as_u64(), Some(u64::MAX));
     // The u64::MAX-ms ping is schedulable but its wall-clock projection
     // overflows epoch milliseconds: the field is absent, never zero
-    // (which the CLI would render as "Next ping  in 0s").
+    // (which the CLI would render as "Next ping    in 0s").
     assert!(status["next_ping_ms"].is_null(), "{status}");
     let text = env.status();
-    assert!(text.contains("Hold       on"), "{text}");
+    assert!(text.contains("Hold         on"), "{text}");
     assert!(!text.contains("Next ping"), "{text}");
     // ...including the widest hold deadline; remaining stays near u64::MAX.
     let request = format!(
@@ -356,7 +361,7 @@ fn extreme_timing_values_cannot_kill_the_daemon() {
     );
     // Ordinary intervals keep their next-ping display.
     let text = env.status();
-    assert!(text.contains("Next ping  in "), "{text}");
+    assert!(text.contains("Next ping    in "), "{text}");
     assert!(!text.contains("in 0s"), "{text}");
 
     // A zero interval stays a plain protocol error, not a crash.
@@ -376,7 +381,7 @@ fn extreme_timing_values_cannot_kill_the_daemon() {
 
     // The daemon is unharmed and fully operational afterwards.
     env.succeed(&["off"]);
-    assert!(env.status().contains("Daemon     running"));
+    assert!(env.status().contains("Daemon       running"));
 }
 
 #[test]
@@ -404,7 +409,7 @@ fn huge_activation_timestamp_does_not_disturb_the_daemon() {
     );
 
     env.succeed(&["off"]);
-    assert!(env.status().contains("Daemon     running"));
+    assert!(env.status().contains("Daemon       running"));
 }
 
 #[test]
@@ -422,7 +427,7 @@ fn unrepresentable_cli_durations_are_rejected_before_side_effects() {
     // Rejected before any side effect: no daemon was started, no GPG call.
     assert_eq!(
         env.status(),
-        "Keyhold status\n\nDaemon     stopped\nHold       off\n"
+        "Keyhold status\n\nDaemon       stopped\nHold         off\n"
     );
     assert_eq!(env.gpg_log(), "");
 }
@@ -458,9 +463,9 @@ fn status_drops_millisecond_precision() {
     // Sub-second remainder exists internally but never reaches the
     // display: remaining and ping times render at whole-second (or
     // coarser) precision.
-    assert!(text.contains("Remaining  "), "{text}");
-    assert!(text.contains("Next ping  in "), "{text}");
-    assert!(text.contains("Last ping  "), "{text}");
+    assert!(text.contains("Remaining    "), "{text}");
+    assert!(text.contains("Next ping    in "), "{text}");
+    assert!(text.contains("Last ping    "), "{text}");
     assert!(!text.contains("ms"), "{text}");
 }
 
@@ -471,7 +476,7 @@ fn stale_socket_file_is_recovered() {
     fs::write(env.sock(), b"junk from a dead daemon").unwrap();
 
     env.succeed(&["on"]);
-    assert!(env.status().contains("Daemon     running"));
+    assert!(env.status().contains("Daemon       running"));
 }
 
 #[test]
@@ -485,7 +490,7 @@ fn second_foreground_daemon_is_rejected() {
         .spawn()
         .unwrap();
     assert!(
-        wait_for_status(&env, "Daemon     running", 5 * SECS),
+        wait_for_status(&env, "Daemon       running", 5 * SECS),
         "first daemon did not start"
     );
 
@@ -498,7 +503,7 @@ fn second_foreground_daemon_is_rejected() {
 
     env.succeed(&["daemon", "--stop"]);
     wait_with_kill(&mut first, 5 * SECS);
-    assert!(env.status().contains("Daemon     stopped"));
+    assert!(env.status().contains("Daemon       stopped"));
 }
 
 #[test]
@@ -509,14 +514,14 @@ fn daemon_stop_removes_socket_and_auto_restart_works() {
     assert!(common::wait_until(5 * SECS, || !env.sock().exists()));
     assert_eq!(
         env.status(),
-        "Keyhold status\n\nDaemon     stopped\nHold       off\n"
+        "Keyhold status\n\nDaemon       stopped\nHold         off\n"
     );
 
     // A subsequent `on` transparently starts a fresh daemon (hold was off).
     env.succeed(&["on"]);
     let text = env.status();
-    assert!(text.contains("Daemon     running"), "{text}");
-    assert!(text.contains("Hold       on"), "{text}");
+    assert!(text.contains("Daemon       running"), "{text}");
+    assert!(text.contains("Hold         on"), "{text}");
 }
 
 #[test]
@@ -531,8 +536,8 @@ fn daemon_background_starts_detached_and_returns() {
     assert_eq!(env.stdout(&["daemon", "-b"]), "Daemon started.\n");
 
     let text = env.status();
-    assert!(text.contains("Daemon     running"), "{text}");
-    assert!(text.contains("Hold       off"), "{text}");
+    assert!(text.contains("Daemon       running"), "{text}");
+    assert!(text.contains("Hold         off"), "{text}");
     // Starting the daemon alone must never invoke GPG (or pinentry).
     assert_eq!(env.gpg_log(), "");
 }
@@ -543,8 +548,8 @@ fn daemon_long_background_flag_matches_short() {
     assert_eq!(env.stdout(&["daemon", "--background"]), "Daemon started.\n");
 
     let text = env.status();
-    assert!(text.contains("Daemon     running"), "{text}");
-    assert!(text.contains("Hold       off"), "{text}");
+    assert!(text.contains("Daemon       running"), "{text}");
+    assert!(text.contains("Hold         off"), "{text}");
     assert_eq!(env.gpg_log(), "");
 }
 
@@ -562,7 +567,7 @@ fn background_daemon_can_be_stopped_normally() {
     assert_eq!(env.stdout(&["daemon", "--stop"]), "Daemon stopped.\n");
     assert_eq!(
         env.status(),
-        "Keyhold status\n\nDaemon     stopped\nHold       off\n"
+        "Keyhold status\n\nDaemon       stopped\nHold         off\n"
     );
 }
 
@@ -571,7 +576,7 @@ fn daemon_without_flags_stays_in_the_foreground() {
     let env = TestEnv::new();
     let mut child = spawn_daemon(&env);
     assert!(
-        wait_for_status(&env, "Daemon     running", 5 * SECS),
+        wait_for_status(&env, "Daemon       running", 5 * SECS),
         "foreground daemon did not start: {}",
         env.status()
     );
@@ -611,8 +616,8 @@ fn malformed_request_does_not_kill_daemon() {
     drop(stream);
 
     let text = env.status();
-    assert!(text.contains("Daemon     running"), "{text}");
-    assert!(text.contains("Hold       on"), "{text}");
+    assert!(text.contains("Daemon       running"), "{text}");
+    assert!(text.contains("Hold         on"), "{text}");
 }
 
 /// Spawn a foreground daemon with all streams silenced.
@@ -639,7 +644,7 @@ fn sigterm_shuts_the_daemon_down_cleanly() {
     let env = TestEnv::new();
     let mut daemon = spawn_daemon(&env);
     assert!(
-        wait_for_status(&env, "Daemon     running", 5 * SECS),
+        wait_for_status(&env, "Daemon       running", 5 * SECS),
         "daemon did not start: {}",
         env.status()
     );
@@ -657,7 +662,7 @@ fn sigterm_shuts_the_daemon_down_cleanly() {
     );
     assert_eq!(
         env.status(),
-        "Keyhold status\n\nDaemon     stopped\nHold       off\n"
+        "Keyhold status\n\nDaemon       stopped\nHold         off\n"
     );
 }
 
@@ -666,7 +671,7 @@ fn sigint_routes_through_the_same_clean_shutdown() {
     let env = TestEnv::new();
     let mut daemon = spawn_daemon(&env);
     assert!(
-        wait_for_status(&env, "Daemon     running", 5 * SECS),
+        wait_for_status(&env, "Daemon       running", 5 * SECS),
         "daemon did not start: {}",
         env.status()
     );
@@ -686,7 +691,7 @@ fn sigterm_with_active_hold_exits_promptly_and_restarts_cleanly() {
     let env = TestEnv::new();
     let mut daemon = spawn_daemon(&env);
     assert!(
-        wait_for_status(&env, "Daemon     running", 5 * SECS),
+        wait_for_status(&env, "Daemon       running", 5 * SECS),
         "daemon did not start: {}",
         env.status()
     );
@@ -712,7 +717,7 @@ fn sigterm_with_active_hold_exits_promptly_and_restarts_cleanly() {
     // The next daemon starts normally — no stale-socket recovery needed.
     let mut second = spawn_daemon(&env);
     assert!(
-        wait_for_status(&env, "Daemon     running", 5 * SECS),
+        wait_for_status(&env, "Daemon       running", 5 * SECS),
         "second daemon did not start: {}",
         env.status()
     );
@@ -748,7 +753,7 @@ fn daemon_stop_is_always_acknowledged() {
             .spawn()
             .unwrap();
         assert!(
-            wait_for_status(&env, "Daemon     running", 5 * SECS),
+            wait_for_status(&env, "Daemon       running", 5 * SECS),
             "daemon did not start: {}",
             env.status()
         );
@@ -782,7 +787,7 @@ fn shutdown_for_a_vanished_client_still_terminates_cleanly() {
         .spawn()
         .unwrap();
     assert!(
-        wait_for_status(&env, "Daemon     running", 5 * SECS),
+        wait_for_status(&env, "Daemon       running", 5 * SECS),
         "daemon did not start: {}",
         env.status()
     );
@@ -803,7 +808,7 @@ fn shutdown_for_a_vanished_client_still_terminates_cleanly() {
     );
     assert_eq!(
         env.status(),
-        "Keyhold status\n\nDaemon     stopped\nHold       off\n"
+        "Keyhold status\n\nDaemon       stopped\nHold         off\n"
     );
 }
 
@@ -855,7 +860,7 @@ fn invalid_config_is_reported() {
     // `status` does not need configuration and keeps working.
     assert_eq!(
         env.status(),
-        "Keyhold status\n\nDaemon     stopped\nHold       off\n"
+        "Keyhold status\n\nDaemon       stopped\nHold         off\n"
     );
 }
 
@@ -871,14 +876,14 @@ fn config_file_supplies_defaults_and_cli_wins() {
 
     env.succeed(&["on", "--for", "1h"]);
     let text = env.status();
-    assert!(text.contains("Key        CAFEF00D"), "{text}");
-    assert!(text.contains("Interval   9m"), "{text}");
+    assert!(text.contains("Key          CAFEF00D"), "{text}");
+    assert!(text.contains("Interval     9m"), "{text}");
 
     env.succeed(&["off"]);
     env.succeed(&["on", "--key", "0xBEEF", "--interval", "3m"]);
     let text = env.status();
-    assert!(text.contains("Key        0xBEEF"), "{text}");
-    assert!(text.contains("Interval   3m"), "{text}");
+    assert!(text.contains("Key          0xBEEF"), "{text}");
+    assert!(text.contains("Interval     3m"), "{text}");
 }
 
 #[test]
@@ -892,5 +897,356 @@ fn on_message_matches_requested_duration() {
     assert_eq!(
         env.stdout(&["on", "--for", "1h30m"]),
         "Keyhold enabled for 1h 30m.\n"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Ordinary-mode truthfulness warnings and live status (rich fake gpg)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn ordinary_mode_warns_when_the_hold_exceeds_max_cache_ttl() {
+    let env = TestEnv::new();
+    env.rich_gpg();
+    env.set_cache_ttls(10, 30);
+    // Fake TTLs: 10s default / 30s max.
+    let out = env.succeed(&["on", "--for", "2h"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("warning: GnuPG's max-cache-ttl is 30s"),
+        "missing max-ttl warning:\n{stdout}"
+    );
+    assert!(stdout.contains("cannot be guaranteed for 2h"), "{stdout}");
+    assert!(
+        stdout.contains("--store-passphrase"),
+        "warning does not mention the opt-in:\n{stdout}"
+    );
+    // A warning, not a failure.
+    assert!(stdout.contains("Keyhold enabled for 2h."));
+}
+
+#[test]
+fn ordinary_mode_warns_about_a_preexisting_cache_entry() {
+    let env = TestEnv::new();
+    env.rich_gpg();
+    env.set_cache_ttls(10, 30);
+    env.cached_key();
+    let out = env.succeed(&["on", "--for", "10s"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("already cached before this activation"),
+        "missing already-cached warning:\n{stdout}"
+    );
+    // A short hold under the 30s max needs no max-ttl warning.
+    assert!(!stdout.contains("max-cache-ttl is 30s"), "{stdout}");
+}
+
+#[test]
+fn ordinary_indefinite_hold_warns_about_the_hard_maximum() {
+    let env = TestEnv::new();
+    env.rich_gpg();
+    env.set_cache_ttls(10, 30);
+    let out = env.succeed(&["on"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("will eventually end an ordinary hold"),
+        "{stdout}"
+    );
+}
+
+#[test]
+fn ordinary_mode_warns_when_interval_meets_default_ttl() {
+    let env = TestEnv::new();
+    env.rich_gpg();
+    env.set_cache_ttls(10, 30);
+    let out = env.succeed(&["on", "--interval", "10s"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("not shorter than GnuPG's default-cache-ttl (10s)"),
+        "{stdout}"
+    );
+}
+
+#[test]
+fn fresh_unlock_suppresses_the_already_cached_warning() {
+    let env = TestEnv::new();
+    env.rich_gpg();
+    env.set_cache_ttls(10, 30);
+    let out = env.succeed(&["on", "--for", "10s"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !stdout.contains("already cached"),
+        "warned despite a fresh unlock:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("max-cache-ttl"),
+        "warned for a hold under the maximum:\n{stdout}"
+    );
+}
+
+#[test]
+fn missing_ttl_tooling_degrades_to_a_silent_ordinary_hold() {
+    let env = TestEnv::new();
+    env.rich_gpg();
+    let mut cmd = env.keyhold(&["on", "--for", "10s"]);
+    // No gpgconf anywhere: neither the override nor PATH provides it.
+    cmd.env_remove("KEYHOLD_GPGCONF")
+        .env_remove("KEYHOLD_GPG_CONNECT_AGENT")
+        .env("PATH", "/nonexistent");
+    let out = cmd.output().unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(!stdout.contains("warning"), "{stdout}");
+    // TTL rows are absent from status rather than guessed.
+    let text = env.status();
+    assert!(!text.contains("GPG max TTL"), "{text}");
+    assert!(!text.contains("Max expiry"), "{text}");
+}
+
+#[test]
+fn status_reports_live_key_and_credential_rows() {
+    let env = TestEnv::new();
+    env.rich_gpg();
+    env.set_cache_ttls(10, 30);
+    env.set_key_cached(true);
+    env.succeed(&["on", "--for", "10s", "--interval", "100ms"]);
+    let text = env.status();
+    for needle in [
+        "Key state    unlocked",
+        // The test environment deliberately has no Secret Service, so
+        // the truthful live value is "unavailable" (not "not stored").
+        "Credential   unavailable",
+        "GPG max TTL  30s",
+        // A fresh foreground unlock established the epoch, so a
+        // truthful countdown is shown (a pre-existing entry would read
+        // "unknown"; see the already-cached warning test).
+        "Max expiry   in 30s",
+    ] {
+        assert!(text.contains(needle), "missing {needle:?}:\n{text}");
+    }
+    // The resolved signing subkey drives the daemon's exact pings.
+    assert!(
+        wait_until_exact_pings(&env, 1),
+        "daemon did not ping the exact subkey: {}",
+        env.gpg_log()
+    );
+}
+
+fn wait_until_exact_pings(env: &TestEnv, min: usize) -> bool {
+    common::wait_until(5 * SECS, || {
+        env.gpg_log()
+            .lines()
+            .filter(|l| {
+                l.contains("cancel")
+                    && l.contains(
+                        "--local-user 97CF31DBA5F6012341995ED8F3C83A12ADCE45A1!",
+                    )
+            })
+            .count()
+            >= min
+    })
+}
+
+#[test]
+fn status_reports_locked_and_unprotected_key_states() {
+    let env = TestEnv::new();
+    env.rich_gpg();
+    env.set_key_cached(false);
+    env.succeed(&["on", "--for", "10s"]);
+    assert!(
+        env.status().contains("Key state    locked"),
+        "{}",
+        env.status()
+    );
+
+    // An unprotected key is usable without any cached passphrase.
+    let env2 = TestEnv::new();
+    env2.rich_gpg();
+    env2.set_key_protection("C");
+    env2.succeed(&["on", "--for", "10s"]);
+    let text = env2.status();
+    assert!(
+        text.contains("Key state    unlocked (unprotected)"),
+        "{text}"
+    );
+}
+
+#[test]
+fn unprotected_key_activates_stored_mode_without_secret_service() {
+    let env = TestEnv::new();
+    env.rich_gpg();
+    env.set_key_protection("C");
+    // -s with an unprotected key never needs the Secret Service.
+    env.succeed(&["on", "-s", "--for", "10s"]);
+    let text = env.status();
+    assert!(text.contains("Credential   not needed"), "{text}");
+    assert!(!env.ca_log().contains("CLEAR_PASSPHRASE"));
+}
+
+#[test]
+fn stored_mode_without_secret_service_leaves_the_cache_untouched() {
+    let env = TestEnv::new();
+    env.rich_gpg();
+    let out = env.fail(&["on", "-s"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("could not read the session credential"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("NOT enabled"), "{stderr}");
+    // No CLEAR happened before the credential was available.
+    assert!(!env.ca_log().contains("CLEAR_PASSPHRASE"));
+    assert!(env.status().contains("Hold         off"));
+}
+
+#[test]
+fn credential_clear_without_secret_service_is_an_error() {
+    let env = TestEnv::new();
+    let out = env.fail(&["credential", "clear"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("secret service error"), "{stderr}");
+    // Nothing was started or cleared.
+    assert!(env.status().contains("Daemon       stopped"));
+    assert_eq!(env.ca_log(), "");
+    assert_eq!(env.gpg_log(), "");
+}
+
+// ---------------------------------------------------------------------------
+// Daemon-shutdown cleanup policies
+// ---------------------------------------------------------------------------
+
+fn write_config(env: &TestEnv, body: &str) {
+    std::fs::create_dir_all(env.config.path().join("keyhold")).unwrap();
+    std::fs::write(
+        env.config.path().join("keyhold").join("config.toml"),
+        body,
+    )
+    .unwrap();
+}
+
+#[test]
+fn lock_key_on_daemon_stop_clears_the_active_keygrip() {
+    let env = TestEnv::new();
+    env.rich_gpg();
+    write_config(&env, "lock_key_on_daemon_stop = true\n");
+    env.succeed(&["on", "--for", "1h"]);
+    assert!(!env.ca_log().contains("CLEAR_PASSPHRASE"));
+
+    env.succeed(&["daemon", "--stop"]);
+    assert!(
+        common::wait_until(5 * SECS, || {
+            env.ca_log().contains(
+            "CLEAR_PASSPHRASE --mode=normal F097020B875D80D64C742456496ECA8F47CED17F"
+        )
+        }),
+        "cleanup clear missing: {}",
+        env.ca_log()
+    );
+    // Only the active signing key's entry: exactly one clear.
+    assert_eq!(
+        env.ca_log()
+            .lines()
+            .filter(|l| l.starts_with("CLEAR_PASSPHRASE"))
+            .count(),
+        1,
+        "{}",
+        env.ca_log()
+    );
+}
+
+#[test]
+fn daemon_stop_without_policies_clears_nothing() {
+    let env = TestEnv::new();
+    env.rich_gpg();
+    env.succeed(&["on", "--for", "1h"]);
+    env.succeed(&["daemon", "--stop"]);
+    assert!(
+        common::wait_until(5 * SECS, || !env.sock().exists()),
+        "socket not removed"
+    );
+    assert!(
+        !env.ca_log().contains("CLEAR_PASSPHRASE"),
+        "{}",
+        env.ca_log()
+    );
+}
+
+#[test]
+fn off_never_runs_the_shutdown_policies() {
+    let env = TestEnv::new();
+    env.rich_gpg();
+    write_config(
+        &env,
+        "lock_key_on_daemon_stop = true\nclear_secret_on_daemon_stop = true\n",
+    );
+    env.succeed(&["on", "--for", "1h"]);
+    env.succeed(&["off"]);
+    thread::sleep(Duration::from_millis(300));
+    assert!(
+        !env.ca_log().contains("CLEAR_PASSPHRASE"),
+        "{}",
+        env.ca_log()
+    );
+    // The daemon is still running.
+    assert!(env.status().contains("Daemon       running"));
+}
+
+#[test]
+fn sigint_runs_the_same_cleanup_as_stop() {
+    let env = TestEnv::new();
+    env.rich_gpg();
+    write_config(&env, "lock_key_on_daemon_stop = true\n");
+    let mut daemon = spawn_daemon(&env);
+    assert!(
+        wait_for_status(&env, "Daemon       running", 5 * SECS),
+        "daemon did not start"
+    );
+    env.succeed(&["on", "--for", "1h"]);
+
+    send_signal(&daemon, "INT");
+    wait_with_kill(&mut daemon, 5 * SECS);
+    assert!(daemon.wait().unwrap().success());
+    assert!(
+        common::wait_until(5 * SECS, || {
+            env.ca_log().contains(
+            "CLEAR_PASSPHRASE --mode=normal F097020B875D80D64C742456496ECA8F47CED17F"
+        )
+        }),
+        "SIGINT cleanup missing: {}",
+        env.ca_log()
+    );
+}
+
+#[test]
+fn cleanup_failure_does_not_break_shutdown() {
+    let env = TestEnv::new();
+    env.rich_gpg();
+    // clear_secret policy, but no Secret Service exists in tests.
+    write_config(&env, "clear_secret_on_daemon_stop = true\n");
+    let mut daemon = env
+        .keyhold(&["daemon"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    assert!(
+        wait_for_status(&env, "Daemon       running", 5 * SECS),
+        "daemon did not start"
+    );
+    env.succeed(&["on", "--for", "1h"]);
+
+    send_signal(&daemon, "TERM");
+    // The cleanup error is reported (detached: stderr is /dev/null),
+    // and the daemon still exits successfully with the socket removed.
+    wait_with_kill(&mut daemon, 5 * SECS);
+    assert!(daemon.wait().unwrap().success());
+    assert!(
+        common::wait_until(5 * SECS, || !env.sock().exists()),
+        "socket not removed despite cleanup failure"
     );
 }

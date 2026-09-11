@@ -25,12 +25,13 @@ use std::{
 };
 
 use crate::{
+    config::ShutdownPolicies,
+    credential::CredentialStore,
     error::{Error, Result},
-    gpg::{Gpg, PingMode},
+    gpg::{Gpg, PingMode, SigningTarget},
     ipc::{self, Request, Response},
-    state::{Action, Hold},
+    state::{Action, CachePlan, CredentialMode, Hold},
 };
-
 use signal_hook::{
     consts::{SIGINT, SIGTERM},
     iterator::Signals,
@@ -161,10 +162,38 @@ fn start_background() -> Result<()> {
 /// Run the daemon until a `shutdown` IPC request or a termination signal
 /// arrives.
 ///
+/// Loads the user configuration for the shutdown policies and uses the
+/// real Secret Service session store.
+///
 /// Returns cleanly after removing the socket file.
 pub fn run(gpg: Gpg) -> Result<()> {
-    let paths = paths()?;
-    let listener = bind(&paths)?;
+    let config = crate::config::load()?;
+    run_with(
+        &paths()?,
+        gpg,
+        Arc::new(crate::credential::SessionCredentialStore),
+        config.shutdown_policies(),
+    )
+}
+
+/// The testable daemon entry point: explicit runtime paths, credential
+/// store and shutdown policies.
+///
+/// Clean shutdown (a `shutdown` IPC request, SIGTERM, or SIGINT on a
+/// foreground daemon) removes the socket and then runs the configured
+/// [`ShutdownPolicies`] synchronously: optionally delete keyhold's
+/// Secret Service session items, then optionally clear the active key's
+/// GPG cache entry. Cleanup failures are reported to stderr and never
+/// prevent the rest of shutdown; no guarantee exists for SIGKILL,
+/// crashes or power loss.
+pub fn run_with(
+    paths: &Paths,
+    gpg: Gpg,
+    store: Arc<dyn CredentialStore>,
+    policies: ShutdownPolicies,
+) -> Result<()> {
+    let listener = bind(paths)?;
+    let services = Arc::new(Services { gpg, store });
     let pair: Pair = Arc::new((
         Mutex::new(Shared {
             hold: Hold::default(),
@@ -175,10 +204,10 @@ pub fn run(gpg: Gpg) -> Result<()> {
 
     // SIGTERM (service managers, plain `kill`) and SIGINT (Ctrl-C on a
     // foreground daemon) run through the same shutdown path as a shutdown
-    // IPC request: set the flag, wake the scheduler, and let `run` below
-    // remove the socket and exit successfully. The iterator is self-pipe
-    // based, so nothing but async-signal-safe bookkeeping ever runs inside
-    // a signal handler.
+    // IPC request: set the flag, wake the scheduler, and let the loop
+    // below remove the socket and exit successfully. The iterator is
+    // self-pipe based, so nothing but async-signal-safe bookkeeping ever
+    // runs inside a signal handler.
     let mut signals = Signals::new([SIGINT, SIGTERM])?;
     let signal_pair = Arc::clone(&pair);
     thread::Builder::new()
@@ -195,10 +224,50 @@ pub fn run(gpg: Gpg) -> Result<()> {
         .name("keyhold-accept".into())
         .spawn(move || accept_loop(listener, accept_pair))?;
 
-    scheduler(&pair, &gpg);
+    scheduler(&pair, &services);
 
+    // Synchronous cleanup while the process still exists: the policies
+    // run after the scheduler stops and before the socket disappears.
+    shutdown_cleanup(&services, &policies, &pair);
     let _ = fs::remove_file(&paths.sock);
     Ok(())
+}
+
+/// Apply the configured shutdown policies. `keyhold off` never reaches
+/// this: only clean daemon shutdown does. Failures are reported, never
+/// fatal, and never include secret material.
+fn shutdown_cleanup(
+    services: &Services,
+    policies: &ShutdownPolicies,
+    pair: &Pair,
+) {
+    // The active hold's keygrip: the only cache entry the lock policy
+    // may clear. No resolved keygrip means no clearing — never a guess.
+    let keygrip = {
+        let shared = lock(pair);
+        shared
+            .hold
+            .enabled
+            .then(|| shared.hold.keygrip.clone())
+            .flatten()
+    };
+    if policies.clear_secret {
+        if let Err(e) = services.store.clear_all() {
+            eprintln!(
+                "keyhold: daemon: clearing session credentials failed: {e}"
+            );
+        }
+    }
+    if policies.lock_key {
+        if let Some(keygrip) = keygrip.as_deref() {
+            if let Err(e) = services.gpg.clear_passphrase(keygrip) {
+                eprintln!(
+                    "keyhold: daemon: clearing the GPG cache entry \
+                     failed: {e}"
+                );
+            }
+        }
+    }
 }
 
 /// Create the private runtime directory (or accept an existing one) with
@@ -239,6 +308,14 @@ fn bind(paths: &Paths) -> Result<UnixListener> {
         }
     }
     Err(Error::Daemon("could not bind the daemon socket".into()))
+}
+
+/// Runtime services the scheduler needs: GPG tooling and the session
+/// credential store. Injected as a whole so tests can supply fakes, and
+/// never part of `Hold` state.
+struct Services {
+    gpg: Gpg,
+    store: Arc<dyn CredentialStore>,
 }
 
 type Pair = Arc<(Mutex<Shared>, Condvar)>;
@@ -317,6 +394,12 @@ fn apply(request: Request, pair: &Pair) -> (Response, bool) {
             interval_ms,
             hold_ms,
             activated_at_ms,
+            fingerprint,
+            keygrip,
+            credential_mode,
+            default_cache_ttl_ms,
+            max_cache_ttl_ms,
+            cache_started_at_ms,
         } => {
             if interval_ms == 0 {
                 return (
@@ -337,6 +420,57 @@ fn apply(request: Request, pair: &Pair) -> (Response, bool) {
                     false,
                 );
             };
+            // Session mode promises proactive renewal: it is only valid
+            // with the full metadata needed to schedule it.
+            if credential_mode == CredentialMode::Session
+                && (keygrip.as_deref().is_none_or(str::is_empty)
+                    || max_cache_ttl_ms.is_none()
+                    || cache_started_at_ms.is_none())
+            {
+                return (
+                    Response::err(
+                        "session mode requires a keygrip, max cache TTL \
+                         and a known cache epoch",
+                    ),
+                    false,
+                );
+            }
+            let cache = match (credential_mode, max_cache_ttl_ms) {
+                (CredentialMode::None, _) | (CredentialMode::NotNeeded, _)
+                    if max_cache_ttl_ms.is_none() =>
+                {
+                    None
+                }
+                (_, Some(max_ms)) => {
+                    let started = cache_started_at_ms.and_then(|ms| {
+                        UNIX_EPOCH.checked_add(Duration::from_millis(ms))
+                    });
+                    Some(CachePlan {
+                        mode: credential_mode,
+                        default_ttl: Duration::from_millis(
+                            default_cache_ttl_ms.unwrap_or(max_ms),
+                        ),
+                        max_ttl: Duration::from_millis(max_ms),
+                        started_wall: started,
+                    })
+                }
+                // A non-session mode with TTLs but no epoch still tracks
+                // policy values for status display.
+                _ => Some(CachePlan {
+                    mode: credential_mode,
+                    default_ttl: Duration::from_millis(
+                        default_cache_ttl_ms.unwrap_or(0),
+                    ),
+                    max_ttl: Duration::from_millis(
+                        max_cache_ttl_ms.unwrap_or(0),
+                    ),
+                    started_wall: None,
+                }),
+            };
+            let target = fingerprint.map(|fingerprint| SigningTarget {
+                fingerprint,
+                keygrip: keygrip.clone(),
+            });
             match shared.hold.turn_on(
                 key,
                 key_source,
@@ -344,6 +478,8 @@ fn apply(request: Request, pair: &Pair) -> (Response, bool) {
                 hold_ms.map(Duration::from_millis),
                 Instant::now(),
                 activated,
+                target.as_ref(),
+                cache,
             ) {
                 Ok(()) => {
                     pair.1.notify_all();
@@ -369,10 +505,11 @@ fn apply(request: Request, pair: &Pair) -> (Response, bool) {
 
 /// The keepalive scheduler.
 ///
-/// Sleeps on the condvar until the next ping or deadline (or an IPC wake-up),
-/// then acts. Pings run outside the shared lock; their results are applied
-/// only if no `on`/`off` transition happened meanwhile (generation check).
-fn scheduler(pair: &Pair, gpg: &Gpg) {
+/// Sleeps on the condvar until the next ping, renewal or deadline (or an
+/// IPC wake-up), then acts. All GPG/Secret Service work runs outside the
+/// shared lock; results are applied only if no `on`/`off` transition
+/// happened meanwhile (generation check).
+fn scheduler(pair: &Pair, services: &Services) {
     loop {
         let action = {
             let mut shared = lock(pair);
@@ -408,26 +545,123 @@ fn scheduler(pair: &Pair, gpg: &Gpg) {
         match action {
             Action::Expire => lock(pair).hold.turn_off(),
             Action::Ping => {
-                let (generation, key) = {
-                    let shared = lock(pair);
-                    (shared.hold.generation, shared.hold.key.clone())
-                };
-                let result = gpg
-                    .use_key(key.as_deref(), PingMode::Background)
-                    .map(|_| ());
+                let snapshot = snapshot(pair);
+                let mut result = ping(&services.gpg, &snapshot);
+                // A stored-mode ping that failed before its scheduled
+                // renewal (agent restart, external clear, race) gets
+                // exactly one recovery attempt from the session
+                // credential. Normal mode keeps today's behaviour.
+                if result.is_err()
+                    && snapshot.credential_mode == CredentialMode::Session
+                {
+                    result = renew_once(services, &snapshot).map_err(|e| {
+                        Error::Message(format!(
+                            "keepalive failed and session-credential \
+                             recovery failed: {e}"
+                        ))
+                    });
+                }
+                apply_ping_result(pair, snapshot.generation, result);
+            }
+            Action::Renew => {
+                let snapshot = snapshot(pair);
+                let result = renew_once(services, &snapshot);
                 let mut shared = lock(pair);
-                if shared.hold.generation == generation && shared.hold.enabled
+                if shared.hold.generation == snapshot.generation
+                    && shared.hold.enabled
                 {
                     match result {
                         Ok(()) => shared
                             .hold
-                            .record_ping_ok(Instant::now(), SystemTime::now()),
+                            .record_renewal(Instant::now(), SystemTime::now()),
                         Err(e) => {
                             shared.hold.record_ping_failure(e.to_string())
                         }
                     }
                 }
             }
+        }
+    }
+}
+
+/// Everything a background operation needs from the hold, captured
+/// under one lock and used outside it.
+#[derive(Debug, Clone)]
+struct HoldSnapshot {
+    generation: u64,
+    key: Option<String>,
+    fingerprint: Option<String>,
+    keygrip: Option<String>,
+    credential_mode: CredentialMode,
+}
+
+fn snapshot(pair: &Pair) -> HoldSnapshot {
+    let shared = lock(pair);
+    HoldSnapshot {
+        generation: shared.hold.generation,
+        key: shared.hold.key.clone(),
+        fingerprint: shared.hold.fingerprint.clone(),
+        keygrip: shared.hold.keygrip.clone(),
+        credential_mode: shared.hold.credential_mode,
+    }
+}
+
+/// The stored-mode recreate sequence, shared by proactive renewal and
+/// ping-failure recovery: retrieve the session credential **before**
+/// touching the GPG cache, clear only this keygrip's normal entry, then
+/// unlock with an exact loopback sign. The credential is zeroized when
+/// this function returns.
+fn renew_once(services: &Services, snapshot: &HoldSnapshot) -> Result<()> {
+    let Some(keygrip) = snapshot.keygrip.as_deref() else {
+        return Err(Error::Message("the hold has no resolved keygrip".into()));
+    };
+    let Some(target) = exact_target(snapshot) else {
+        return Err(Error::Message(
+            "the hold has no resolved signing key".into(),
+        ));
+    };
+    // Retrieve before clear: a Secret Service outage must not lock a
+    // currently usable key.
+    let secret = services.store.load(keygrip)?.ok_or_else(|| {
+        Error::Message(
+            "session credential is no longer available; \
+             stored-mode hold stopped"
+                .into(),
+        )
+    })?;
+    services.gpg.clear_passphrase(keygrip)?;
+    let unlocked = services.gpg.use_key_with_passphrase(&target, &secret);
+    drop(secret);
+    unlocked
+}
+
+/// One background keepalive, using the resolved exact signing target
+/// when known (falling back to the original selector).
+fn ping(gpg: &Gpg, snapshot: &HoldSnapshot) -> Result<()> {
+    let exact = snapshot.fingerprint.as_ref().map(|fpr| format!("{fpr}!"));
+    let selector = exact.as_deref().or(snapshot.key.as_deref());
+    gpg.use_key(selector, PingMode::Background).map(|_| ())
+}
+
+fn exact_target(snapshot: &HoldSnapshot) -> Option<SigningTarget> {
+    snapshot
+        .fingerprint
+        .as_ref()
+        .map(|fingerprint| SigningTarget {
+            fingerprint: fingerprint.clone(),
+            keygrip: snapshot.keygrip.clone(),
+        })
+}
+
+/// Apply a ping outcome under the lock, discarding races.
+fn apply_ping_result(pair: &Pair, generation: u64, result: Result<()>) {
+    let mut shared = lock(pair);
+    if shared.hold.generation == generation && shared.hold.enabled {
+        match result {
+            Ok(()) => shared
+                .hold
+                .record_ping_ok(Instant::now(), SystemTime::now()),
+            Err(e) => shared.hold.record_ping_failure(e.to_string()),
         }
     }
 }

@@ -33,6 +33,29 @@ pub fn disabled() {
     println!("Keyhold {}.", "disabled".yellow());
 }
 
+/// Print an informational warning with a `warning:` prefix (yellow when
+/// colour applies).
+pub fn warning(message: &str) {
+    println!("{} {}", "warning:".yellow(), message);
+}
+
+/// Print every activation warning, in order.
+pub fn warnings(messages: &[String]) {
+    for message in messages {
+        warning(message);
+    }
+}
+
+/// Print the confirmation for `keyhold credential clear`.
+pub fn session_credentials_cleared() {
+    println!("Session credentials {}.", "cleared".green());
+}
+
+/// Print the notice that `keyhold credential clear` found nothing.
+pub fn no_session_credentials() {
+    println!("No Keyhold session credentials {}.", "stored".yellow());
+}
+
 /// Print the confirmation for `keyhold daemon --stop`.
 pub fn daemon_stopped() {
     println!("Daemon {}.", "stopped".green());
@@ -68,10 +91,14 @@ pub fn error(message: &str) {
 
 /// Every status row label. The label column width is derived from this
 /// list, so no spacing is hand-counted.
-const LABELS: [&str; 8] = [
+const LABELS: [&str; 12] = [
     "Daemon",
     "Hold",
     "Key",
+    "Key state",
+    "Credential",
+    "GPG max TTL",
+    "Max expiry",
     "Interval",
     "Remaining",
     "Last ping",
@@ -155,7 +182,13 @@ pub fn status_stopped() {
 /// Only rows meaningful for the current state appear: key, timing and
 /// ping rows require an active hold, and absent display timestamps (for
 /// example an unrepresentable far-future next ping) omit their row.
-pub fn print_status(data: &StatusData) {
+/// `key_state` and `credential` carry the live values the caller
+/// queried at command time (`None` omits the row).
+pub fn print_status(
+    data: &StatusData,
+    key_state: Option<String>,
+    credential: Option<String>,
+) {
     println!("{}", "Keyhold status".bold());
     println!();
     row("Daemon", "running".green());
@@ -178,6 +211,38 @@ pub fn print_status(data: &StatusData) {
             _ => key.cyan().to_string(),
         };
         row("Key", value);
+        if let Some(state) = key_state {
+            row("Key state", state);
+        }
+        if let Some(credential) = credential {
+            row("Credential", credential);
+        }
+        if let Some(ms) = data.max_cache_ttl_ms {
+            row("GPG max TTL", interval(ms));
+        }
+        match data.max_expires_at_ms {
+            // A countdown is only honest when keyhold knows the epoch;
+            // TTL values without an epoch display as unknown.
+            Some(ms) if data.max_cache_ttl_ms.is_some() => {
+                let now = epoch_ms();
+                let value = format!(
+                    "in {}{}",
+                    ping_delta(ms.saturating_sub(now)),
+                    if data.credential_mode
+                        == crate::state::CredentialMode::Session
+                    {
+                        " (auto-renew)"
+                    } else {
+                        ""
+                    },
+                );
+                row("Max expiry", value);
+            }
+            _ if data.max_cache_ttl_ms.is_some() => {
+                row("Max expiry", "unknown".dim());
+            }
+            _ => {}
+        }
         row("Interval", interval(data.interval_ms));
         match data.remaining_ms {
             Some(ms) => row("Remaining", remaining(ms)),
@@ -208,7 +273,7 @@ mod tests {
 
     #[test]
     fn label_width_is_the_widest_label_plus_gap() {
-        assert_eq!(label_width(), 11);
+        assert_eq!(label_width(), 13);
         assert!(
             LABELS
                 .iter()

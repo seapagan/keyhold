@@ -33,8 +33,11 @@ pub fn parse_duration(value: &str) -> Result<Duration> {
     about = "Keep a GPG private key cached in gpg-agent while you explicitly allow it",
     long_about = "keyhold periodically performs a harmless signing operation with the selected \
 GPG private key, refreshing gpg-agent's normal idle cache timeout for as long as you \
-explicitly allow it. Turning it off leaves the cache to expire naturally; keyhold never \
-sees or stores your passphrase.",
+explicitly allow it. Turning it off leaves the cache to expire naturally. By default \
+keyhold never sees or stores your passphrase; with the explicit --store-passphrase \
+opt-in it additionally keeps the passphrase in the Linux Secret Service session \
+collection (erased at logout) so it can recreate the selected key's cache entry \
+before GnuPG's absolute max-cache-ttl expires.",
     propagate_version = true,
     disable_help_subcommand = true,
     arg_required_else_help = true
@@ -56,6 +59,15 @@ pub enum Command {
         /// Use Git's effective user.signingkey as the key to keep cached
         #[arg(long)]
         git_key: bool,
+        /// Store the GPG passphrase in the Linux Secret Service session collection for this
+        /// hold, enabling automatic recovery across GnuPG's max-cache-ttl (explicit opt-in;
+        /// ordinary mode never sees the passphrase)
+        #[arg(short = 's', long, conflicts_with = "no_store_passphrase")]
+        store_passphrase: bool,
+        /// Do not store the passphrase for this hold, overriding store_passphrase = true in
+        /// the config
+        #[arg(long)]
+        no_store_passphrase: bool,
         /// Keep the hold enabled for this long (e.g. 30m, 4h, 1h30m); omit for an indefinite hold
         #[arg(long = "for", value_name = "DURATION", value_parser = parse_duration)]
         r#for: Option<Duration>,
@@ -67,6 +79,11 @@ pub enum Command {
     Off,
     /// Show whether the daemon and hold are active
     Status,
+    /// Manage the stored session credential
+    Credential {
+        #[command(subcommand)]
+        action: CredentialAction,
+    },
     /// Run the daemon in the foreground, start it in the background, or
     /// stop a running daemon
     Daemon {
@@ -79,6 +96,14 @@ pub enum Command {
         #[arg(long)]
         stop: bool,
     },
+}
+
+/// Subcommands of `keyhold credential`.
+#[derive(Debug, Subcommand)]
+pub enum CredentialAction {
+    /// Delete all keyhold passphrases from the Secret Service session
+    /// collection; the GPG cache and any active hold are left untouched
+    Clear,
 }
 
 #[cfg(test)]

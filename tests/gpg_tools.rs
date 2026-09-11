@@ -199,7 +199,7 @@ fn foreground_use_resolves_the_actual_signing_subkey() {
         "target mismatch: {:?}",
         used.target
     );
-    assert!(used.pinentry_launched);
+    assert_eq!(used.pinentry_launched, Some(true));
 }
 
 #[test]
@@ -207,7 +207,7 @@ fn cached_key_reports_no_pinentry() {
     let tools = Tools::new();
     tools.marker("cached");
     let used = tools.gpg.use_key(None, PingMode::Foreground).unwrap();
-    assert!(!used.pinentry_launched);
+    assert_eq!(used.pinentry_launched, Some(false));
     assert!(used.target.is_some());
 }
 

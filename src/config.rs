@@ -23,6 +23,15 @@ pub struct Config {
     pub git_key: bool,
     /// Keepalive ping interval.
     pub interval: Duration,
+    /// Store the GPG passphrase in the Secret Service session collection
+    /// by default (the security-expanding opt-in; CLI flags override).
+    pub store_passphrase: bool,
+    /// Delete keyhold's Secret Service session items on clean daemon
+    /// shutdown.
+    pub clear_secret_on_daemon_stop: bool,
+    /// Clear the active signing key's GPG cache entry on clean daemon
+    /// shutdown.
+    pub lock_key_on_daemon_stop: bool,
 }
 
 impl Default for Config {
@@ -31,8 +40,36 @@ impl Default for Config {
             key: None,
             git_key: false,
             interval: DEFAULT_INTERVAL,
+            store_passphrase: false,
+            clear_secret_on_daemon_stop: false,
+            lock_key_on_daemon_stop: false,
         }
     }
+}
+
+impl Config {
+    /// The daemon-shutdown cleanup policies derived from this config.
+    /// Both are independent, opt-in and default to doing nothing.
+    pub fn shutdown_policies(&self) -> ShutdownPolicies {
+        ShutdownPolicies {
+            clear_secret: self.clear_secret_on_daemon_stop,
+            lock_key: self.lock_key_on_daemon_stop,
+        }
+    }
+}
+
+/// Clean-daemon-shutdown cleanup policies. Independent booleans:
+/// deleting the Secret Service session items and clearing the active
+/// key's GPG cache entry are separate decisions. Neither runs on
+/// `keyhold off`; only on a clean daemon stop (`keyhold daemon --stop`,
+/// SIGTERM, or Ctrl-C on a foreground daemon).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ShutdownPolicies {
+    /// Remove keyhold's items from the Secret Service session collection.
+    pub clear_secret: bool,
+    /// Clear only the active signing key's normal GPG cache entry
+    /// (keygrip-scoped; never an agent restart or global flush).
+    pub lock_key: bool,
 }
 
 /// Raw shape of the TOML file; unknown keys are rejected.
@@ -42,6 +79,9 @@ struct ConfigFile {
     key: Option<String>,
     git_key: Option<bool>,
     interval: Option<String>,
+    store_passphrase: Option<bool>,
+    clear_secret_on_daemon_stop: Option<bool>,
+    lock_key_on_daemon_stop: Option<bool>,
 }
 
 /// Base config directory: `$XDG_CONFIG_HOME` if absolute, else `$HOME/.config`.
@@ -101,6 +141,11 @@ pub fn load_from(dir: &Path) -> Result<Config> {
         key: file.key,
         git_key,
         interval,
+        store_passphrase: file.store_passphrase.unwrap_or(false),
+        clear_secret_on_daemon_stop: file
+            .clear_secret_on_daemon_stop
+            .unwrap_or(false),
+        lock_key_on_daemon_stop: file.lock_key_on_daemon_stop.unwrap_or(false),
     })
 }
 

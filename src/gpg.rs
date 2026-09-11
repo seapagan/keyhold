@@ -106,7 +106,9 @@ pub struct GpgUse {
     /// The resolved signing target, when identifiable.
     pub target: Option<SigningTarget>,
     /// Whether gpg launched pinentry during this use (a fresh unlock).
-    pub pinentry_launched: bool,
+    /// `None` means gpg produced no machine-readable status, so the
+    /// question cannot be answered.
+    pub pinentry_launched: Option<bool>,
 }
 
 /// Machine-readable status records distilled from one gpg `--status-fd`
@@ -119,6 +121,10 @@ pub struct GpgStatus {
     pub pinentry_launched: bool,
     /// Primary fingerprints gpg considered (`KEY_CONSIDERED`), in order.
     pub key_considered: Vec<String>,
+    /// Whether any `[GNUPG:]` record was seen at all. Without one there
+    /// is no evidence either way about pinentry, so callers must treat
+    /// `pinentry_launched` as unknown rather than false.
+    pub saw_status: bool,
 }
 
 /// One `sec`/`ssb` record from a colon-separated secret-key listing,
@@ -225,9 +231,11 @@ impl Gpg {
             .sig_created
             .as_deref()
             .and_then(|fpr| self.target_for_fingerprint(fpr).ok().flatten());
+        let pinentry_launched =
+            status.saw_status.then_some(status.pinentry_launched);
         Ok(GpgUse {
             target,
-            pinentry_launched: status.pinentry_launched,
+            pinentry_launched,
         })
     }
 
@@ -596,15 +604,13 @@ pub fn parse_status(text: &str) -> GpgStatus {
         let Some(rest) = line.strip_prefix("[GNUPG:] ") else {
             continue;
         };
+        status.saw_status = true;
         let mut tokens = rest.split_whitespace();
         let Some(keyword) = tokens.next() else {
             continue;
         };
         match keyword {
             "SIG_CREATED" => {
-                // `SIG_CREATED <D|C|S> <digest> <hash> <class> <ts> <fpr>`:
-                // the final field is the fingerprint of the key that
-                // actually signed (a subkey signs with its own
                 // fingerprint).
                 if let Some(fpr) = tokens.last()
                     && fpr.len() == 40
@@ -946,7 +952,17 @@ mod tests {
              plain stderr-ish noise\n\
              [GNUPG:] NEED_PASSPHRASE this that more\n",
         );
-        assert_eq!(status, GpgStatus::default());
+        // Malformed records contribute nothing, but their presence is
+        // still evidence that gpg emits status on this stream.
+        assert_eq!(
+            status,
+            GpgStatus {
+                saw_status: true,
+                ..GpgStatus::default()
+            }
+        );
+        // A stream with no status records at all leaves no evidence.
+        assert_eq!(parse_status("plain noise only\n"), GpgStatus::default());
     }
 
     #[test]

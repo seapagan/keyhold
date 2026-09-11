@@ -1,0 +1,2 @@
+gpg: signing failed: Bad passphrase
+gpg: signing failed: Bad passphrase

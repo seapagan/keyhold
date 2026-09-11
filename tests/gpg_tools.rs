@@ -51,7 +51,9 @@ impl Tools {
                  if [ \"$list\" = 1 ]; then cat {root}/keys.txt; exit 0; fi\n\
                  if [ \"$background\" = 1 ] && [ -e {root}/lock ]; then\n\
                    echo '[GNUPG:] KEY_CONSIDERED {PRIMARY_FPR} 0'\n\
-                   echo '[GNUPG:] FAILURE sign 67108963'\n\
+                   code=67108963\n\
+                   [ -e {root}/syserr ] && code=32867\n\
+                   echo \"[GNUPG:] FAILURE sign $code\"\n\
                    if [ -e {root}/non-english ]; then\n\
                      echo 'gpg: signature echouee: operation annulee' >&2\n\
                    else\n\
@@ -68,7 +70,9 @@ impl Tools {
                    IFS= read -r supplied\n\
                    expected=$(cat {root}/passphrase)\n\
                    if [ \"$supplied\" != \"$expected\" ]; then\n\
-                     echo '[GNUPG:] FAILURE sign 67108875'\n\
+                     code=67108875\n\
+                     [ -e {root}/syserr ] && code=32779\n\
+                     echo \"[GNUPG:] FAILURE sign $code\"\n\
                      if [ -e {root}/non-english ]; then\n\
                        echo 'gpg: signature echouee: mot de passe errone' >&2\n\
                      else\n\
@@ -367,6 +371,39 @@ fn bad_passphrase_is_classified_without_english_stderr() {
     let t = target(SUB2_FPR, SUB2_GRIP);
     let err = tools.gpg.use_key_with_passphrase(&t, b"wrong").unwrap_err();
     assert!(matches!(err, keyhold::error::Error::BadPassphrase), "{err}");
+}
+
+/// A system-error `FAILURE` code (bit 15 set) whose low bits resemble
+/// `GPG_ERR_BAD_PASSPHRASE` must not classify as a rejected
+/// passphrase: the error-code mask must preserve the system-error flag.
+#[test]
+fn system_error_failure_code_is_not_a_bad_passphrase() {
+    let tools = Tools::new();
+    tools.marker("syserr");
+    let t = target(SUB2_FPR, SUB2_GRIP);
+    let err = tools.gpg.use_key_with_passphrase(&t, b"wrong").unwrap_err();
+    assert!(
+        !matches!(err, keyhold::error::Error::BadPassphrase),
+        "system error aliased BAD_PASSPHRASE: {err}"
+    );
+    assert!(
+        matches!(err, keyhold::error::Error::GpgFailed(_)),
+        "expected a plain signing failure, got {err}"
+    );
+}
+
+/// The same guard for the locked-key probe: a system-error `FAILURE`
+/// whose low bits resemble `GPG_ERR_CANCELED` must not resolve as a
+/// locked key.
+#[test]
+fn system_error_failure_code_is_not_treated_as_a_locked_key() {
+    let tools = Tools::new();
+    tools.marker("lock");
+    tools.marker("syserr");
+    assert!(
+        tools.gpg.probe_target(None).is_err(),
+        "system error aliased CANCELED and resolved a locked key"
+    );
 }
 
 #[test]

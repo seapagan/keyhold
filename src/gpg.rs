@@ -45,10 +45,12 @@ pub const GPGCONF_ENV: &str = "KEYHOLD_GPGCONF";
 /// Environment variable overriding the `gpg-connect-agent` executable path.
 pub const CONNECT_AGENT_ENV: &str = "KEYHOLD_GPG_CONNECT_AGENT";
 
-/// libgpg-error packs the error code into the low 15 bits of the value
+/// libgpg-error packs the error code into the low 16 bits of the value
 /// printed in Assuan `ERR <code>` replies and `--status-fd` `FAILURE`
-/// records; the upper bits carry the error source.
-const GPG_ERR_CODE_MASK: u64 = 0x7FFF;
+/// records; the upper bits carry the error source. Bit 15 of the code
+/// is the `GPG_ERR_SYSTEM_ERROR` flag and is preserved by this mask, so
+/// a system error never aliases a plain semantic code.
+const GPG_ERR_CODE_MASK: u64 = 0xFFFF;
 /// `GPG_ERR_NOT_FOUND` (27): the agent's answer for an unknown keygrip.
 const GPG_ERR_NOT_FOUND: u64 = 27;
 /// `GPG_ERR_BAD_PASSPHRASE` (11): gpg rejected the supplied passphrase.
@@ -148,7 +150,8 @@ impl AgentReply {
     }
 
     /// Whether this is an `ERR` reply carrying the given libgpg-error
-    /// code (masked to its low 15 bits).
+    /// code (masked to its low 16 bits, preserving the system-error
+    /// flag).
     fn has_code(&self, wanted: u64) -> bool {
         matches!(
             self,
@@ -196,8 +199,9 @@ pub struct GpgStatus {
     pub saw_status: bool,
     /// The numeric error code of the last `FAILURE` record, when gpg
     /// emitted one. Machine-readable failure classification (the low
-    /// 15 bits are the libgpg-error code); the location token is
-    /// dropped. Localized stderr is never used for this.
+    /// 16 bits are the libgpg-error code, including the system-error
+    /// flag); the location token is dropped. Localized stderr is never
+    /// used for this.
     pub failure_code: Option<u64>,
 }
 
@@ -1533,8 +1537,30 @@ max-cache-ttl-ssh:24:2:d:3:3:N:10::\ndefault-cache-ttl-ssh:24:0:d:3:3:N:10::\n";
 
     #[test]
     fn agent_err_code_matching_uses_the_libgpg_error_bits() {
-        // GPG_ERR_NOT_FOUND (27) rides in the low 15 bits; the high
-        // bits are the error source and must not disturb the match.
+        // Plain semantic codes (in the low 16 bits, no system-error
+        // flag) match themselves.
+        for (wanted, text) in [
+            (GPG_ERR_BAD_PASSPHRASE, "Bad passphrase"),
+            (GPG_ERR_NOT_FOUND, "Not found"),
+            (GPG_ERR_CANCELED, "Operation cancelled"),
+        ] {
+            let reply = parse_agent_reply(&format!("ERR {wanted} {text}\n"));
+            assert!(reply.has_code(wanted), "{wanted} must match itself");
+            // A system-error variant (GPG_ERR_SYSTEM_ERROR, bit 15) whose
+            // low bits resemble the code is a different value and must
+            // never alias it.
+            let system = parse_agent_reply(&format!(
+                "ERR {} {text} (system error)\n",
+                0x8000 | wanted
+            ));
+            assert!(
+                !system.has_code(wanted),
+                "0x8000|{wanted} must not classify as {wanted}"
+            );
+        }
+        // The error source lives above the code field and must not
+        // disturb the match: 67108891 is GPG_ERR_NOT_FOUND plus source
+        // bits.
         let not_found = parse_agent_reply("ERR 67108891 Not found\n");
         assert!(not_found.has_code(GPG_ERR_NOT_FOUND));
         let other = parse_agent_reply("ERR 67109139 Unknown IPC command\n");

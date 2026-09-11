@@ -149,10 +149,7 @@ fn on(
         cache_started_at_ms: prepared
             .cache
             .and_then(|cache| cache.started_wall)
-            .map(|t| epoch_ms(t).unwrap_or(0))
-            .filter(|_| {
-                prepared.cache.is_some_and(|c| c.started_wall.is_some())
-            }),
+            .and_then(epoch_ms),
     };
     check(ipc::request(&request)?)?;
 

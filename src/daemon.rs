@@ -430,11 +430,9 @@ fn apply(request: Request, pair: &Pair) -> (Response, bool) {
                 );
             }
             let cache = match (credential_mode, max_cache_ttl_ms) {
-                (CredentialMode::None, _) | (CredentialMode::NotNeeded, _)
-                    if max_cache_ttl_ms.is_none() =>
-                {
-                    None
-                }
+                // Without a TTL there is nothing to track; an ordinary
+                // hold may legitimately arrive with no cache metadata.
+                (_, None) => None,
                 (_, Some(max_ms)) => {
                     let started = cache_started_at_ms.and_then(|ms| {
                         UNIX_EPOCH.checked_add(Duration::from_millis(ms))
@@ -448,18 +446,6 @@ fn apply(request: Request, pair: &Pair) -> (Response, bool) {
                         started_wall: started,
                     })
                 }
-                // A non-session mode with TTLs but no epoch still tracks
-                // policy values for status display.
-                _ => Some(CachePlan {
-                    mode: credential_mode,
-                    default_ttl: Duration::from_millis(
-                        default_cache_ttl_ms.unwrap_or(0),
-                    ),
-                    max_ttl: Duration::from_millis(
-                        max_cache_ttl_ms.unwrap_or(0),
-                    ),
-                    started_wall: None,
-                }),
             };
             let target = fingerprint.map(|fingerprint| SigningTarget {
                 fingerprint,
@@ -542,21 +528,23 @@ fn scheduler(pair: &Pair, services: &Services) {
             Action::Expire => lock(pair).hold.turn_off(),
             Action::Ping => {
                 let snapshot = snapshot(pair);
-                let mut result = ping(&services.gpg, &snapshot);
+                let result = ping(&services.gpg, &snapshot);
                 // A stored-mode ping that failed before its scheduled
                 // renewal (agent restart, external clear, race) gets
                 // exactly one recovery attempt from the session
-                // credential. Normal mode keeps today's behaviour.
-                if result.is_err()
-                    && snapshot.credential_mode == CredentialMode::Session
-                {
-                    result = renew_once(services, &snapshot).map_err(|e| {
-                        Error::Message(format!(
-                            "keepalive failed and session-credential \
-                             recovery failed: {e}"
-                        ))
-                    });
-                }
+                // credential; the recorded error explains both halves.
+                // Normal mode keeps today's behaviour.
+                let result = match (result, snapshot.credential_mode) {
+                    (Err(ping_err), CredentialMode::Session) => {
+                        renew_once(services, &snapshot).map_err(|e| {
+                            Error::Message(format!(
+                                "{ping_err}; session-credential recovery \
+                                 failed: {e}"
+                            ))
+                        })
+                    }
+                    (result, _) => result,
+                };
                 apply_ping_result(pair, snapshot.generation, result);
             }
             Action::Renew => {

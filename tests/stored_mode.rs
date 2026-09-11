@@ -420,6 +420,44 @@ fn unexpected_cache_loss_is_recovered_once() {
 }
 
 #[test]
+fn failed_recovery_error_explains_both_halves() {
+    let running = Running::start(ShutdownPolicies::default());
+    // Frequent pings, no renewals: the ping path drives recovery.
+    running.hold(200, 600);
+
+    // The cache entry disappears AND the credential is gone: the ping
+    // fails, recovery fails, and the recorded error must explain both.
+    running.tools.drop_cache();
+    running.store.remove(SUB2_GRIP);
+    let clears_before = running.tools.clears();
+
+    assert!(
+        wait_until(5 * SECS, || running.status()["hold_on"] == false),
+        "hold did not stop: {}",
+        running.status()
+    );
+    let error = running.status()["last_error"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        error.contains("cancelled"),
+        "ping failure not explained: {error}"
+    );
+    assert!(
+        error.contains("no longer available"),
+        "recovery failure not explained: {error}"
+    );
+    // Retrieve-before-clear held: no clear happened without a credential.
+    assert_eq!(
+        running.tools.clears(),
+        clears_before,
+        "{}",
+        running.tools.ca_log()
+    );
+}
+
+#[test]
 fn missing_credential_at_renewal_stops_the_hold_without_clearing() {
     let running = Running::start(ShutdownPolicies::default());
     running.hold(60_000, 2);

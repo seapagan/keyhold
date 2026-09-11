@@ -767,7 +767,7 @@ mod tests {
             Some(Duration::from_millis(1)),
             start,
             UNIX_EPOCH + Duration::from_secs(1),
-            Activation::none(),
+            Activation::default(),
         )
         .unwrap();
         let action = scheduled_action(&hold, start + Duration::from_millis(1))

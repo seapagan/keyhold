@@ -896,7 +896,6 @@ pub fn stored_activation(
         gpg,
         true,
         key,
-        keyhold::state::KeySource::Default,
         Duration::from_millis(interval_ms),
         hold_ms.map(Duration::from_millis),
         store,

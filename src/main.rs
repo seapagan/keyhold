@@ -114,7 +114,6 @@ fn on(
         &gpg,
         store_enabled,
         key.as_deref(),
-        key_source,
         interval,
         hold_for,
         &SessionCredentialStore,
@@ -153,7 +152,9 @@ fn on(
     };
     check(ipc::request(&request)?)?;
 
-    presentation::warnings(&prepared.warnings);
+    for warning in &prepared.warnings {
+        presentation::warning(warning);
+    }
     match hold_for {
         Some(d) => presentation::enabled_for(
             &humantime::format_duration(d).to_string(),
@@ -223,7 +224,9 @@ fn status() -> Result<()> {
             presentation::print_status(
                 &data,
                 key_state_row(&data, gpg.as_ref()),
-                credential_row(&data),
+                credential_row_with(&data, |keygrip| {
+                    SessionCredentialStore.contains(keygrip)
+                }),
             );
             Ok(())
         }
@@ -247,17 +250,6 @@ fn key_state_row(data: &StatusData, gpg: Option<&Gpg>) -> Option<String> {
         }
         keyhold::gpg::KeyProtection::Clear => "unlocked (unprotected)".into(),
         keyhold::gpg::KeyProtection::Unknown => "unknown".into(),
-    })
-}
-
-/// The `Credential` row value for the resolved key: whether keyhold
-/// could recover the key when GPG drops the cache. Queried live for
-/// the retained key even after the hold is off. Unavailability of the
-/// Secret Service degrades to `unavailable` rather than failing
-/// status.
-fn credential_row(data: &StatusData) -> Option<String> {
-    credential_row_with(data, |keygrip| {
-        SessionCredentialStore.contains(keygrip)
     })
 }
 

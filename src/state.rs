@@ -134,8 +134,6 @@ pub struct Hold {
 /// GPG cache tracking for an active hold.
 #[derive(Debug, Clone, Copy)]
 pub struct CacheState {
-    /// Credential mode of the hold.
-    pub mode: CredentialMode,
     /// GnuPG's effective `default-cache-ttl`.
     pub default_ttl: Duration,
     /// The hard maximum GnuPG enforces on the cache entry.
@@ -176,11 +174,6 @@ pub struct Activation<'a> {
 }
 
 impl<'a> Activation<'a> {
-    /// No target and no cache tracking (an ordinary, unresolved hold).
-    pub fn none() -> Self {
-        Self::default()
-    }
-
     /// Cache tracking without a resolved target.
     pub fn cache_only(cache: CachePlan) -> Self {
         Self {
@@ -278,7 +271,6 @@ impl Hold {
                     None
                 };
                 Some(CacheState {
-                    mode: plan.mode,
                     default_ttl: plan.default_ttl,
                     max_ttl: plan.max_ttl,
                     expires_wall,
@@ -296,7 +288,9 @@ impl Hold {
         self.last_error = None;
         self.fingerprint = target.map(|t| t.fingerprint.to_owned());
         self.keygrip = target.and_then(|t| t.keygrip.to_owned());
-        self.credential_mode = cache.map_or(CredentialMode::None, |c| c.mode);
+        self.credential_mode = activation
+            .cache
+            .map_or(CredentialMode::None, |plan| plan.mode);
         self.cache = cache;
         self.generation += 1;
         Ok(())
@@ -468,7 +462,7 @@ mod tests {
             None,
             start,
             wall(1_000),
-            Activation::none(),
+            Activation::default(),
         )
         .unwrap();
         assert_eq!(hold.due_action(start), None);
@@ -488,7 +482,7 @@ mod tests {
             Some(MINUTE),
             start,
             wall(1_000),
-            Activation::none(),
+            Activation::default(),
         )
         .unwrap();
         assert_eq!(hold.due_action(start + MINUTE), Some(Action::Expire));
@@ -505,7 +499,7 @@ mod tests {
             Some(MINUTE),
             start,
             wall(1_000),
-            Activation::none(),
+            Activation::default(),
         )
         .unwrap();
         hold.turn_off();
@@ -526,7 +520,7 @@ mod tests {
             Some(MINUTE),
             start,
             wall(1_000),
-            Activation::none(),
+            Activation::default(),
         )
         .unwrap();
 
@@ -548,7 +542,7 @@ mod tests {
             Some(MINUTE),
             start,
             wall(1_000),
-            Activation::none(),
+            Activation::default(),
         )
         .unwrap();
 
@@ -571,7 +565,7 @@ mod tests {
             None,
             start,
             wall(1_000),
-            Activation::none(),
+            Activation::default(),
         )
         .unwrap();
         hold.record_ping_failure(
@@ -596,7 +590,7 @@ mod tests {
             None,
             start,
             wall(1_000),
-            Activation::none(),
+            Activation::default(),
         )
         .unwrap();
         let pinged_at = start + MINUTE;
@@ -617,7 +611,7 @@ mod tests {
             Some(MINUTE),
             start,
             wall(1_000),
-            Activation::none(),
+            Activation::default(),
         )
         .unwrap();
         let generation = hold.generation;
@@ -629,7 +623,7 @@ mod tests {
             None,
             later,
             wall(2_000),
-            Activation::none(),
+            Activation::default(),
         )
         .unwrap();
         assert_eq!(hold.generation, generation + 1);
@@ -649,7 +643,7 @@ mod tests {
             Some(Duration::from_secs(3600)),
             start,
             wall(1_000),
-            Activation::none(),
+            Activation::default(),
         )
         .unwrap();
         assert_eq!(
@@ -670,7 +664,7 @@ mod tests {
             None,
             start,
             activated,
-            Activation::none(),
+            Activation::default(),
         )
         .unwrap();
         assert_eq!(hold.last_ping, Some(activated));
@@ -691,7 +685,7 @@ mod tests {
             None,
             start,
             wall(1_000),
-            Activation::none(),
+            Activation::default(),
         )
         .unwrap();
         hold.record_ping_ok(start + MINUTE, wall(1_060));
@@ -704,7 +698,7 @@ mod tests {
             None,
             later,
             fresh,
-            Activation::none(),
+            Activation::default(),
         )
         .unwrap();
         assert_eq!(hold.last_ping, Some(fresh));
@@ -722,7 +716,7 @@ mod tests {
                 None,
                 start,
                 wall(1_000),
-                Activation::none(),
+                Activation::default(),
             )
             .unwrap_err();
         assert!(err.contains("interval"), "{err}");
@@ -743,7 +737,7 @@ mod tests {
                 Some(Duration::from_secs(u64::MAX)),
                 start,
                 wall(1_000),
-                Activation::none(),
+                Activation::default(),
             )
             .unwrap_err();
         assert!(err.contains("hold"), "{err}");
@@ -766,7 +760,7 @@ mod tests {
             Some(interval),
             start,
             wall(1_000),
-            Activation::none(),
+            Activation::default(),
         )
         .unwrap();
         assert_eq!(hold.next_ping, Some(start + interval));
@@ -787,7 +781,7 @@ mod tests {
             None,
             start,
             wall(1_000),
-            Activation::none(),
+            Activation::default(),
         )
         .unwrap();
         let status = hold.status();
@@ -805,7 +799,7 @@ mod tests {
             None,
             start,
             wall(1_000),
-            Activation::none(),
+            Activation::default(),
         )
         .unwrap();
         assert!(hold.next_ping.is_some(), "monotonic schedule kept");
@@ -990,7 +984,7 @@ mod tests {
             None,
             start + MINUTE,
             wall(2_000),
-            Activation::none(),
+            Activation::default(),
         )
         .unwrap();
         assert!(hold.cache.is_none());
@@ -1048,7 +1042,7 @@ mod tests {
             None,
             start + MINUTE,
             wall(2_000),
-            Activation::none(),
+            Activation::default(),
         )
         .unwrap();
 

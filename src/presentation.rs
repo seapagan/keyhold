@@ -39,13 +39,6 @@ pub fn warning(message: &str) {
     println!("{} {}", "warning:".yellow(), message);
 }
 
-/// Print every activation warning, in order.
-pub fn warnings(messages: &[String]) {
-    for message in messages {
-        warning(message);
-    }
-}
-
 /// Print the confirmation for `keyhold credential clear`.
 pub fn session_credentials_cleared() {
     println!("Session credentials {}.", "cleared".green());

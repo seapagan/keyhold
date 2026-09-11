@@ -21,7 +21,7 @@ use crate::{
     credential::CredentialStore,
     error::{Error, Result},
     gpg::{Gpg, GpgUse, KeyProtection, PingMode, SigningTarget},
-    state::{CachePlan, CredentialMode, KeySource},
+    state::{CachePlan, CredentialMode},
 };
 
 /// What a successful activation hands to the caller: exact IPC metadata
@@ -48,13 +48,11 @@ pub fn activate(
     gpg: &Gpg,
     store_enabled: bool,
     key: Option<&str>,
-    key_source: KeySource,
     interval: Duration,
     hold_for: Option<Duration>,
     store: &dyn CredentialStore,
     prompt: &Prompt<'_>,
 ) -> Result<Prepared> {
-    let _ = key_source;
     if store_enabled {
         stored(gpg, key, interval, store, prompt)
     } else {
@@ -285,11 +283,4 @@ fn interval_warning(interval: Duration, default_ttl: Duration) -> String {
 fn use_foreground(gpg: &Gpg, key: Option<&str>) -> Result<GpgUse> {
     gpg.use_key(key, PingMode::Foreground)
         .map_err(|e| Error::Message(format!("{e}; the hold was NOT enabled")))
-}
-
-#[cfg(test)]
-mod tests {
-    // The flows above are integration-tested end-to-end (and
-    // in-process) against fake gpg tooling; the state-machine
-    // arithmetic they produce is unit-tested in `state`.
 }

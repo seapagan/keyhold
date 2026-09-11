@@ -62,7 +62,7 @@ fn on_with_key_and_duration_reports_details() {
     env.succeed(&["on", "--key", "DEADBEEF", "--for", "2h"]);
     let text = env.status();
     assert!(text.contains("Key        DEADBEEF"), "{text}");
-    assert!(text.contains("Remaining  1h"), "{text}");
+    assert!(text.contains("Remaining  2h"), "{text}");
     assert!(text.contains("Interval   5m"), "{text}");
 
     let log = env.gpg_log();
@@ -74,7 +74,8 @@ fn repeated_on_replaces_the_hold() {
     let env = TestEnv::new();
     env.succeed(&["on", "--for", "1h"]);
     env.succeed(&["on", "--for", "3h"]);
-    assert!(env.status().contains("Remaining  2h"));
+    // A fresh hold rounds to the nearest minute, so it still reads `3h`.
+    assert!(env.status().contains("Remaining  3h"));
 
     env.succeed(&["on", "--key", "XYZ"]);
     let text = env.status();
@@ -450,16 +451,17 @@ fn subsecond_durations_are_not_truncated_to_zero() {
 }
 
 #[test]
-fn status_shows_subsecond_remaining_and_ping_times() {
+fn status_drops_millisecond_precision() {
     let env = TestEnv::new();
     env.succeed(&["on", "--for", "2s", "--interval", "2s"]);
     let text = env.status();
-    // With a fresh hold, remaining and next-ping times are between one and
-    // two seconds: the display must keep the millisecond remainder instead
-    // of collapsing to whole seconds (or to "0s").
-    assert!(text.contains("Remaining  1s "), "{text}");
-    assert!(text.contains("Next ping  in 1s "), "{text}");
+    // Sub-second remainder exists internally but never reaches the
+    // display: remaining and ping times render at whole-second (or
+    // coarser) precision.
+    assert!(text.contains("Remaining  "), "{text}");
+    assert!(text.contains("Next ping  in "), "{text}");
     assert!(text.contains("Last ping  "), "{text}");
+    assert!(!text.contains("ms"), "{text}");
 }
 
 #[test]

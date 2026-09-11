@@ -107,11 +107,39 @@ fn epoch_ms() -> u64 {
     .unwrap_or(0)
 }
 
-/// A duration value, styled cyan.
-fn duration(ms: u64) -> colored_text::StyledText {
+/// The configured interval, at its natural precision (`5m`, `500ms`).
+fn interval(ms: u64) -> colored_text::StyledText {
     humantime::format_duration(Duration::from_millis(ms))
         .to_string()
         .cyan()
+}
+
+/// Remaining hold time, rounded for humans: hours and minutes once at
+/// least a minute is left (a fresh `--for 8h` hold reads `8h`, not
+/// `7h 59m`), plain seconds below that.
+fn remaining(ms: u64) -> colored_text::StyledText {
+    let text = if ms >= 60_000 {
+        // Round to the nearest minute (saturating: remaining can sit
+        // near `u64::MAX` for unrepresentable deadlines), so a fresh
+        // hold keeps its advertised time instead of dropping a minute.
+        let minutes = ms.saturating_add(30_000) / 60_000;
+        humantime::format_duration(Duration::from_secs(minutes * 60))
+            .to_string()
+    } else {
+        // Capped at 59 so the display steps straight to `1m` at a
+        // minute instead of ever showing `60s`.
+        format!("{}s", (ms.saturating_add(500) / 1000).min(59))
+    };
+    text.cyan()
+}
+
+/// A ping delta at whole-second precision (`3s`, `4m 56s`).
+fn ping_delta(ms: u64) -> colored_text::StyledText {
+    humantime::format_duration(Duration::from_secs(
+        ms.saturating_add(500) / 1000,
+    ))
+    .to_string()
+    .cyan()
 }
 
 /// Print the status snapshot for a stopped daemon.
@@ -150,22 +178,22 @@ pub fn print_status(data: &StatusData) {
             _ => key.cyan().to_string(),
         };
         row("Key", value);
-        row("Interval", duration(data.interval_ms));
+        row("Interval", interval(data.interval_ms));
         match data.remaining_ms {
-            Some(ms) => row("Remaining", duration(ms)),
+            Some(ms) => row("Remaining", remaining(ms)),
             None => row("Remaining", "no deadline".dim()),
         }
         let now = epoch_ms();
         if let Some(ms) = data.last_ping_ms {
             row(
                 "Last ping",
-                format!("{} ago", duration(now.saturating_sub(ms))),
+                format!("{} ago", ping_delta(now.saturating_sub(ms))),
             );
         }
         if let Some(ms) = data.next_ping_ms {
             row(
                 "Next ping",
-                format!("in {}", duration(ms.saturating_sub(now))),
+                format!("in {}", ping_delta(ms.saturating_sub(now))),
             );
         }
     }
@@ -186,5 +214,63 @@ mod tests {
                 .iter()
                 .all(|label| label.len() + LABEL_GAP <= label_width())
         );
+    }
+
+    #[test]
+    fn interval_keeps_natural_precision() {
+        assert_eq!(interval(300_000).plain_text(), "5m");
+        assert_eq!(interval(90_000).plain_text(), "1m 30s");
+        assert_eq!(interval(1_500).plain_text(), "1s 500ms");
+    }
+
+    #[test]
+    fn remaining_rounds_to_nearest_minute_at_an_hour_scale() {
+        // A fresh hold keeps its advertised time for the first half
+        // minute instead of immediately dropping a minute.
+        let eight_hours = 8 * 3_600_000;
+        assert_eq!(remaining(eight_hours).plain_text(), "8h");
+        assert_eq!(remaining(eight_hours - 1_000).plain_text(), "8h");
+        assert_eq!(remaining(eight_hours - 29_999).plain_text(), "8h");
+        assert_eq!(remaining(eight_hours - 30_001).plain_text(), "7h 59m");
+        // Hours and minutes only, no seconds or milliseconds.
+        assert_eq!(
+            remaining(2 * 3_600_000 + 17 * 60_000).plain_text(),
+            "2h 17m"
+        );
+        assert_eq!(remaining(59 * 60_000).plain_text(), "59m");
+        // A near-`u64::MAX` deadline must not overflow the rounding add.
+        let styled = remaining(u64::MAX);
+        let text = styled.plain_text();
+        assert!(!text.contains("ms"), "{text}");
+    }
+
+    #[test]
+    fn remaining_below_a_minute_shows_rounded_seconds() {
+        // Rounding to the nearest second would give 60; the cap keeps
+        // the display at `59s` until a true minute shows `1m`.
+        assert_eq!(remaining(59_499).plain_text(), "59s");
+        assert_eq!(remaining(59_999).plain_text(), "59s");
+        assert_eq!(remaining(60_000).plain_text(), "1m");
+        assert_eq!(remaining(45_000).plain_text(), "45s");
+        assert_eq!(remaining(1_499).plain_text(), "1s");
+        assert_eq!(remaining(1_500).plain_text(), "2s");
+        assert_eq!(remaining(499).plain_text(), "0s");
+    }
+
+    #[test]
+    fn ping_deltas_show_whole_seconds_only() {
+        assert_eq!(ping_delta(0).plain_text(), "0s");
+        assert_eq!(ping_delta(499).plain_text(), "0s");
+        assert_eq!(ping_delta(500).plain_text(), "1s");
+        assert_eq!(ping_delta(3_400).plain_text(), "3s");
+        assert_eq!(ping_delta(4 * 60_000 + 56_000).plain_text(), "4m 56s");
+        assert_eq!(
+            ping_delta(3_600_000 + 2 * 60_000 + 3_000).plain_text(),
+            "1h 2m 3s"
+        );
+        // Near-`u64::MAX` deltas (absurd timestamps) must not overflow.
+        let styled = ping_delta(u64::MAX);
+        let text = styled.plain_text();
+        assert!(text.ends_with('s') && !text.contains("ms"), "{text}");
     }
 }

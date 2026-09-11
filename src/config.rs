@@ -158,6 +158,15 @@ pub fn load() -> Result<Config> {
     load_from(&config_dir()?)
 }
 
+/// The current shutdown policies from the user config on disk.
+///
+/// Used by the daemon at clean shutdown so that edits made while it
+/// was running govern teardown; callers keep a start-time snapshot to
+/// fall back on if this read fails.
+pub fn shutdown_policies_from_disk() -> Result<ShutdownPolicies> {
+    load().map(|config| config.shutdown_policies())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

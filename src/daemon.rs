@@ -163,21 +163,27 @@ fn start_background() -> Result<()> {
 /// arrives.
 ///
 /// Loads the user configuration for the shutdown policies and uses the
-/// real Secret Service session store.
+/// real Secret Service session store. The shutdown policies are
+/// re-read from disk at clean shutdown, so edits made while the daemon
+/// was running govern teardown (falling back to the start-time
+/// snapshot if that read fails).
 ///
 /// Returns cleanly after removing the socket file.
 pub fn run(gpg: Gpg) -> Result<()> {
     let config = crate::config::load()?;
-    run_with(
+    run_with_policies(
         &paths()?,
         gpg,
         Arc::new(crate::credential::SessionCredentialStore),
         config.shutdown_policies(),
+        crate::config::shutdown_policies_from_disk,
     )
 }
 
 /// The testable daemon entry point: explicit runtime paths, credential
-/// store and shutdown policies.
+/// store and shutdown policies. The supplied policies are fixed for
+/// the process lifetime (no config re-read); use [`run_with_policies`]
+/// to inject a refresh.
 ///
 /// Clean shutdown (a `shutdown` IPC request, SIGTERM, or SIGINT on a
 /// foreground daemon) removes the socket and then runs the configured
@@ -194,6 +200,23 @@ pub fn run_with(
     store: Arc<dyn CredentialStore>,
     policies: ShutdownPolicies,
 ) -> Result<()> {
+    run_with_policies(paths, gpg, store, policies, || Ok(policies))
+}
+
+/// [`run_with`] plus a shutdown-policy refresher, invoked at clean
+/// shutdown to obtain the current teardown policies. The start-time
+/// snapshot is kept as the fallback for a failed read (a policy
+/// enabled at startup is never silently weakened).
+pub fn run_with_policies<F>(
+    paths: &Paths,
+    gpg: Gpg,
+    store: Arc<dyn CredentialStore>,
+    start_policies: ShutdownPolicies,
+    refresh_policies: F,
+) -> Result<()>
+where
+    F: Fn() -> Result<ShutdownPolicies>,
+{
     let listener = bind(paths)?;
     let services = Arc::new(Services { gpg, store });
     let pair: Pair = Arc::new((
@@ -230,7 +253,7 @@ pub fn run_with(
 
     // Synchronous cleanup while the process still exists: the policies
     // run after the scheduler stops and before the socket disappears.
-    shutdown_cleanup(&services, &policies, &pair);
+    shutdown_cleanup(&services, &start_policies, &refresh_policies, &pair);
     let _ = fs::remove_file(&paths.sock);
     Ok(())
 }
@@ -238,11 +261,14 @@ pub fn run_with(
 /// Apply the configured shutdown policies. `keyhold off` never reaches
 /// this: only clean daemon shutdown does. Failures are reported, never
 /// fatal, and never include secret material.
-fn shutdown_cleanup(
+fn shutdown_cleanup<F>(
     services: &Services,
-    policies: &ShutdownPolicies,
+    start: &ShutdownPolicies,
+    refresh: &F,
     pair: &Pair,
-) {
+) where
+    F: Fn() -> Result<ShutdownPolicies>,
+{
     // The most recently resolved signing keygrip. It is retained
     // (non-secret metadata) after `off`, `--for` expiry and hold
     // failures precisely so this cleanup can still target it: the
@@ -250,6 +276,20 @@ fn shutdown_cleanup(
     // daemon, or no hold ever resolved one) means no clearing — never
     // a guess.
     let keygrip = lock(pair).hold.keygrip.clone();
+    // Teardown follows the config as it stands at shutdown, so edits
+    // made while the daemon ran take effect. A read failure falls back
+    // to the start-time snapshot — a policy enabled at startup is never
+    // silently weakened by a later config problem — and is reported.
+    let policies = match refresh() {
+        Ok(policies) => policies,
+        Err(e) => {
+            eprintln!(
+                "keyhold: daemon: re-reading shutdown config failed \
+                 ({e}); using start-time shutdown policies"
+            );
+            *start
+        }
+    };
     if policies.clear_secret
         && let Err(e) = services.store.clear_all()
     {

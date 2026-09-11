@@ -1192,6 +1192,89 @@ fn lock_key_on_daemon_stop_clears_the_active_keygrip() {
 }
 
 #[test]
+fn daemon_stop_uses_the_shutdown_config_edited_while_running() {
+    let env = TestEnv::new();
+    env.rich_gpg();
+    // Both policies off at daemon start.
+    write_config(&env, "");
+    env.succeed(&["on", "--for", "1h"]);
+    env.succeed(&["off"]);
+
+    // Enabled while the daemon is still alive: the current config must
+    // govern teardown, and the retained keygrip is still known.
+    write_config(&env, "lock_key_on_daemon_stop = true\n");
+    env.succeed(&["daemon", "--stop"]);
+    assert!(
+        common::wait_until(5 * SECS, || {
+            env.ca_log().contains(
+                "CLEAR_PASSPHRASE --mode=normal \
+                 F097020B875D80D64C742456496ECA8F47CED17F",
+            )
+        }),
+        "edited-in lock policy did not clear the retained key: {}",
+        env.ca_log()
+    );
+    assert_eq!(
+        env.ca_log()
+            .lines()
+            .filter(|l| l.starts_with("CLEAR_PASSPHRASE"))
+            .count(),
+        1,
+        "{}",
+        env.ca_log()
+    );
+}
+
+#[test]
+fn daemon_stop_uses_a_shutdown_config_disabled_while_running() {
+    let env = TestEnv::new();
+    env.rich_gpg();
+    write_config(&env, "lock_key_on_daemon_stop = true\n");
+    env.succeed(&["on", "--for", "1h"]);
+    env.succeed(&["off"]);
+
+    // The user disables the policy while the daemon is alive: a clean
+    // read at shutdown takes the current (disabled) value.
+    write_config(&env, "");
+    env.succeed(&["daemon", "--stop"]);
+    assert!(
+        common::wait_until(5 * SECS, || !env.sock().exists()),
+        "socket not removed"
+    );
+    assert!(
+        !env.ca_log().contains("CLEAR_PASSPHRASE"),
+        "disabled policy still cleared: {}",
+        env.ca_log()
+    );
+}
+
+#[test]
+fn daemon_stop_with_unreadable_config_falls_back_to_start_policies() {
+    let env = TestEnv::new();
+    env.rich_gpg();
+    write_config(&env, "lock_key_on_daemon_stop = true\n");
+    env.succeed(&["on", "--for", "1h"]);
+    env.succeed(&["off"]);
+
+    // Malformed config at shutdown: the read fails, but a policy
+    // enabled at startup is never silently weakened, and the socket is
+    // still removed.
+    write_config(&env, "this is not valid toml [[[ not even close\n");
+    env.succeed(&["daemon", "--stop"]);
+    assert!(
+        common::wait_until(5 * SECS, || {
+            !env.sock().exists()
+                && env.ca_log().contains(
+                    "CLEAR_PASSPHRASE --mode=normal \
+                     F097020B875D80D64C742456496ECA8F47CED17F",
+                )
+        }),
+        "fallback cleanup missing: {}",
+        env.ca_log()
+    );
+}
+
+#[test]
 fn daemon_stop_without_policies_clears_nothing() {
     let env = TestEnv::new();
     env.rich_gpg();

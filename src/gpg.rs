@@ -282,8 +282,8 @@ impl Gpg {
     }
 
     /// Return a copy with a different execution bound for unattended
-    /// operations (test injection point; production always uses
-    /// [`UNATTENDED_TIMEOUT`]).
+    /// operations (test injection point; production always uses the
+    /// `UNATTENDED_TIMEOUT` default).
     pub fn with_unattended_timeout(mut self, timeout: Duration) -> Self {
         self.unattended_timeout = timeout;
         self

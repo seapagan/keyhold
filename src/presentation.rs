@@ -179,7 +179,7 @@ pub fn status_stopped() {
 
 /// Print the aligned two-column status snapshot for a running daemon.
 ///
-/// Row selection lives in [`status_rows`]; see its documentation for
+/// Row selection lives in `status_rows`; see its documentation for
 /// which rows appear in which state.
 pub fn print_status(
     data: &StatusData,

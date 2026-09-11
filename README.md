@@ -122,14 +122,22 @@ Keyhold status
 
 Daemon       running
 Hold         off
+Key          default
+Key state    unlocked
+Credential   not stored
 ```
 
 `Key state` and `Credential` answer the two questions that matter at a
 glance: can GPG sign with this key *right now*, and could keyhold recover
-it when GnuPG drops the cache? `Max expiry` shows the honest hard-max
-countdown when keyhold knows the cache entry's age (`unknown` otherwise,
-for example when the key was already cached before activation), and reads
-`(auto-renew)` while a session credential is backing the hold.
+it when GnuPG drops the cache? They stay visible after `off` while the
+daemon still knows the most recently resolved key — the hold being off
+does not itself clear the GPG cache or delete a session credential — and
+disappear only when there is no resolved key left to query. `Max expiry`
+shows the honest hard-max countdown when keyhold knows the cache entry's
+age (`unknown` otherwise, for example when the key was already cached
+before activation), and reads `(auto-renew)` while a session credential is
+backing the hold; the timing rows (`Interval`, `Remaining`, `Last ping`,
+`Next ping`) appear only while a hold is actually on.
 
 ### What `on` does
 

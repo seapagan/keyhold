@@ -230,11 +230,10 @@ fn status() -> Result<()> {
     }
 }
 
-/// The live `Key state` value for an active hold, when one is resolvable.
+/// The live `Key state` value for the resolved key, when one is
+/// resolvable (an active hold, or the retained key of a hold that has
+/// since been turned off or expired).
 fn key_state_row(data: &StatusData, gpg: Option<&Gpg>) -> Option<String> {
-    if !data.hold_on {
-        return None;
-    }
     let keygrip = data.keygrip.as_deref()?;
     let gpg = gpg?;
     let state = gpg.key_state(keygrip).ok()?;
@@ -251,13 +250,12 @@ fn key_state_row(data: &StatusData, gpg: Option<&Gpg>) -> Option<String> {
     })
 }
 
-/// The `Credential` row value for an active hold: whether keyhold could
-/// recover the key when GnuPG drops the cache. Unavailability of the
-/// Secret Service degrades to `unavailable` rather than failing status.
+/// The `Credential` row value for the resolved key: whether keyhold
+/// could recover the key when GPG drops the cache. Queried live for
+/// the retained key even after the hold is off. Unavailability of the
+/// Secret Service degrades to `unavailable` rather than failing
+/// status.
 fn credential_row(data: &StatusData) -> Option<String> {
-    if !data.hold_on {
-        return None;
-    }
     let keygrip = data.keygrip.as_deref()?;
     match data.credential_mode {
         CredentialMode::NotNeeded => Some("not needed".into()),
@@ -268,6 +266,8 @@ fn credential_row(data: &StatusData) -> Option<String> {
                 Err(_) => Some("unavailable".into()),
             }
         }
+        // An off hold resets its mode; the live store decides whether
+        // a credential still exists for the retained key.
         CredentialMode::None => {
             match SessionCredentialStore.contains(keygrip) {
                 Ok(true) => Some("session stored (not in use)".into()),

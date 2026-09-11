@@ -179,11 +179,8 @@ pub fn status_stopped() {
 
 /// Print the aligned two-column status snapshot for a running daemon.
 ///
-/// Only rows meaningful for the current state appear: key, timing and
-/// ping rows require an active hold, and absent display timestamps (for
-/// example an unrepresentable far-future next ping) omit their row.
-/// `key_state` and `credential` carry the live values the caller
-/// queried at command time (`None` omits the row).
+/// Row selection lives in [`status_rows`]; see its documentation for
+/// which rows appear in which state.
 pub fn print_status(
     data: &StatusData,
     key_state: Option<String>,
@@ -191,16 +188,52 @@ pub fn print_status(
 ) {
     println!("{}", "Keyhold status".bold());
     println!();
-    row("Daemon", "running".green());
-    row(
-        "Hold",
-        if data.hold_on {
-            "on".green()
+    for r in status_rows(data, key_state, credential) {
+        row(r.label, r.value);
+    }
+}
+
+/// One rendered status row.
+#[derive(Debug)]
+struct Row {
+    label: &'static str,
+    value: String,
+}
+
+/// The status rows for one snapshot, heading excluded.
+///
+/// Only rows meaningful for the current state appear:
+///
+/// * the key rows (`Key`, `Key state`, `Credential`) need an active
+///   hold **or** retained resolved-key metadata — a hold being `off`
+///   does not make the key's cache state or the session credential
+///   disappear, so their live values stay visible while there is a
+///   resolved key to query (`Key state`/`Credential` remain absent
+///   when the caller could not resolve them);
+/// * hold timing and cache-countdown rows (`GPG max TTL`, `Max
+///   expiry`, `Interval`, `Remaining`, `Last ping`, `Next ping`)
+///   require an active hold and are never fabricated from stale
+///   metadata;
+/// * `Error` shows the retained last failure either way.
+fn status_rows(
+    data: &StatusData,
+    key_state: Option<String>,
+    credential: Option<String>,
+) -> Vec<Row> {
+    let mut rows = Vec::new();
+    rows.push(Row {
+        label: "Daemon",
+        value: "running".green().to_string(),
+    });
+    rows.push(Row {
+        label: "Hold",
+        value: if data.hold_on {
+            "on".green().to_string()
         } else {
-            "off".yellow()
+            "off".yellow().to_string()
         },
-    );
-    if data.hold_on {
+    });
+    if data.hold_on || data.fingerprint.is_some() {
         let key = data.key.clone().unwrap_or_else(|| "default".into());
         // Git-selected keys carry a dim suffix; layout is unaffected
         // because the value column is last.
@@ -210,15 +243,29 @@ pub fn print_status(
             }
             _ => key.cyan().to_string(),
         };
-        row("Key", value);
+        rows.push(Row {
+            label: "Key",
+            value,
+        });
         if let Some(state) = key_state {
-            row("Key state", state);
+            rows.push(Row {
+                label: "Key state",
+                value: state,
+            });
         }
         if let Some(credential) = credential {
-            row("Credential", credential);
+            rows.push(Row {
+                label: "Credential",
+                value: credential,
+            });
         }
+    }
+    if data.hold_on {
         if let Some(ms) = data.max_cache_ttl_ms {
-            row("GPG max TTL", interval(ms));
+            rows.push(Row {
+                label: "GPG max TTL",
+                value: interval(ms).to_string(),
+            });
         }
         match data.max_expires_at_ms {
             // A countdown is only honest when keyhold knows the epoch;
@@ -236,35 +283,52 @@ pub fn print_status(
                         ""
                     },
                 );
-                row("Max expiry", value);
+                rows.push(Row {
+                    label: "Max expiry",
+                    value,
+                });
             }
-            _ if data.max_cache_ttl_ms.is_some() => {
-                row("Max expiry", "unknown".dim());
-            }
+            _ if data.max_cache_ttl_ms.is_some() => rows.push(Row {
+                label: "Max expiry",
+                value: "unknown".dim().to_string(),
+            }),
             _ => {}
         }
-        row("Interval", interval(data.interval_ms));
+        rows.push(Row {
+            label: "Interval",
+            value: interval(data.interval_ms).to_string(),
+        });
         match data.remaining_ms {
-            Some(ms) => row("Remaining", remaining(ms)),
-            None => row("Remaining", "no deadline".dim()),
+            Some(ms) => rows.push(Row {
+                label: "Remaining",
+                value: remaining(ms).to_string(),
+            }),
+            None => rows.push(Row {
+                label: "Remaining",
+                value: "no deadline".dim().to_string(),
+            }),
         }
         let now = epoch_ms();
         if let Some(ms) = data.last_ping_ms {
-            row(
-                "Last ping",
-                format!("{} ago", ping_delta(now.saturating_sub(ms))),
-            );
+            rows.push(Row {
+                label: "Last ping",
+                value: format!("{} ago", ping_delta(now.saturating_sub(ms))),
+            });
         }
         if let Some(ms) = data.next_ping_ms {
-            row(
-                "Next ping",
-                format!("in {}", ping_delta(ms.saturating_sub(now))),
-            );
+            rows.push(Row {
+                label: "Next ping",
+                value: format!("in {}", ping_delta(ms.saturating_sub(now))),
+            });
         }
     }
     if let Some(err) = &data.last_error {
-        row("Error", err.red());
+        rows.push(Row {
+            label: "Error",
+            value: err.red().to_string(),
+        });
     }
+    rows
 }
 
 #[cfg(test)]
@@ -279,6 +343,94 @@ mod tests {
                 .iter()
                 .all(|label| label.len() + LABEL_GAP <= label_width())
         );
+    }
+
+    /// A snapshot with only the fields `status_rows` branches on.
+    fn snapshot(
+        hold_on: bool,
+        fingerprint: Option<&str>,
+        keygrip: Option<&str>,
+    ) -> StatusData {
+        StatusData {
+            hold_on,
+            key: None,
+            key_source: KeySource::Default,
+            interval_ms: 300_000,
+            remaining_ms: hold_on.then_some(600_000),
+            last_ping_ms: None,
+            next_ping_ms: None,
+            last_error: None,
+            fingerprint: fingerprint.map(str::to_string),
+            keygrip: keygrip.map(str::to_string),
+            credential_mode: crate::state::CredentialMode::None,
+            default_cache_ttl_ms: None,
+            max_cache_ttl_ms: None,
+            max_expires_at_ms: None,
+        }
+    }
+
+    fn labels(rows: &[Row]) -> Vec<&'static str> {
+        rows.iter().map(|r| r.label).collect()
+    }
+
+    #[test]
+    fn off_hold_with_a_retained_key_still_shows_live_state_rows() {
+        let data = snapshot(false, Some("FPR"), Some("GRIP"));
+        let rows = status_rows(
+            &data,
+            Some("unlocked".into()),
+            Some("session stored (not in use)".into()),
+        );
+        assert_eq!(
+            labels(&rows),
+            vec!["Daemon", "Hold", "Key", "Key state", "Credential"]
+        );
+        // Hold timing rows stay absent: the hold is genuinely off.
+        for absent in ["Interval", "Remaining", "Next ping", "Last ping"] {
+            assert!(!labels(&rows).contains(&absent), "{absent} shown");
+        }
+    }
+
+    #[test]
+    fn off_hold_without_a_resolved_key_shows_no_key_rows() {
+        let data = snapshot(false, None, None);
+        // Unresolvable live values must not fabricate rows either.
+        let rows = status_rows(&data, None, None);
+        assert_eq!(labels(&rows), vec!["Daemon", "Hold"]);
+    }
+
+    #[test]
+    fn off_hold_with_a_retained_key_never_fabricates_live_rows() {
+        let data = snapshot(false, Some("FPR"), None);
+        // Resolved key but no keygrip (no live state queryable): the
+        // Key row shows, the live rows do not.
+        let rows = status_rows(&data, None, None);
+        assert_eq!(labels(&rows), vec!["Daemon", "Hold", "Key"]);
+    }
+
+    #[test]
+    fn active_hold_shows_the_full_row_set() {
+        let data = snapshot(true, Some("FPR"), Some("GRIP"));
+        let rows = status_rows(&data, Some("locked".into()), None);
+        assert_eq!(
+            labels(&rows),
+            vec![
+                "Daemon",
+                "Hold",
+                "Key",
+                "Key state",
+                "Interval",
+                "Remaining"
+            ]
+        );
+    }
+
+    #[test]
+    fn retained_error_row_appears_while_off() {
+        let mut data = snapshot(false, None, None);
+        data.last_error = Some("the key expired".into());
+        let rows = status_rows(&data, None, None);
+        assert_eq!(labels(&rows), vec!["Daemon", "Hold", "Error"]);
     }
 
     #[test]

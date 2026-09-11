@@ -1249,3 +1249,64 @@ fn cleanup_failure_does_not_break_shutdown() {
         "socket not removed despite cleanup failure"
     );
 }
+
+/// `keyhold off` ends the hold, not the retained security state: with
+/// a resolved key the live `Key state`/`Credential` rows stay visible
+/// while hold timing rows disappear.
+#[test]
+fn status_after_off_reports_the_retained_key_state() {
+    let env = TestEnv::new();
+    env.rich_gpg();
+    env.set_key_cached(true);
+    env.succeed(&["on", "--for", "10s"]);
+    env.succeed(&["off"]);
+
+    let text = env.status();
+    assert!(text.contains("Hold         off"), "{text}");
+    assert!(text.contains("Key          default"), "{text}");
+    assert!(text.contains("Key state    unlocked"), "{text}");
+    // No Secret Service in the test environment: the truthful live
+    // value for the retained key.
+    assert!(text.contains("Credential   unavailable"), "{text}");
+    for absent in ["Interval", "Remaining", "Next ping", "Last ping"] {
+        assert!(!text.contains(absent), "{absent} shown while off:\n{text}");
+    }
+
+    // The row is a live snapshot: an external cache clear flips it.
+    env.set_key_cached(false);
+    let text = env.status();
+    assert!(text.contains("Key state    locked"), "{text}");
+}
+
+/// The same retained rows after a timed hold expires by itself.
+#[test]
+fn status_after_expiry_reports_the_retained_key_state() {
+    let env = TestEnv::new();
+    env.rich_gpg();
+    env.set_key_cached(true);
+    env.succeed(&["on", "--for", "500ms", "--interval", "100ms"]);
+    assert!(
+        wait_for_status(&env, "Hold         off", 5 * SECS),
+        "hold did not expire: {}",
+        env.status()
+    );
+    let text = env.status();
+    assert!(text.contains("Key state    unlocked"), "{text}");
+    assert!(text.contains("Credential   unavailable"), "{text}");
+    assert!(!text.contains("Next ping"), "{text}");
+}
+
+/// Without a previously resolved key there is nothing truthful to
+/// show: no key rows are fabricated while the hold is off.
+#[test]
+fn status_after_off_without_a_resolved_key_shows_no_key_rows() {
+    let env = TestEnv::new();
+    // No `rich` marker: activation cannot resolve a signing target.
+    env.succeed(&["on", "--for", "10s"]);
+    env.succeed(&["off"]);
+    let text = env.status();
+    assert_eq!(
+        text,
+        "Keyhold status\n\nDaemon       running\nHold         off\n"
+    );
+}

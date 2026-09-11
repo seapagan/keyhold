@@ -1,2 +1,0 @@
-gpg: signing failed: Operation cancelled
-gpg: signing failed: Operation cancelled

@@ -12,9 +12,14 @@ that normal idle timer for exactly as long as you allow it. Turn it off (or let
 a `--for` deadline lapse) and normal GnuPG cache expiry resumes. It is equally
 useful during attended development when repeatedly unlocking the same key is
 simply inconvenient.
-
-`keyhold` never sees, stores, or handles your passphrase. GnuPG and pinentry
-remain entirely responsible for unlocking the key.
+`keyhold` has two operating modes. In the default mode keyhold never sees,
+stores, or handles your passphrase — GnuPG and pinentry remain entirely
+responsible for unlocking the key. The explicitly opted-in session
+credential mode (`keyhold on --store-passphrase`) additionally stores the
+passphrase in the Linux Secret Service **session** collection (erased at
+logout) so keyhold can recreate the selected key's cache entry before
+GnuPG's absolute `max-cache-ttl` expires; see
+[Session credential mode](#session-credential-mode-optional).
 
 ## Requirements
 
@@ -22,6 +27,8 @@ remain entirely responsible for unlocking the key.
 - GnuPG 2.2+ (tested with 2.4)
 - A pinentry configured for your terminal (only needed to unlock the key)
 - `$XDG_RUNTIME_DIR` set (any modern systemd distribution does this)
+- A Secret Service keyring (GNOME Keyring/KWallet) — only for the optional
+  session credential mode
 
 ## Installation
 
@@ -63,8 +70,10 @@ keyhold on --for 4h
 keyhold on --key <fingerprint-or-key-id>
 keyhold on --key <key-id> --for 2h
 keyhold on --interval 5m      # custom ping interval
+keyhold on -s --for 4h        # session credential mode (see below)
 keyhold off                   # stop holding; cache expires naturally
 keyhold status                # what is happening right now
+keyhold credential clear      # erase stored session credentials
 keyhold daemon -b             # start the daemon detached; no hold, no GPG use
 keyhold daemon --stop         # shut the daemon down cleanly
 ```
@@ -81,8 +90,8 @@ A typical session:
 $ keyhold status
 Keyhold status
 
-Daemon     stopped
-Hold       off
+Daemon       stopped
+Hold         off
 
 $ keyhold on --for 4h
 # Pinentry appears here if the key is not cached yet.
@@ -91,13 +100,17 @@ Keyhold enabled for 4h.
 $ keyhold status
 Keyhold status
 
-Daemon     running
-Hold       on
-Key        default
-Interval   5m
-Remaining  3h 59m
-Last ping  3s ago
-Next ping  in 4m 57s
+Daemon       running
+Hold         on
+Key          default
+Key state    unlocked
+Credential   not stored
+GPG max TTL  2h
+Max expiry   in 2h
+Interval     5m
+Remaining    3h 59m
+Last ping    3s ago
+Next ping    in 4m 57s
 
 # Close the terminal and walk away; the daemon keeps the key cached.
 
@@ -107,9 +120,16 @@ Keyhold disabled.
 $ keyhold status
 Keyhold status
 
-Daemon     running
-Hold       off
+Daemon       running
+Hold         off
 ```
+
+`Key state` and `Credential` answer the two questions that matter at a
+glance: can GPG sign with this key *right now*, and could keyhold recover
+it when GnuPG drops the cache? `Max expiry` shows the honest hard-max
+countdown when keyhold knows the cache entry's age (`unknown` otherwise,
+for example when the key was already cached before activation), and reads
+`(auto-renew)` while a session credential is backing the hold.
 
 ### What `on` does
 
@@ -174,20 +194,30 @@ Key        ABCDEF0123456789 (git)
 ## Configuration
 
 Optional file at `$XDG_CONFIG_HOME/keyhold/config.toml`
-(`~/.config/keyhold/config.toml` by default):
+(~/.config/keyhold/config.toml by default):
 
 ```toml
 key = "ABCD1234EFGH5678"   # optional static key; omit for GPG's default key
 git_key = true             # optional; use Git's user.signingkey by default
 interval = "5m"            # optional; default 5m
+store_passphrase = false   # optional; default false — opt in to session
+                           # credential mode for `keyhold on` (see below)
+clear_secret_on_daemon_stop = false  # optional; delete keyhold's Secret
+                                     # Service session items on clean daemon
+                                     # shutdown
+lock_key_on_daemon_stop = false      # optional; clear the active key's GPG
+                                     # cache entry on clean daemon shutdown
 ```
 
 Setting both `key` and `git_key = true` is rejected as an invalid
 configuration: choose one default key-selection strategy.
 
 Precedence: CLI option > config file > built-in default. No config file is
-required. Unknown keys, non-positive intervals, and conflicting
-key-selection settings are rejected with an error naming the file.
+required. In particular `--store-passphrase` / `-s` beats
+`store_passphrase = false`, and `--no-store-passphrase` beats
+`store_passphrase = true`; storage is never the implicit default. Unknown
+keys, non-positive intervals, and conflicting key-selection settings are
+rejected with an error naming the file.
 
 ## How the GnuPG TTL interaction works
 
@@ -196,8 +226,14 @@ key-selection settings are rejected with an error naming the file.
 - `default-cache-ttl` is the normal idle timeout that each `keyhold` ping
   refreshes. **Keep the ping interval shorter than this value.**
 - `max-cache-ttl` is an absolute cap GnuPG enforces regardless of activity.
-  Configure it long enough for your longest intended hold, or the cache will
-  expire mid-hold (the daemon will notice and stop; see below).
+
+In ordinary mode, keyhold warns at activation when the requested hold
+cannot be guaranteed under these values (a hold longer than
+`max-cache-ttl`, a pre-existing cache entry of unknown age, or an
+indefinite hold), and the daemon ends the hold when the cache finally
+disappears. To hold a key across `max-cache-ttl` boundaries **without
+changing your global GnuPG settings**, use session credential mode; see the
+next section.
 
 For example, with:
 
@@ -211,11 +247,68 @@ a key left alone expires after ten minutes of inactivity. With
 maintains the cached key for exactly those eight hours. When the hold ends,
 keyhold stops touching the key and normal `gpg-agent` idle expiry resumes
 from the final key use, so the key may stay cached for up to ten more
-minutes before expiring naturally.
+minutes before expiring naturally. The `max-cache-ttl 43200` setting does
+**not** stretch an 8-hour hold into a twelve-hour one — it is an
+independent absolute ceiling GnuPG enforces on the cache entry regardless
+of activity.
 
-The `max-cache-ttl 43200` setting does **not** stretch an 8-hour hold into a
-twelve-hour one — it is an independent absolute ceiling GnuPG enforces on
-the cache entry regardless of activity.
+## Session credential mode (optional)
+
+Ordinary mode cannot hold a key across GnuPG's absolute `max-cache-ttl`:
+GnuPG itself drops the cache entry no matter how often the key is used.
+Session credential mode opts into a larger security surface in exchange for
+holds that are not bounded by that ceiling:
+
+```sh
+keyhold on -s --for 4h        # or --store-passphrase
+keyhold credential clear
+```
+
+or persistently in the configuration file:
+
+```toml
+store_passphrase = true
+```
+
+(`keyhold on --no-store-passphrase` disables it again for one invocation.)
+
+How it works:
+
+- You are prompted once (normal terminal prompt, not pinentry). The
+  passphrase is validated by *clearing only the selected key's* GPG cache
+  entry and unlocking it again with the exact key — establishing a cache
+  epoch keyhold owns — and is then stored in the Linux Secret Service
+  **`session` collection**, which the desktop session destroys at logout.
+- There is no fallback to the `login`/`default` collection, no file, no
+  environment variable and no daemon IPC copy: the passphrase reaches
+  `gpg` only through child stdin, wrapped in zeroized memory otherwise.
+- The daemon proactively recreates the selected key's cache entry shortly
+  before each `max-cache-ttl` boundary (a 2h maximum renews at ~1h59m),
+  and recovers once from unexpected cache loss (agent restart, another
+  program clearing the entry). If the session credential disappears — for
+  example after `keyhold credential clear` — the hold stops with a clear
+  error at the next renewal instead of prompting unattended.
+- The credential lives for the **login session**, not for one hold:
+  `keyhold off`, hold expiry and daemon restarts leave it in place, and a
+  later `keyhold on -s` reuses it without another prompt. `keyhold
+  credential clear` removes every keyhold credential from the session
+  collection (it never touches the GPG cache or an active hold).
+- Your global GnuPG configuration is never modified: the key's own cache
+  entry is cleared and recreated keygrip-specifically, `gpg-agent` is
+  never restarted, and unrelated keys are never flushed.
+- External programs may also clear or recreate the GPG cache entry; the
+  `Max expiry` countdown keyhold displays is then approximate until the
+  next renewal re-establishes it. Recovery makes this cosmetic rather
+  than fatal.
+
+The security trade-off is real: in ordinary mode keyhold never sees the
+passphrase at all, while in session mode the passphrase additionally
+exists in the Secret Service session collection for the rest of the login
+session, where same-user malware running inside an unlocked desktop
+session may be able to read it depending on the keyring's policy. This is
+the price of unattended signing reliability; see
+[SECURITY.md](SECURITY.md) for the full model.
+
 
 ## Daemon model
 
@@ -238,11 +331,18 @@ the cache entry regardless of activity.
   never touches GPG; if the daemon is already running it reports that and
   succeeds.
 - `keyhold daemon --stop` shuts the daemon down cleanly and removes its
-  socket.
+  socket. If (and only if) `clear_secret_on_daemon_stop = true` and/or
+  `lock_key_on_daemon_stop = true` is configured, the same clean shutdown
+  — including SIGTERM and Ctrl-C on a foreground daemon — also runs those
+  cleanup policies synchronously before the process exits: deleting
+  keyhold's Secret Service session items and/or clearing the active
+  signing key's own GPG cache entry. `keyhold off` never runs them, and
+  no cleanup is guaranteed after SIGKILL, a crash or power loss (the
+  session collection still disappears at logout).
 - The daemon keeps no state across restarts: a fresh daemon starts with the
   hold off, and stale socket files are recovered automatically.
-- IPC is a small newline-framed JSON protocol on the socket; nothing is
-  exposed over the network.
+- IPC is a small newline-framed JSON protocol on the socket carrying
+  metadata only (never a passphrase); nothing is exposed over the network.
 
 ## If a background ping fails
 
@@ -251,30 +351,44 @@ disappeared (for example the `max-cache-ttl` ceiling hit, or the agent was
 restarted), the ping fails immediately instead of opening a pinentry dialog
 nobody is watching. The daemon then:
 
-1. disables the hold,
-2. stays running,
-3. records the failure, shown by `keyhold status`:
+1. disables the hold — except in session credential mode, which first
+   attempts exactly one recovery from the stored credential (retrieve,
+   keygrip-scoped clear, exact-key loopback unlock) and keeps the hold if
+   it succeeds;
+2. stays running;
+3. records any failure, shown by `keyhold status`:
 
 ```text
 Keyhold status
 
-Daemon     running
-Hold       off
-Error      gpg keepalive failed: gpg: signing failed: Operation cancelled (exit status 2)
+Daemon       running
+Hold         off
+Error        gpg keepalive failed: gpg: signing failed: Operation cancelled (exit status 2)
 ```
 
-Run `keyhold on` again to unlock via the normal pinentry flow and resume.
+Run `keyhold on` again to unlock via the normal pinentry flow and resume
+(in session mode, `keyhold on -s` reuses the stored credential and does
+not re-prompt).
 
 ## Security notes
 
-- The passphrase never passes through `keyhold`: no loopback pinentry, no
-  passphrase capture, storage, or transmission.
+- **Ordinary mode (the default)**: the passphrase never passes through
+  keyhold — no loopback pinentry, no capture, storage, or transmission.
+- **Session credential mode (opt-in)**: keyhold receives the passphrase
+  once, validates it, and stores it only in the Secret Service `session`
+  collection; it never crosses keyhold's IPC socket, never appears in
+  argv/environment/files/logs, and is zeroized after each use. This
+  expands the same-user attack surface for the rest of the login
+  session; see [SECURITY.md](SECURITY.md).
 - Foreground unlock uses your normal pinentry; background pings are
   non-interactive by construction.
 - The keepalive operation is a detached signature of empty input written to
   `/dev/null` — no files are left behind and no artefacts are kept.
 - The socket lives inside `$XDG_RUNTIME_DIR` (0700, per-user) and is itself
   mode 0700.
+- GnuPG configuration files are never modified, `gpg-agent` is never
+  restarted, and cache clearing is always scoped to the selected key's
+  own keygrip.
 
 ## Exit codes
 
@@ -311,6 +425,10 @@ keyhold on --for 5m --interval 10s
 keyhold status
 ```
 
+The optional Secret Service paths are the one thing the automated suite
+cannot fake in-process; exercise them manually against your real session
+collection with a throwaway key and `keyhold credential clear` afterwards.
+
 Formatting uses a 79-column width (`.rustfmt.toml`); please run `cargo fmt`
 before submitting.
 
@@ -323,5 +441,10 @@ before submitting.
   successfully. A `SIGKILL` still abandons the socket file, but the next
   start recovers it automatically.
 - One hold at a time: `on` replaces any existing hold.
-- `keyhold` cannot extend a hold past GnuPG's `max-cache-ttl` ceiling; GnuPG
-  itself imposes that limit.
+- In ordinary mode `keyhold` cannot extend a hold past GnuPG's
+  `max-cache-ttl` ceiling; GnuPG itself imposes that limit. Session
+  credential mode works around it by recreating the selected key's cache
+  entry without touching global GnuPG settings.
+- The `Max expiry` countdown assumes no other program recreates the GPG
+  cache entry behind keyhold's back; if one does, the display becomes
+  approximate until the next renewal or recovery.

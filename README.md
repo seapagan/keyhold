@@ -205,8 +205,10 @@ store_passphrase = false   # optional; default false — opt in to session
 clear_secret_on_daemon_stop = false  # optional; delete keyhold's Secret
                                      # Service session items on clean daemon
                                      # shutdown
-lock_key_on_daemon_stop = false      # optional; clear the active key's GPG
-                                     # cache entry on clean daemon shutdown
+lock_key_on_daemon_stop = false      # optional; clear the last resolved
+                                     # key's GPG cache entry on clean daemon
+                                     # shutdown (still works after `off` or
+                                     # hold expiry)
 ```
 
 Setting both `key` and `git_key = true` is rejected as an invalid

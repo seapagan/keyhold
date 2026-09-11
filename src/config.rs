@@ -29,8 +29,9 @@ pub struct Config {
     /// Delete keyhold's Secret Service session items on clean daemon
     /// shutdown.
     pub clear_secret_on_daemon_stop: bool,
-    /// Clear the active signing key's GPG cache entry on clean daemon
-    /// shutdown.
+    /// Clear the most recently resolved signing key's GPG cache entry
+    /// on clean daemon shutdown (the resolved key is retained across
+    /// `off` and expiry so teardown can still target it).
     pub lock_key_on_daemon_stop: bool,
 }
 
@@ -59,16 +60,19 @@ impl Config {
 }
 
 /// Clean-daemon-shutdown cleanup policies. Independent booleans:
-/// deleting the Secret Service session items and clearing the active
-/// key's GPG cache entry are separate decisions. Neither runs on
-/// `keyhold off`; only on a clean daemon stop (`keyhold daemon --stop`,
-/// SIGTERM, or Ctrl-C on a foreground daemon).
+/// deleting the Secret Service session items and clearing the most
+/// recently resolved signing key's GPG cache entry are separate
+/// decisions. Neither runs on `keyhold off`; only on a clean daemon
+/// stop (`keyhold daemon --stop`, SIGTERM, or Ctrl-C on a foreground
+/// daemon). The resolved key is retained across `off` and expiry
+/// precisely so this teardown can still target it.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ShutdownPolicies {
     /// Remove keyhold's items from the Secret Service session collection.
     pub clear_secret: bool,
-    /// Clear only the active signing key's normal GPG cache entry
-    /// (keygrip-scoped; never an agent restart or global flush).
+    /// Clear only the most recently resolved signing key's normal GPG
+    /// cache entry (keygrip-scoped; never an agent restart or global
+    /// flush).
     pub lock_key: bool,
 }
 

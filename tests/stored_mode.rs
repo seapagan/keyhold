@@ -8,8 +8,8 @@ mod common;
 use std::{path::Path, sync::Arc, thread, time::Duration};
 
 use common::{
-    DaemonTools, FakeStore, SUB2_FPR, SUB2_GRIP, ipc_at, spawn_daemon,
-    status_at, stored_activation, wait_until,
+    DaemonTools, FakeStore, SUB_FPR, SUB_GRIP, SUB2_FPR, SUB2_GRIP, ipc_at,
+    spawn_daemon, status_at, stored_activation, wait_until,
 };
 use keyhold::{
     activation,
@@ -800,6 +800,170 @@ fn default_shutdown_policies_touch_nothing() {
             .any(|op| op == "clear_all"),
         "secret cleared without the policy: {:?}",
         running.store.operations()
+    );
+}
+
+/// `on → off → daemon --stop` with the lock policy still clears the
+/// retained key's cache entry: `off` stops holding, but shutdown
+/// teardown targets the key that was last resolved.
+#[test]
+fn lock_on_daemon_stop_works_after_off() {
+    let running = Running::start(ShutdownPolicies {
+        clear_secret: false,
+        lock_key: true,
+    });
+    running.hold(60_000, 600);
+    let clears_before = running.tools.clears();
+
+    assert_eq!(
+        ipc_at(&running.sock, "{\"cmd\":\"off\"}").unwrap()["ok"],
+        true
+    );
+    let status = running.status();
+    assert_eq!(status["hold_on"], false, "{status}");
+
+    assert_eq!(
+        ipc_at(&running.sock, "{\"cmd\":\"shutdown\"}").unwrap()["ok"],
+        true
+    );
+    assert!(
+        wait_until(5 * SECS, || running.tools.clears() == clears_before + 1),
+        "the retained key was not locked on shutdown: {}",
+        running.tools.ca_log()
+    );
+    let log = running.tools.ca_log();
+    let last_clear = log
+        .lines()
+        .rev()
+        .find(|l| l.starts_with("CLEAR_PASSPHRASE"))
+        .expect("a cleanup clear");
+    assert_eq!(
+        last_clear,
+        &format!("CLEAR_PASSPHRASE --mode=normal {SUB2_GRIP} /bye"),
+        "wrong keygrip cleared: {}",
+        running.tools.ca_log()
+    );
+}
+
+/// The same after a timed hold expires by itself.
+#[test]
+fn lock_on_daemon_stop_works_after_expiry() {
+    let running = Running::start(ShutdownPolicies {
+        clear_secret: false,
+        lock_key: true,
+    });
+    // A stored hold that expires in 300ms (its activation did one
+    // clear; no renewal is scheduled within the hold's life).
+    running.tools.set_ttls(600, 600);
+    let prepared = stored_activation(
+        tools_gpg(&running),
+        &running.store,
+        None,
+        60_000,
+        None,
+    )
+    .unwrap();
+    let request = common::on_request(None, &prepared, 60_000, Some(300));
+    assert_eq!(ipc_at(&running.sock, &request).unwrap()["ok"], true);
+    assert!(
+        wait_until(5 * SECS, || running.status()["hold_on"] == false),
+        "hold did not expire: {}",
+        running.status()
+    );
+    let clears_before = running.tools.clears();
+
+    assert_eq!(
+        ipc_at(&running.sock, "{\"cmd\":\"shutdown\"}").unwrap()["ok"],
+        true
+    );
+    assert!(
+        wait_until(5 * SECS, || running.tools.clears() == clears_before + 1),
+        "the expired hold's key was not locked on shutdown: {}",
+        running.tools.ca_log()
+    );
+    let log = running.tools.ca_log();
+    let last_clear = log
+        .lines()
+        .rev()
+        .find(|l| l.starts_with("CLEAR_PASSPHRASE"))
+        .expect("a cleanup clear");
+    assert!(
+        last_clear.contains(SUB2_GRIP),
+        "wrong keygrip cleared: {}",
+        running.tools.ca_log()
+    );
+}
+
+/// Replacing a hold with another key makes the newest resolved key the
+/// shutdown target, cleared exactly once; the replaced key is
+/// untouched.
+#[test]
+fn lock_on_daemon_stop_targets_the_replacement_key() {
+    let running = Running::start(ShutdownPolicies {
+        clear_secret: false,
+        lock_key: true,
+    });
+    running.hold(60_000, 600);
+    let clears_before = running.tools.clears();
+
+    // A replacement hold resolving a different signing key (the older
+    // subkey), as `keyhold on --key <subkey>` would send.
+    let replacement = format!(
+        "{{\"cmd\":\"on\",\"key\":\"4E7D2CD7\",\
+         \"key_source\":\"explicit\",\"interval_ms\":60000,\
+         \"hold_ms\":null,\"activated_at_ms\":1700000000000,\
+         \"fingerprint\":\"{SUB_FPR}\",\"keygrip\":\"{SUB_GRIP}\",\
+         \"credential_mode\":\"session\",\
+         \"default_cache_ttl_ms\":600000,\"max_cache_ttl_ms\":600000,\
+         \"cache_started_at_ms\":1700000000000}}"
+    );
+    assert_eq!(ipc_at(&running.sock, &replacement).unwrap()["ok"], true);
+    assert_eq!(
+        ipc_at(&running.sock, "{\"cmd\":\"off\"}").unwrap()["ok"],
+        true
+    );
+
+    assert_eq!(
+        ipc_at(&running.sock, "{\"cmd\":\"shutdown\"}").unwrap()["ok"],
+        true
+    );
+    assert!(
+        wait_until(5 * SECS, || running.tools.clears() == clears_before + 1),
+        "expected exactly one shutdown clear: {}",
+        running.tools.ca_log()
+    );
+    let log = running.tools.ca_log();
+    let last_clear = log
+        .lines()
+        .rev()
+        .find(|l| l.starts_with("CLEAR_PASSPHRASE"))
+        .expect("a cleanup clear");
+    assert_eq!(
+        last_clear,
+        &format!("CLEAR_PASSPHRASE --mode=normal {SUB_GRIP} /bye"),
+        "wrong keygrip cleared: {}",
+        running.tools.ca_log()
+    );
+}
+
+/// A daemon that never resolved a key must not guess one: the lock
+/// policy does nothing without retained metadata.
+#[test]
+fn lock_on_daemon_stop_without_a_resolved_key_clears_nothing() {
+    let running = Running::start(ShutdownPolicies {
+        clear_secret: false,
+        lock_key: true,
+    });
+    assert_eq!(
+        ipc_at(&running.sock, "{\"cmd\":\"shutdown\"}").unwrap()["ok"],
+        true
+    );
+    assert!(wait_until(5 * SECS, || !running.sock.exists()));
+    assert_eq!(
+        running.tools.clears(),
+        0,
+        "a key was cleared without any resolved key: {}",
+        running.tools.ca_log()
     );
 }
 

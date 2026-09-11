@@ -303,7 +303,10 @@ impl Hold {
     }
 
     /// Disable the hold, leaving any last error intact for `status`.
-    /// All renewal/cache metadata dies with the hold.
+    /// Renewal/cache metadata dies with the hold, but the resolved
+    /// fingerprint/keygrip (non-secret) are retained: the cache entry
+    /// can outlive the hold, and daemon-shutdown cleanup may still
+    /// need to clear it.
     pub fn turn_off(&mut self) {
         self.enabled = false;
         self.deadline = None;

@@ -70,6 +70,10 @@ trade is unacceptable, keep using ordinary mode and raise GnuPG's
 - Shutdown cleanup (`clear_secret_on_daemon_stop`,
   `lock_key_on_daemon_stop`) runs only on clean daemon shutdown
   (`keyhold daemon --stop`, SIGTERM, or Ctrl-C on a foreground daemon).
+  The lock policy targets the most recently resolved signing keygrip —
+  non-secret metadata the daemon deliberately retains after `off`,
+  timed expiry or a hold failure, because the GPG cache entry can
+  outlive the hold. It never clears a key it never resolved.
   No cleanup is guaranteed after SIGKILL, a process crash or power loss;
   the session collection itself still disappears at logout.
 

@@ -182,10 +182,12 @@ pub fn run(gpg: Gpg) -> Result<()> {
 /// Clean shutdown (a `shutdown` IPC request, SIGTERM, or SIGINT on a
 /// foreground daemon) removes the socket and then runs the configured
 /// [`ShutdownPolicies`] synchronously: optionally delete keyhold's
-/// Secret Service session items, then optionally clear the active key's
-/// GPG cache entry. Cleanup failures are reported to stderr and never
-/// prevent the rest of shutdown; no guarantee exists for SIGKILL,
-/// crashes or power loss.
+/// Secret Service session items, then optionally clear the GPG cache
+/// entry of the most recently resolved signing key — metadata that is
+/// deliberately retained after `off`, `--for` expiry or a hold
+/// failure, because the cache entry can outlive the hold. Cleanup
+/// failures are reported to stderr and never prevent the rest of
+/// shutdown; no guarantee exists for SIGKILL, crashes or power loss.
 pub fn run_with(
     paths: &Paths,
     gpg: Gpg,
@@ -241,16 +243,13 @@ fn shutdown_cleanup(
     policies: &ShutdownPolicies,
     pair: &Pair,
 ) {
-    // The active hold's keygrip: the only cache entry the lock policy
-    // may clear. No resolved keygrip means no clearing — never a guess.
-    let keygrip = {
-        let shared = lock(pair);
-        shared
-            .hold
-            .enabled
-            .then(|| shared.hold.keygrip.clone())
-            .flatten()
-    };
+    // The most recently resolved signing keygrip. It is retained
+    // (non-secret metadata) after `off`, `--for` expiry and hold
+    // failures precisely so this cleanup can still target it: the
+    // cache entry outlives the hold. No resolved keygrip (a fresh
+    // daemon, or no hold ever resolved one) means no clearing — never
+    // a guess.
+    let keygrip = lock(pair).hold.keygrip.clone();
     if policies.clear_secret
         && let Err(e) = services.store.clear_all()
     {

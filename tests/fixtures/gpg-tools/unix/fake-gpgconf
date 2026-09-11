@@ -1,0 +1,18 @@
+#!/bin/sh
+# Static subprocess fixture for tests/gpg_tools.rs and tests/common/mod.rs.
+#
+# IMPORTANT: parallel tests must not generate, rewrite, or copy this
+# executable. Linux can return ETXTBSY when a forked child temporarily
+# inherits a writable descriptor for an executable. Mutable TTL and failure
+# state therefore lives under KEYHOLD_TEST_ROOT; this file remains immutable.
+
+: "${KEYHOLD_TEST_ROOT:?KEYHOLD_TEST_ROOT is required}"
+root=$KEYHOLD_TEST_ROOT
+
+if [ -e "$root/gpgconf-fail" ]; then
+  exit 1
+fi
+read def max < "$root/ttls"
+printf '%s\n' \
+  "default-cache-ttl:24:0:expire cached PINs after N seconds:3:3:N:$def::" \
+  "max-cache-ttl:24:2:set maximum PIN cache lifetime to N seconds:3:3:N:$max::"

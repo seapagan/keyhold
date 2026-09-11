@@ -1,9 +1,36 @@
-//! Subprocess-level integration tests for the GPG tool layer, using
-//! self-contained fake `gpg`/`gpgconf`/`gpg-connect-agent` scripts with
-//! their scratch directory baked in (no environment mutation, so the
-//! tests are parallel-safe even under plain `cargo test`).
+//! Subprocess-level integration tests for the GPG tool layer. These tests run
+//! real child processes against fake `gpg`, `gpgconf`, and
+//! `gpg-connect-agent` programs, while each [`Tools`] instance keeps all
+//! mutable fixture state in its own [`TempDir`]. The executable programs are
+//! immutable, checked-in POSIX fixtures under `tests/fixtures/gpg-tools/unix`.
+//!
+//! The fixtures must remain immutable for a non-obvious concurrency reason.
+//! In a multithreaded native Rust test process, one test thread can fork or
+//! spawn while another is creating or writing an executable. The child can
+//! transiently inherit the writable file descriptor before exec closes its
+//! `CLOEXEC` descriptors. Linux then refuses to execute that file with
+//! `ETXTBSY` (`Text file busy`). Separate temporary directories do not prevent
+//! this process-wide fork/file-descriptor race. This harness therefore does
+//! not generate, copy, rewrite, or chmod executables at runtime, and it does
+//! not mask the defect with retries, sleeps, or test serialization.
+//!
+//! Each [`Gpg`] instance supplies `KEYHOLD_TEST_ROOT` only to its own child
+//! processes. The value is non-secret fixture metadata naming that instance's
+//! scratch directory. Per-child injection avoids process-global environment
+//! mutation, which would create another race between parallel tests. The fake
+//! GPG still reads the expected passphrase from `TempDir/passphrase`, while
+//! the supplied passphrase reaches the child only through stdin; no
+//! passphrase is placed in argv, the environment, or logs.
+//!
+//! Linux and macOS can share these immutable POSIX fixtures. A future Windows
+//! fake can consume the same per-instance `KEYHOLD_TEST_ROOT` contract without
+//! changing the mutable-state model.
+//!
+//! **Maintenance warning:** do not revert this harness to creating or copying
+//! executable fake tools at test runtime. Native parallel `cargo test` can
+//! then reintroduce the Linux `ETXTBSY` fork/exec race.
 
-use std::{fs, os::unix::fs::PermissionsExt, path::PathBuf, process::Command};
+use std::{fs, path::PathBuf, process::Command};
 
 use keyhold::gpg::{
     AgentKeyState, Gpg, KeyProtection, PingMode, SigningTarget,
@@ -17,8 +44,7 @@ const SUB_GRIP: &str = "4B88DD924C36F6085738E95FB112B482E33A3220";
 const SUB2_FPR: &str = "97CF31DBA5F6012341995ED8F3C83A12ADCE45A1";
 const SUB2_GRIP: &str = "F097020B875D80D64C742456496ECA8F47CED17F";
 
-/// Scratch directory with fake tools whose paths are baked into the
-/// scripts themselves.
+/// Per-test mutable state consumed by the immutable fake tool fixtures.
 struct Tools {
     _dir: TempDir,
     gpg: Gpg,
@@ -31,149 +57,18 @@ impl Tools {
     fn new() -> Self {
         let dir = TempDir::new().expect("scratch dir");
         let root = dir.path().to_path_buf();
-        let gpg_path = root.join("fake-gpg");
-        let gpgconf_path = root.join("fake-gpgconf");
-        let ca_path = root.join("fake-connect-agent");
         let gpg_log = root.join("gpg.log");
         let ca_log = root.join("ca.log");
 
-        fs::write(
-            &gpg_path,
-            format!(
-                "#!/bin/sh\n\
-                 list=0; loopback=0; background=0\n\
-                 for a in \"$@\"; do\n\
-                   [ \"$a\" = --list-secret-keys ] && list=1\n\
-                   [ \"$a\" = --passphrase-fd ] && loopback=1\n\
-                   [ \"$a\" = cancel ] && background=1\n\
-                 done\n\
-                 echo \"$*\" >> {log}\n\
-                 if [ \"$list\" = 1 ]; then\n\
-                   if [ -e {root}/large-stdout ]; then\n\
-                     dd if=/dev/zero bs=1024 count=512 2>/dev/null | tr '\\000' x\n\
-                     printf '\\n'\n\
-                   fi\n\
-                   if [ -e {root}/large-stderr ]; then\n\
-                     dd if=/dev/zero bs=1024 count=512 2>/dev/null | tr '\\000' e >&2\n\
-                     printf '\\n' >&2\n\
-                   fi\n\
-                   cat {root}/keys.txt\n\
-                   exit 0\n\
-                 fi\n\
-                 if [ \"$background\" = 1 ] && [ -e {root}/lock ]; then\n\
-                   echo '[GNUPG:] KEY_CONSIDERED {PRIMARY_FPR} 0'\n\
-                   code=67108963\n\
-                   [ -e {root}/syserr ] && code=32867\n\
-                   echo \"[GNUPG:] FAILURE sign $code\"\n\
-                   if [ -e {root}/non-english ]; then\n\
-                     echo 'gpg: signature echouee: operation annulee' >&2\n\
-                   else\n\
-                     echo 'gpg: signing failed: Operation cancelled' >&2\n\
-                   fi\n\
-                   exit 2\n\
-                 fi\n\
-                 if [ \"$loopback\" = 1 ] && [ -e {root}/hang-loopback ]; then\n\
-                   i=0\n\
-                   while [ $i -lt 3000 ]; do echo b >> {root}/beats; sleep 0.1; i=$((i+1)); done\n\
-                   exit 0\n\
-                 fi\n\
-                 if [ \"$loopback\" = 1 ]; then\n\
-                   IFS= read -r supplied\n\
-                   expected=$(cat {root}/passphrase)\n\
-                   if [ \"$supplied\" != \"$expected\" ]; then\n\
-                     code=67108875\n\
-                     [ -e {root}/syserr ] && code=32779\n\
-                     echo \"[GNUPG:] FAILURE sign $code\"\n\
-                     if [ -e {root}/non-english ]; then\n\
-                       echo 'gpg: signature echouee: mot de passe errone' >&2\n\
-                     else\n\
-                       echo 'gpg: signing failed: Bad passphrase' >&2\n\
-                     fi\n\
-                     exit 2\n\
-                   fi\n\
-                 fi\n\
-                 if [ \"$background\" = 1 ] && [ -e {root}/cancel-no-failure ]; then\n\
-                   echo '[GNUPG:] KEY_CONSIDERED {PRIMARY_FPR} 0'\n\
-                   echo 'gpg: signing failed: Operation cancelled' >&2\n\
-                   exit 2\n\
-                 fi\n\
-                 if [ -e {root}/fail-all ]; then exit 2; fi\n\
-                 echo '[GNUPG:] KEY_CONSIDERED {PRIMARY_FPR} 0'\n\
-                 if [ \"$background\" != 1 ] && [ \"$loopback\" != 1 ] && \
-                    [ ! -e {root}/cached ]; then\n\
-                   echo '[GNUPG:] PINENTRY_LAUNCHED 2718 gnome3 1.3.2 x'\n\
-                 fi\n\
-                 echo '[GNUPG:] SIG_CREATED D 22 10 00 1789136997 {SUB2_FPR}'\n\
-                 exit 0\n",
-                log = gpg_log.display(),
-                root = root.display(),
-            ),
+        let gpg = Gpg::with_tools(
+            fixture_tool("fake-gpg"),
+            Some(fixture_tool("fake-gpgconf")),
+            Some(fixture_tool("fake-connect-agent")),
         )
-        .expect("write fake gpg");
-        fs::set_permissions(&gpg_path, fs::Permissions::from_mode(0o755))
-            .expect("chmod fake gpg");
-
-        fs::write(
-            &gpgconf_path,
-            format!(
-                "#!/bin/sh\n\
-                 if [ -e {root}/gpgconf-fail ]; then exit 1; fi\n\
-                 read def max < {root}/ttls\n\
-                 printf '%s\\n' \
-                 \"default-cache-ttl:24:0:expire cached PINs after N seconds:3:3:N:$def::\" \
-                 \"max-cache-ttl:24:2:set maximum PIN cache lifetime to N seconds:3:3:N:$max::\"\n",
-                root = root.display(),
-            ),
-        )
-        .expect("write fake gpgconf");
-        fs::set_permissions(&gpgconf_path, fs::Permissions::from_mode(0o755))
-            .expect("chmod fake gpgconf");
-
-        fs::write(
-            &ca_path,
-            format!(
-                "#!/bin/sh\n\
-                 echo \"$*\" >> {ca_log}\n\
-                 cmd=$1\n\
-                 if [ -e {root}/hang-ca ]; then\n\
-                   i=0\n\
-                   while [ $i -lt 3000 ]; do echo b >> {root}/beats; sleep 0.1; i=$((i+1)); done\n\
-                   exit 0\n\
-                 fi\n\
-                 if [ -e {root}/malformed-ca ]; then echo 'gibberish, not assuan'; exit 0; fi\n\
-                 if [ -e {root}/bare-ok ]; then echo OK; exit 0; fi\n\
-                 case \"$cmd\" in\n\
-                   'CLEAR_PASSPHRASE '*)\n\
-                     if [ -e {root}/fail-clear ]; then\n\
-                       echo 'ERR 67109139 Unknown IPC command <GPG Agent>'; exit 0; fi\n\
-                     echo OK; exit 0;;\n\
-                   KEYINFO\\ *)\n\
-                     if [ -e {root}/fail-keyinfo ]; then\n\
-                       echo 'ERR 67109139 Unknown IPC command <GPG Agent>'; exit 0; fi\n\
-                     grip=$(echo \"$cmd\" | cut -d' ' -f2)\n\
-                     case \"$grip\" in\n\
-                       0000000000000000000000000000000000000000)\n\
-                         echo 'ERR 67108891 Not found <GPG Agent>'; exit 0;;\n\
-                     esac\n\
-                     prot=P\n\
-                     [ -f {root}/prot ] && prot=$(cat {root}/prot)\n\
-                     cached=-\n\
-                     [ -e {root}/key-cached ] && cached=1\n\
-                     echo \"S KEYINFO $grip D - - $cached $prot - - -\"\n\
-                     echo OK\n\
-                     exit 0;;\n\
-                 esac\n\
-                 echo OK\n",
-                ca_log = ca_log.display(),
-                root = root.display(),
-            ),
-        )
-        .expect("write fake connect-agent");
-        fs::set_permissions(&ca_path, fs::Permissions::from_mode(0o755))
-            .expect("chmod fake connect-agent");
+        .with_tool_env("KEYHOLD_TEST_ROOT", root.as_os_str());
 
         let tools = Self {
-            gpg: Gpg::with_tools(gpg_path, Some(gpgconf_path), Some(ca_path)),
+            gpg,
             _dir: dir,
             gpg_log,
             ca_log,
@@ -208,6 +103,15 @@ impl Tools {
     fn ca_log(&self) -> String {
         fs::read_to_string(&self.ca_log).unwrap_or_default()
     }
+}
+
+fn fixture_tool(name: &str) -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("fixtures")
+        .join("gpg-tools")
+        .join("unix")
+        .join(name)
 }
 
 /// Primary with two signing subkeys; the newest signs by default.
@@ -751,12 +655,12 @@ fn loopback_sign_rejects_empty_passphrase() {
     assert_eq!(tools.gpg_log(), "");
 }
 
-/// Sanity: the fake tooling itself must be executable (guards against
-/// script-generation drift breaking every other test confusingly).
+/// Sanity: the checked-in fake tooling must retain its executable mode.
 #[test]
 fn fake_tools_are_executable() {
     let tools = Tools::new();
-    let ok = Command::new(tools.root.join("fake-gpg"))
+    let ok = Command::new(fixture_tool("fake-gpg"))
+        .env("KEYHOLD_TEST_ROOT", &tools.root)
         .arg("--batch")
         .output()
         .expect("run fake gpg");

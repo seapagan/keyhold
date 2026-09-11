@@ -144,7 +144,7 @@ fn relative_gpg_override_survives_daemon_detachment() {
     let env = TestEnv::new();
     let mut cmd = env.keyhold(&["on", "--interval", "100ms"]);
     cmd.env("KEYHOLD_GPG", "fake-gpg");
-    cmd.current_dir(env.scratch.path());
+    cmd.current_dir(env.gpg.parent().expect("fixture directory"));
     let out = cmd.output().unwrap();
     assert!(
         out.status.success(),

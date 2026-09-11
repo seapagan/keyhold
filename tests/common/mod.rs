@@ -1,9 +1,19 @@
 // Each test binary includes only part of this module's API.
 #![allow(dead_code)]
 
-//! Shared helpers for integration tests: isolated runtime/config
-//! directories plus fake `gpg`/`gpgconf`/`gpg-connect-agent` scripts
-//! driven by marker files.
+//! Shared helpers for integration tests: isolated runtime/config directories
+//! plus immutable checked-in fake `gpg`/`gpgconf`/`gpg-connect-agent`
+//! executables driven by marker files under a per-test scratch directory.
+//!
+//! The executables must remain static. Creating or rewriting executable files
+//! in a multithreaded Rust test process can let a concurrently forked child
+//! transiently inherit a writable descriptor; Linux may then reject exec with
+//! `ETXTBSY` (`Text file busy`). Separate temporary directories do not prevent
+//! that process-wide race. Each Keyhold child or [`Gpg`] instance therefore
+//! receives only the non-secret `KEYHOLD_TEST_ROOT` path for its own mutable
+//! state. This avoids both runtime executable creation and process-global
+//! environment mutation. Passphrases remain files under that root and are
+//! supplied to fake gpg through stdin, never argv or the environment.
 //!
 //! The fake gpg logs every invocation and can be told to fail all pings
 //! (`fail_all`), only background pings (`fail_bg`, detected by the
@@ -21,7 +31,7 @@
 use std::{
     fs,
     io::{Read, Write},
-    os::unix::{fs::PermissionsExt, net::UnixStream},
+    os::unix::net::UnixStream,
     path::PathBuf,
     process::{Command, Output},
     thread,
@@ -48,12 +58,20 @@ pub const FAKE_PASSPHRASE: &str = "correct horse battery staple";
 pub const DEFAULT_TTL_SECS: u64 = 600;
 pub const MAX_TTL_SECS: u64 = 7200;
 
+fn fixture_tool(name: &str) -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("fixtures")
+        .join("gpg-tools")
+        .join("unix")
+        .join(name)
+}
+
 pub struct TestEnv {
     pub runtime: TempDir,
     pub config: TempDir,
-    // Holds the fake gpg/gpgconf/gpg-connect-agent scripts, their logs,
-    // fixtures and failure markers; must outlive every spawned keyhold
-    // process.
+    // Holds mutable logs, fixture data, and failure markers; must outlive
+    // every spawned keyhold process.
     pub scratch: TempDir,
     pub bin: PathBuf,
     pub gpg: PathBuf,
@@ -81,50 +99,28 @@ impl TestEnv {
         let config = TempDir::new().expect("temp config dir");
         let scratch = TempDir::new().expect("temp scratch dir");
 
-        let gpg = scratch.path().join("fake-gpg");
+        let gpg = fixture_tool("fake-gpg");
         let log = scratch.path().join("gpg.log");
         let fail_all = scratch.path().join("fail-all");
         let fail_bg = scratch.path().join("fail-bg");
         let slow_bg = scratch.path().join("slow-bg");
         let rich = scratch.path().join("rich");
-        let cached = scratch.path().join("cached-key");
-        let lock = scratch.path().join("lock-key");
-        let passphrase = scratch.path().join("expected-passphrase");
+        let cached = scratch.path().join("cached");
+        let lock = scratch.path().join("lock");
+        let passphrase = scratch.path().join("passphrase");
 
-        let gpgconf = scratch.path().join("fake-gpgconf");
-        let ttls = scratch.path().join("cache-ttls");
+        let gpgconf = fixture_tool("fake-gpgconf");
+        let ttls = scratch.path().join("ttls");
         let gpgconf_fail = scratch.path().join("gpgconf-fail");
 
-        let connect_agent = scratch.path().join("fake-gpg-connect-agent");
-        let ca_log = scratch.path().join("connect-agent.log");
+        let connect_agent = fixture_tool("fake-connect-agent");
+        let ca_log = scratch.path().join("ca.log");
         let key_cached = scratch.path().join("key-cached");
-        let key_prot = scratch.path().join("key-protection");
+        let key_prot = scratch.path().join("prot");
 
-        let keys_fixture = scratch.path().join("secret-keys.txt");
-
-        fs::write(&gpg, fake_gpg_script()).expect("write fake gpg");
-        fs::set_permissions(&gpg, fs::Permissions::from_mode(0o755))
-            .expect("chmod fake gpg");
-
-        // The TTLs are read from the file by the shell itself, so the
-        // script is a constant.
-        fs::write(
-            &gpgconf,
-            "#!/bin/sh\n\
-             [ -e \"$KEYHOLD_FAKE_GPGCONF_FAIL\" ] && exit 1\n\
-             read def max < \"$KEYHOLD_FAKE_TTLS\" || exit 1\n\
-             printf '%s\\n' \
-             \"default-cache-ttl:24:0:expire cached PINs after N seconds:3:3:N:$def::\" \
-             \"max-cache-ttl:24:2:set maximum PIN cache lifetime to N seconds:3:3:N:$max::\"\n",
-        )
-        .expect("write fake gpgconf");
-        fs::set_permissions(&gpgconf, fs::Permissions::from_mode(0o755))
-            .expect("chmod fake gpgconf");
-
-        fs::write(&connect_agent, fake_connect_agent_script())
-            .expect("write fake gpg-connect-agent");
-        fs::set_permissions(&connect_agent, fs::Permissions::from_mode(0o755))
-            .expect("chmod fake gpg-connect-agent");
+        let keys_fixture = scratch.path().join("keys.txt");
+        fs::write(scratch.path().join("status-on-rich"), b"1")
+            .expect("write fixture profile marker");
 
         let env = Self {
             bin: PathBuf::from(env!("CARGO_BIN_EXE_keyhold")),
@@ -251,20 +247,7 @@ impl TestEnv {
             .env("KEYHOLD_GPG", &self.gpg)
             .env("KEYHOLD_GPGCONF", &self.gpgconf)
             .env("KEYHOLD_GPG_CONNECT_AGENT", &self.connect_agent)
-            .env("KEYHOLD_FAKE_LOG", &self.log)
-            .env("KEYHOLD_FAKE_FAIL_ALL", &self.fail_all)
-            .env("KEYHOLD_FAKE_FAIL_BG", &self.fail_bg)
-            .env("KEYHOLD_FAKE_SLOW_BG", &self.slow_bg)
-            .env("KEYHOLD_FAKE_RICH", &self.rich)
-            .env("KEYHOLD_FAKE_CACHED", &self.cached)
-            .env("KEYHOLD_FAKE_LOCK", &self.lock)
-            .env("KEYHOLD_FAKE_PASSPHRASE", &self.passphrase)
-            .env("KEYHOLD_FAKE_KEYS", &self.keys_fixture)
-            .env("KEYHOLD_FAKE_TTLS", &self.ttls)
-            .env("KEYHOLD_FAKE_GPGCONF_FAIL", &self.gpgconf_fail)
-            .env("KEYHOLD_FAKE_CA_LOG", &self.ca_log)
-            .env("KEYHOLD_FAKE_KEY_CACHED", &self.key_cached)
-            .env("KEYHOLD_FAKE_KEY_PROT", &self.key_prot)
+            .env("KEYHOLD_TEST_ROOT", self.scratch.path())
             .env(
                 "DBUS_SESSION_BUS_ADDRESS",
                 "unix:path=/nonexistent/keyhold-test-bus",
@@ -331,107 +314,6 @@ impl Drop for TestEnv {
         // Best effort: stop any daemon this test started.
         let _ = self.keyhold(&["daemon", "--stop"]).output();
     }
-}
-
-/// The fake `gpg` script. Signature semantics:
-///
-/// * invocations containing `--list-secret-keys` print the fixture;
-/// * loopback invocations (`--passphrase-fd`) read one line from stdin
-///   and validate it against `$KEYHOLD_FAKE_PASSPHRASE` (the secret is
-///   never logged);
-/// * background invocations (containing `cancel`) fail like a locked key
-///   when the `lock` marker is present;
-/// * otherwise the harmless sign succeeds, emitting a `--status-fd`
-///   stream when the `rich` marker is present.
-fn fake_gpg_script() -> String {
-    let mut s = String::new();
-    s.push_str("#!/bin/sh\n");
-    // Machine-readable signing status goes to stdout (the daemon passes
-    // --status-fd 1); the signature itself is discarded via --output
-    // /dev/null, so stdout is free.
-    s.push_str("list=0; loopback=0; background=0\n");
-    s.push_str("for a in \"$@\"; do\n");
-    s.push_str("  [ \"$a\" = --list-secret-keys ] && list=1\n");
-    s.push_str("  [ \"$a\" = --passphrase-fd ] && loopback=1\n");
-    s.push_str("  [ \"$a\" = cancel ] && background=1\n");
-    s.push_str("done\n");
-    s.push_str("echo \"$*\" >> \"$KEYHOLD_FAKE_LOG\"\n");
-    s.push_str(
-        "if [ \"$list\" = 1 ]; then cat \"$KEYHOLD_FAKE_KEYS\"; exit 0; fi\n",
-    );
-    s.push_str("if [ \"$background\" = 1 ] && [ -e \"$KEYHOLD_FAKE_SLOW_BG\" ]; then\n");
-    s.push_str("  sleep 2\n");
-    s.push_str("  echo bg-done >> \"$KEYHOLD_FAKE_LOG\"\n");
-    s.push_str("fi\n");
-    s.push_str("if [ \"$background\" = 1 ] && [ -e \"$KEYHOLD_FAKE_FAIL_BG\" ]; then\n");
-    s.push_str("  echo 'gpg: signing failed: Operation cancelled' >&2\n");
-    s.push_str("  exit 2\n");
-    s.push_str("fi\n");
-    s.push_str("if [ -e \"$KEYHOLD_FAKE_FAIL_ALL\" ]; then exit 2; fi\n");
-    s.push_str("if [ \"$loopback\" = 1 ]; then\n");
-    // Read the single passphrase line from stdin and compare. Never log
-    // it; only the outcome is observable.
-    s.push_str("  IFS= read -r supplied\n");
-    s.push_str("  expected=$(cat \"$KEYHOLD_FAKE_PASSPHRASE\")\n");
-    s.push_str("  if [ \"$supplied\" != \"$expected\" ]; then\n");
-    s.push_str("    echo '[GNUPG:] FAILURE sign 67108875'\n");
-    s.push_str("    echo 'gpg: signing failed: Bad passphrase' >&2\n");
-    s.push_str("    exit 2\n");
-    s.push_str("  fi\n");
-    s.push_str("fi\n");
-    s.push_str(
-        "if [ \"$background\" = 1 ] && [ -e \"$KEYHOLD_FAKE_LOCK\" ]; then\n",
-    );
-    s.push_str("  echo '[GNUPG:] KEY_CONSIDERED C1D6F8E1B1E8D5FBFF34ACE08FACE96FA6D9DB48 0'\n");
-    s.push_str("  echo '[GNUPG:] FAILURE sign 67108963'\n");
-    s.push_str("  echo 'gpg: signing failed: Operation cancelled' >&2\n");
-    s.push_str("  exit 2\n");
-    s.push_str("fi\n");
-    s.push_str("if [ -e \"$KEYHOLD_FAKE_RICH\" ]; then\n");
-    s.push_str("  echo '[GNUPG:] KEY_CONSIDERED C1D6F8E1B1E8D5FBFF34ACE08FACE96FA6D9DB48 0'\n");
-    s.push_str("  if [ \"$background\" != 1 ] && [ \"$loopback\" != 1 ] && [ ! -e \"$KEYHOLD_FAKE_CACHED\" ]; then\n");
-    s.push_str("    echo '[GNUPG:] PINENTRY_LAUNCHED 2718 gnome3 1.3.2 not a tty dumb :0 ? 1000/1000 -'\n");
-    s.push_str("  fi\n");
-    s.push_str("  echo '[GNUPG:] SIG_CREATED D 22 10 00 1789136997 97CF31DBA5F6012341995ED8F3C83A12ADCE45A1'\n");
-    s.push_str("fi\n");
-    s.push_str("exit 0\n");
-    s
-}
-
-/// The fake `gpg-connect-agent` script: KEYINFO and CLEAR_PASSPHRASE
-/// over the same command line shape the real tool accepts.
-fn fake_connect_agent_script() -> String {
-    let mut s = String::new();
-    s.push_str("#!/bin/sh\n");
-    s.push_str("echo \"$*\" >> \"$KEYHOLD_FAKE_CA_LOG\"\n");
-    s.push_str("cmd=$1\n");
-    // CLEAR_PASSPHRASE --mode=normal <keygrip>
-    s.push_str("case \"$cmd\" in\n");
-    s.push_str("  'CLEAR_PASSPHRASE '*)\n");
-    s.push_str("    echo OK\n");
-    s.push_str("    exit 0\n");
-    s.push_str("    ;;\n");
-    s.push_str("  KEYINFO\\ *)\n");
-    s.push_str("    grip=$(echo \"$cmd\" | cut -d' ' -f2)\n");
-    s.push_str(
-        "    case \"$grip\" in\n\
-             0000000000000000000000000000000000000000)\n\
-               echo 'ERR 67108891 Not found <GPG Agent>'\n\
-               exit 0\n\
-               ;;\n\
-           esac\n",
-    );
-    s.push_str("    prot=P\n");
-    s.push_str("    [ -f \"$KEYHOLD_FAKE_KEY_PROT\" ] && prot=$(cat \"$KEYHOLD_FAKE_KEY_PROT\")\n");
-    s.push_str("    cached=-\n");
-    s.push_str("    [ -e \"$KEYHOLD_FAKE_KEY_CACHED\" ] && cached=1\n");
-    s.push_str("    echo \"S KEYINFO $grip D - - $cached $prot - - -\"\n");
-    s.push_str("    echo OK\n");
-    s.push_str("    exit 0\n");
-    s.push_str("    ;;\n");
-    s.push_str("esac\n");
-    s.push_str("echo OK\n");
-    s
 }
 
 /// Poll until `cond` holds, at most `timeout`. Returns false on timeout.
@@ -501,9 +383,9 @@ use keyhold::{
 };
 use zeroize::Zeroizing;
 
-/// A stateful fake gpg toolchain with paths baked into the scripts (no
-/// environment mutation, so tests are parallel-safe). The fake agent's
-/// cache lifecycle is modelled by a `locked` marker: CLEAR_PASSPHRASE
+/// A stateful fake gpg toolchain using immutable checked-in executables and a
+/// per-instance mutable root. The fake agent's cache lifecycle is modelled by
+/// a `locked` marker: CLEAR_PASSPHRASE
 /// creates it, a successful loopback sign removes it, background
 /// (cancel-mode) signs fail while it exists, and KEYINFO reports it.
 pub struct DaemonTools {
@@ -519,119 +401,22 @@ impl DaemonTools {
     pub fn new(runtime_root: &Path) -> Self {
         let dir = TempDir::new().expect("scratch dir");
         let root = dir.path().to_path_buf();
-        let gpg_path = root.join("fake-gpg");
-        let gpgconf_path = root.join("fake-gpgconf");
-        let ca_path = root.join("fake-connect-agent");
         let gpg_log = root.join("gpg.log");
         let ca_log = root.join("ca.log");
+        fs::write(root.join("daemon-tools"), b"1")
+            .expect("write fixture profile marker");
 
-        fs::write(
-            &gpg_path,
-            format!(
-                "#!/bin/sh\n\
-                 list=0; loopback=0; background=0\n\
-                 for a in \"$@\"; do\n\
-                   [ \"$a\" = --list-secret-keys ] && list=1\n\
-                   [ \"$a\" = --passphrase-fd ] && loopback=1\n\
-                   [ \"$a\" = cancel ] && background=1\n\
-                 done\n\
-                 echo \"$*\" >> {log}\n\
-                 if [ \"$list\" = 1 ]; then cat {root}/keys.txt; exit 0; fi\n\
-                 if [ -e {root}/fail-all ]; then exit 2; fi\n\
-                 if [ \"$background\" = 1 ]; then\n\
-                   if [ -e {root}/locked ] || [ -e {root}/fail-bg ]; then\n\
-                     echo '[GNUPG:] KEY_CONSIDERED {PRIMARY_FPR} 0'\n\
-                     echo '[GNUPG:] FAILURE sign 67108963'\n\
-                     echo 'gpg: signing failed: Operation cancelled' >&2\n\
-                     exit 2\n\
-                   fi\n\
-                 fi\n\
-                 if [ \"$loopback\" = 1 ]; then\n\
-                   if [ -e {root}/slow ]; then sleep 2; fi\n\
-                   if [ -e {root}/hang-loopback ]; then\n\
-                     i=0\n\
-                     while [ $i -lt 3000 ]; do echo b >> {root}/beats; sleep 0.1; i=$((i+1)); done\n\
-                     exit 0\n\
-                   fi\n\
-                   IFS= read -r supplied\n\
-                   expected=$(cat {root}/passphrase)\n\
-                   if [ \"$supplied\" != \"$expected\" ]; then\n\
-                     echo '[GNUPG:] FAILURE sign 67108875'\n\
-                     echo 'gpg: signing failed: Bad passphrase' >&2\n\
-                     exit 2\n\
-                   fi\n\
-                   rm -f {root}/locked\n\
-                 fi\n\
-                 echo '[GNUPG:] KEY_CONSIDERED {PRIMARY_FPR} 0'\n\
-                 if [ \"$background\" != 1 ] && [ \"$loopback\" != 1 ] && \
-                    [ ! -e {root}/cached ]; then\n\
-                   echo '[GNUPG:] PINENTRY_LAUNCHED 2718 gnome3 1.3.2 x'\n\
-                   rm -f {root}/locked\n\
-                 fi\n\
-                 echo '[GNUPG:] SIG_CREATED D 22 10 00 1789136997 {SUB2_FPR}'\n\
-                 exit 0\n",
-                log = gpg_log.display(),
-                root = root.display(),
-            ),
+        let gpg = Gpg::with_tools(
+            fixture_tool("fake-gpg"),
+            Some(fixture_tool("fake-gpgconf")),
+            Some(fixture_tool("fake-connect-agent")),
         )
-        .expect("write fake gpg");
-        fs::set_permissions(&gpg_path, fs::Permissions::from_mode(0o755))
-            .expect("chmod fake gpg");
-
-        fs::write(
-            &gpgconf_path,
-            format!(
-                "#!/bin/sh\n\
-                 read def max < {root}/ttls\n\
-                 printf '%s\\n' \
-                 \"default-cache-ttl:24:0:expire cached PINs after N seconds:3:3:N:$def::\" \
-                 \"max-cache-ttl:24:2:set maximum PIN cache lifetime to N seconds:3:3:N:$max::\"\n",
-                root = root.display(),
-            ),
-        )
-        .expect("write fake gpgconf");
-        fs::set_permissions(&gpgconf_path, fs::Permissions::from_mode(0o755))
-            .expect("chmod fake gpgconf");
-
-        fs::write(
-            &ca_path,
-            format!(
-                "#!/bin/sh\n\
-                 echo \"$*\" >> {ca_log}\n\
-                 cmd=$1\n\
-                 case \"$cmd\" in\n\
-                   'CLEAR_PASSPHRASE '*)\n\
-                     if [ -e {root}/fail-clear ]; then\n\
-                       echo 'ERR 67109139 Unknown IPC command <GPG Agent>'; exit 0; fi\n\
-                     touch {root}/locked\n\
-                     echo OK; exit 0;;\n\
-                   KEYINFO\\ *)\n\
-                     grip=$(echo \"$cmd\" | cut -d' ' -f2)\n\
-                     case \"$grip\" in\n\
-                       0000000000000000000000000000000000000000)\n\
-                         echo 'ERR 67108891 Not found <GPG Agent>'; exit 0;;\n\
-                     esac\n\
-                     prot=P\n\
-                     [ -f {root}/prot ] && prot=$(cat {root}/prot)\n\
-                     cached=-\n\
-                     [ ! -e {root}/locked ] && cached=1\n\
-                     echo \"S KEYINFO $grip D - - $cached $prot - - -\"\n\
-                     echo OK\n\
-                     exit 0;;\n\
-                 esac\n\
-                 echo OK\n",
-                ca_log = ca_log.display(),
-                root = root.display(),
-            ),
-        )
-        .expect("write fake connect-agent");
-        fs::set_permissions(&ca_path, fs::Permissions::from_mode(0o755))
-            .expect("chmod fake connect-agent");
+        .with_tool_env("KEYHOLD_TEST_ROOT", root.as_os_str());
 
         let runtime = runtime_root.to_path_buf();
         let sock = runtime.join("keyhold").join("keyhold.sock");
         let tools = Self {
-            gpg: Gpg::with_tools(gpg_path, Some(gpgconf_path), Some(ca_path)),
+            gpg,
             _dir: dir,
             gpg_log,
             ca_log,

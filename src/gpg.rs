@@ -22,8 +22,15 @@
 //! `--status-fd` records, `--with-colons --with-keygrip` listings,
 //! `gpgconf --list-options` and `gpg-connect-agent` responses. Free-form
 //! localized stderr is used for messages only, never for identity.
+//!
+//! Integration tests may attach non-secret fixture metadata to each [`Gpg`]
+//! instance's child environment. This is deliberately per instance rather
+//! than process-global so parallel tests cannot race. Keyhold never uses this
+//! seam for passphrases; credential material still travels only through the
+//! selected gpg child's stdin.
 
 use std::{
+    ffi::OsString,
     io::Read,
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
@@ -249,6 +256,12 @@ pub struct Gpg {
     path: PathBuf,
     gpgconf: Option<PathBuf>,
     connect_agent: Option<PathBuf>,
+    /// Non-secret environment entries applied only to tools spawned by this
+    /// instance. This is primarily an integration-test injection seam:
+    /// per-instance values avoid the parallel-test race introduced by
+    /// process-global `std::env::set_var`. Production detection leaves it
+    /// empty, and passphrases must never be stored here.
+    tool_env: Vec<(OsString, OsString)>,
     /// Execution bound for unattended child operations.
     unattended_timeout: Duration,
 }
@@ -268,6 +281,7 @@ impl Gpg {
             path,
             gpgconf,
             connect_agent,
+            tool_env: Vec::new(),
             unattended_timeout: UNATTENDED_TIMEOUT,
         })
     }
@@ -282,8 +296,25 @@ impl Gpg {
             path,
             gpgconf,
             connect_agent,
+            tool_env: Vec::new(),
             unattended_timeout: UNATTENDED_TIMEOUT,
         }
+    }
+
+    /// Return a copy which supplies one non-secret environment value to every
+    /// GPG-family child spawned by this instance.
+    ///
+    /// This narrow seam exists primarily for parallel integration tests. It
+    /// avoids process-global environment mutation and does not affect other
+    /// [`Gpg`] instances. Production [`Gpg::detect`] starts with no entries.
+    /// Passphrases must never be provided through this API.
+    pub fn with_tool_env(
+        mut self,
+        name: impl Into<OsString>,
+        value: impl Into<OsString>,
+    ) -> Self {
+        self.tool_env.push((name.into(), value.into()));
+        self
     }
 
     /// Return a copy with a different execution bound for unattended
@@ -413,7 +444,7 @@ impl Gpg {
         &self,
         key: Option<&str>,
     ) -> Result<Vec<KeyBlock>> {
-        let mut cmd = Command::new(&self.path);
+        let mut cmd = self.command(&self.path);
         cmd.args([
             "--batch",
             "--with-colons",
@@ -451,7 +482,7 @@ impl Gpg {
         let path = self.gpgconf.clone().ok_or_else(|| {
             Error::GpgToolNotFound("gpgconf (not located)".into())
         })?;
-        let mut cmd = Command::new(&path);
+        let mut cmd = self.command(&path);
         cmd.args(["--list-options", "gpg-agent"])
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -586,7 +617,7 @@ impl Gpg {
         let path = self.connect_agent.clone().ok_or_else(|| {
             Error::GpgToolNotFound("gpg-connect-agent (not located)".into())
         })?;
-        let mut cmd = Command::new(&path);
+        let mut cmd = self.command(&path);
         cmd.arg(command)
             .arg("/bye")
             .stdin(Stdio::null())
@@ -625,7 +656,7 @@ impl Gpg {
     /// The harmless detached-sign command, stdout reserved for
     /// `--status-fd=1` (the signature itself goes to `/dev/null`).
     fn sign_command(&self, key: Option<&str>, mode: PingMode) -> Command {
-        let mut cmd = Command::new(&self.path);
+        let mut cmd = self.command(&self.path);
         cmd.arg("--batch")
             .arg("--yes")
             .arg("--detach-sign")
@@ -643,6 +674,15 @@ impl Gpg {
         if let Some(key) = key {
             cmd.arg("--local-user").arg(key);
         }
+        cmd
+    }
+
+    /// Build a configured GPG-family child without mutating the parent
+    /// process environment. An empty `tool_env`, as used by production
+    /// constructors, is equivalent to `Command::new(path)`.
+    fn command(&self, path: &Path) -> Command {
+        let mut cmd = Command::new(path);
+        cmd.envs(self.tool_env.iter().map(|(name, value)| (name, value)));
         cmd
     }
 

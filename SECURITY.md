@@ -21,11 +21,13 @@ keyhold has two operating modes with deliberately different guarantees.
 config) deliberately expands the security surface in exchange for holds
 that survive GnuPG's absolute `max-cache-ttl`:
 
-- The passphrase is prompted once, validated against the exact selected
-  key, and stored **only** in the Linux Secret Service collection aliased
-  `session` — the collection the desktop session destroys at logout.
-  There is no fallback to the persistent `default`/`login` collection, no
-  file, and no other persistence.
+- A normal first activation prompts once; reuse of a valid stored credential
+  prompts zero times, and a conclusively stale credential causes one
+  replacement prompt. The passphrase is validated against the exact selected
+  key and stored **only** in the Linux Secret Service collection aliased
+  `session`, which the desktop session destroys at logout. There is
+  no fallback to the persistent `default`/`login` collection, no file, and no
+  other persistence. The daemon never prompts.
 - The passphrase never appears in process arguments, environment
   variables, keyhold's Unix-socket IPC protocol, daemon state, config
   files, temporary files, or logs. It reaches `gpg` exclusively through

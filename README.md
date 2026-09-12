@@ -289,11 +289,13 @@ store_passphrase = true
 
 How it works:
 
-- You are prompted once (normal terminal prompt, not pinentry). The
-  passphrase is validated by *clearing only the selected key's* GPG cache
-  entry and unlocking it again with the exact key — establishing a cache
-  epoch keyhold owns — and is then stored in the Linux Secret Service
-  **`session` collection**, which the desktop session destroys at logout.
+- A normal first stored activation prompts once (normal terminal prompt, not
+  pinentry); reuse of a valid stored credential prompts zero times. A
+  conclusively stale credential causes one replacement prompt. The passphrase
+  is validated by *clearing only the selected key's* GPG cache entry and
+  unlocking it again with the exact key, which establishes a cache epoch
+  keyhold owns. Keyhold then stores it in the Linux Secret Service **`session`
+  collection**, which the desktop session destroys at logout.
 - There is no fallback to the `login`/`default` collection, no file, no
   environment variable and no daemon IPC copy: the passphrase reaches
   `gpg` only through child stdin, wrapped in zeroized memory otherwise.

@@ -119,8 +119,8 @@ impl SessionCredentialStore {
     }
 }
 
-/// Attributes identifying keyhold's item for `keygrip` (the empty
-/// fingerprint placeholder is replaced by the real one at store time).
+/// Attributes identifying keyhold's session item by owner, kind, keygrip and
+/// the exact signing-key fingerprint supplied by the activation flow.
 fn item_attributes<'a>(
     keygrip: &'a str,
     fingerprint: &'a str,

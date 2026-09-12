@@ -23,8 +23,9 @@ pub struct Config {
     pub git_key: bool,
     /// Keepalive ping interval.
     pub interval: Duration,
-    /// Store the GPG passphrase in the Secret Service session collection
-    /// by default (the security-expanding opt-in; CLI flags override).
+    /// Whether `keyhold on` stores the passphrase in the Secret Service
+    /// session collection when no CLI override is supplied. Defaults to
+    /// false; setting it true is the security-expanding opt-in.
     pub store_passphrase: bool,
     /// Delete keyhold's Secret Service session items on clean daemon
     /// shutdown.

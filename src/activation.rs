@@ -39,8 +39,9 @@ pub struct Prepared {
     pub warnings: Vec<String>,
 }
 
-/// The prompt the foreground stored-mode flow may use (once, or twice
-/// across a stale-credential replacement). The daemon never sees it.
+/// The prompt the foreground stored-mode flow may use once for a new or stale
+/// credential. Valid reuse and unprotected keys do not prompt. The daemon
+/// never sees it.
 pub type Prompt<'a> = dyn Fn() -> Result<Zeroizing<Vec<u8>>> + 'a;
 
 /// Run the activation flow. `store_enabled` selects the mode; `key` and

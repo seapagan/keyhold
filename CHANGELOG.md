@@ -12,6 +12,8 @@
 
 Initial release of `keyhold`.
 
-See the README for installation, usage, configuration, and implementation details.
+See the README for installation, usage, configuration, and implementation
+details.
+
 ---
 *This changelog was generated using [github-changelog-md](http://changelog.seapagan.net/) by [Seapagan](https://github.com/seapagan)*

@@ -829,6 +829,12 @@ pub fn on_request(
         .started_wall
         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
         .map(|d| d.as_millis() as u64);
+    let activated = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock before Unix epoch")
+        .as_millis();
+    let activated =
+        u64::try_from(activated).expect("activation timestamp fits u64");
     format!(
         "{{\"cmd\":\"on\",\"key\":{key},\"key_source\":\"default\",\
          \"interval_ms\":{interval_ms},\"hold_ms\":{hold},\
@@ -845,7 +851,7 @@ pub fn on_request(
             Some(ms) => ms.to_string(),
             None => "null".to_string(),
         },
-        activated = 1_700_000_000_000_u64,
+        activated = activated,
         fpr = prepared
             .target
             .as_ref()

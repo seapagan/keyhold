@@ -1052,13 +1052,17 @@ fn status_reports_live_key_and_credential_rows() {
         "Key state    unlocked",
         "Credential   not in use",
         "GPG max TTL  30s",
-        // A fresh foreground unlock established the epoch, so a
-        // truthful countdown is shown (a pre-existing entry would read
-        // "unknown"; see the already-cached warning test).
-        "Max expiry   in 30s",
     ] {
         assert!(text.contains(needle), "missing {needle:?}:\n{text}");
     }
+    // A fresh foreground unlock established the epoch, so a truthful live
+    // countdown is shown. Its exact second may tick while status is rendered.
+    let max_expiry = text
+        .lines()
+        .find(|line| line.starts_with("Max expiry"))
+        .expect("Max expiry row");
+    assert!(max_expiry.contains("in "), "{max_expiry}");
+    assert!(!max_expiry.contains("unknown"), "{max_expiry}");
     // The resolved signing subkey drives the daemon's exact pings.
     assert!(
         wait_until_exact_pings(&env, 1),
@@ -1299,7 +1303,6 @@ fn off_never_runs_the_shutdown_policies() {
     );
     env.succeed(&["on", "--for", "1h"]);
     env.succeed(&["off"]);
-    thread::sleep(Duration::from_millis(300));
     assert!(
         !env.ca_log().contains("CLEAR_PASSPHRASE"),
         "{}",
@@ -1307,6 +1310,13 @@ fn off_never_runs_the_shutdown_policies() {
     );
     // The daemon is still running.
     assert!(env.status().contains("Daemon       running"));
+
+    env.succeed(&["daemon", "--stop"]);
+    assert!(
+        env.ca_log().contains("CLEAR_PASSPHRASE"),
+        "shutdown cleanup did not run: {}",
+        env.ca_log()
+    );
 }
 
 #[test]

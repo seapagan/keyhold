@@ -229,12 +229,8 @@ fn unprotected_key_needs_no_credential() {
     assert!(cache.started_wall.is_none());
     assert!(!prepared.credential_mutated);
     assert!(
-        !store
-            .operations()
-            .iter()
-            .any(|op| op != "load:F097020B875D80D64C742456496ECA8F47CED17F"
-                || true),
-        "store untouched: {:?}",
+        store.operations().is_empty(),
+        "store touched: {:?}",
         store.operations()
     );
     assert_eq!(tools.clears(), 0, "no cache entry exists to clear");
@@ -701,7 +697,7 @@ fn expiry_wins_over_renewal() {
     let running = Running::start(ShutdownPolicies::default());
     // A hold shorter than the first renewal deadline (which is ~1.8s out):
     // expiry must win and no renewal may recreate the entry afterwards.
-    running.tools.set_ttls(600, 5);
+    running.tools.set_ttls(600, 2);
     let prepared = stored_activation(
         tools_gpg(&running),
         &running.store,
@@ -712,17 +708,22 @@ fn expiry_wins_over_renewal() {
     .unwrap();
     let request = common::on_request(None, &prepared, 60_000, Some(500));
     assert_eq!(ipc_at(&running.sock, &request).unwrap()["ok"], true);
+    let renewal_deadline = prepared.cache.unwrap().started_wall.unwrap()
+        + Duration::from_millis(1_800);
+    let baseline_clears = running.tools.clears();
 
     assert!(
         wait_until(5 * SECS, || running.status()["hold_on"] == false),
         "hold did not expire: {}",
         running.status()
     );
-    let clears = running.tools.clears(); // 1 from activation
-    thread::sleep(Duration::from_millis(1500));
+    assert!(wait_until(5 * SECS, || {
+        std::time::SystemTime::now()
+            > renewal_deadline + Duration::from_millis(200)
+    }));
     assert_eq!(
         running.tools.clears(),
-        clears,
+        baseline_clears,
         "renewal ran after expiry: {}",
         running.tools.ca_log()
     );

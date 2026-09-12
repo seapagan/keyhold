@@ -8,7 +8,6 @@ mod common;
 use std::{
     io::{Read, Write},
     os::unix::net::UnixStream,
-    path::Path,
     sync::Arc,
     thread,
     time::Duration,
@@ -23,7 +22,7 @@ use keyhold::{
     config::ShutdownPolicies,
     credential::CredentialStore,
     error::{Error, Result},
-    gpg::{Gpg, KeyProtection, PingMode},
+    gpg::{Gpg, KeyProtection, PingMode, SigningTarget},
 };
 use zeroize::Zeroizing;
 
@@ -434,6 +433,66 @@ fn stale_replacement_blocks_same_key_until_cancel_releases_ownership() {
 }
 
 #[test]
+fn activation_before_clear_leaves_no_credential() {
+    let store = Arc::new(FakeStore::default());
+    let transaction = store.lock_transaction(SUB2_GRIP).unwrap();
+    let clear_waiting = store.observe_next_clear_contention();
+    let clear_store = Arc::clone(&store);
+    let clear = thread::spawn(move || clear_store.clear_all());
+
+    clear_waiting
+        .recv_timeout(5 * SECS)
+        .expect("clear did not wait for the active transaction");
+    store
+        .store(
+            &SigningTarget {
+                fingerprint: SUB2_FPR.into(),
+                keygrip: Some(SUB2_GRIP.into()),
+            },
+            b"new-credential",
+        )
+        .unwrap();
+    drop(transaction);
+    assert_eq!(clear.join().unwrap().unwrap(), 1);
+    assert!(!store.contains_key(SUB2_GRIP));
+}
+
+#[test]
+fn clear_before_activation_allows_a_new_credential() {
+    let store = Arc::new(FakeStore::default());
+    store.preload(SUB2_GRIP, b"old-credential");
+    let clear_gate = store.block_next_clear();
+    let clear_store = Arc::clone(&store);
+    let clear = thread::spawn(move || clear_store.clear_all());
+    clear_gate.wait_until_entered();
+
+    let transaction_waiting = store.observe_next_lock_contention();
+    let activation_store = Arc::clone(&store);
+    let activation = thread::spawn(move || {
+        let _transaction = activation_store.lock_transaction(SUB2_GRIP)?;
+        activation_store.store(
+            &SigningTarget {
+                fingerprint: SUB2_FPR.into(),
+                keygrip: Some(SUB2_GRIP.into()),
+            },
+            b"new-credential",
+        )
+    });
+    assert_eq!(
+        transaction_waiting.recv_timeout(5 * SECS).unwrap(),
+        SUB2_GRIP
+    );
+
+    clear_gate.release();
+    assert_eq!(clear.join().unwrap().unwrap(), 1);
+    activation.join().unwrap().unwrap();
+    assert_eq!(
+        store.credential(SUB2_GRIP).as_deref(),
+        Some(b"new-credential".as_slice())
+    );
+}
+
+#[test]
 fn secret_service_outage_leaves_the_gpg_cache_untouched() {
     let tools = DaemonTools::new();
     let store = FakeStore::default();
@@ -623,6 +682,126 @@ fn rejected_cache_clear_stops_renewal_before_any_loopback_sign() {
         "a loopback sign ran after the failed clear: {}",
         running.tools.gpg_log()
     );
+    assert!(running.store.contains_key(SUB2_GRIP));
+}
+
+#[test]
+fn stale_renewal_waiting_behind_activation_has_no_side_effects() {
+    let tools = DaemonTools::new();
+    tools.set_ttls(600, 2);
+    let store = Arc::new(FakeStore::default());
+    store.preload(SUB2_GRIP, common::FAKE_PASSPHRASE.as_bytes());
+    let mut daemon = spawn_daemon(
+        tools.gpg.clone(),
+        Arc::clone(&store),
+        ShutdownPolicies::default(),
+    );
+
+    let initial = stored_activation(&tools.gpg, &store, None, 60_000, None)
+        .expect("initial activation");
+    assert_eq!(
+        ipc_at(
+            daemon.sock(),
+            &common::on_request(None, &initial, 60_000, None)
+        )
+        .unwrap()["ok"],
+        true
+    );
+    drop(initial);
+
+    let foreground = stored_activation(&tools.gpg, &store, None, 60_000, None)
+        .expect("foreground replacement");
+    let clears_before = tools.clears();
+    let loopbacks_before = tools.loopbacks();
+    let loads_before = store
+        .operations()
+        .iter()
+        .filter(|op| *op == &format!("load:{SUB2_GRIP}"))
+        .count();
+    let contention = store.observe_next_lock_contention();
+    assert_eq!(
+        contention.recv_timeout(5 * SECS).unwrap(),
+        SUB2_GRIP,
+        "renewal did not wait for the foreground transaction"
+    );
+
+    let replacement = format!(
+        "{{\"cmd\":\"on\",\"key\":null,\"key_source\":\"default\",\
+         \"interval_ms\":60000,\"hold_ms\":null,\
+         \"activated_at_ms\":1700000000000,\"fingerprint\":\"{SUB2_FPR}\",\
+         \"keygrip\":\"{SUB2_GRIP}\",\"credential_mode\":\"session\",\
+         \"default_cache_ttl_ms\":600000,\"max_cache_ttl_ms\":600000,\
+         \"cache_started_at_ms\":1700000000000}}"
+    );
+    assert_eq!(ipc_at(daemon.sock(), &replacement).unwrap()["ok"], true);
+    drop(foreground);
+    store.clear_all().unwrap();
+
+    assert_eq!(tools.clears(), clears_before);
+    assert_eq!(tools.loopbacks(), loopbacks_before);
+    assert_eq!(
+        store
+            .operations()
+            .iter()
+            .filter(|op| *op == &format!("load:{SUB2_GRIP}"))
+            .count(),
+        loads_before
+    );
+    daemon.shutdown().unwrap();
+}
+
+#[test]
+fn background_bad_passphrase_removes_credential_and_stops_hold() {
+    let running = Running::start(ShutdownPolicies::default());
+    running.hold(60_000, 2);
+    running.tools.set_passphrase("replacement-passphrase");
+
+    assert!(
+        wait_until(10 * SECS, || running.status()["hold_on"] == false),
+        "hold did not stop: {}",
+        running.status()
+    );
+    assert!(!running.store.contains_key(SUB2_GRIP));
+    let error = running.status()["last_error"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        error.contains("stored session credential was rejected"),
+        "{error}"
+    );
+    assert!(error.contains("removed"), "{error}");
+    assert!(error.contains("keyhold on -s"), "{error}");
+    assert!(!error.contains(common::FAKE_PASSPHRASE), "{error}");
+    assert!(!error.contains("replacement-passphrase"), "{error}");
+}
+
+#[test]
+fn background_bad_passphrase_composes_credential_deletion_failure() {
+    let running = Running::start(ShutdownPolicies::default());
+    running.hold(60_000, 2);
+    running.store.make_deletes_fail();
+    running.tools.set_passphrase("replacement-passphrase");
+
+    assert!(
+        wait_until(10 * SECS, || running.status()["hold_on"] == false),
+        "hold did not stop: {}",
+        running.status()
+    );
+    assert!(running.store.contains_key(SUB2_GRIP));
+    let error = running.status()["last_error"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        error.contains("stored session credential was rejected"),
+        "{error}"
+    );
+    assert!(error.contains("removing it failed"), "{error}");
+    assert!(error.contains("injected delete failure"), "{error}");
+    assert!(error.contains("keyhold on -s"), "{error}");
+    assert!(!error.contains(common::FAKE_PASSPHRASE), "{error}");
+    assert!(!error.contains("replacement-passphrase"), "{error}");
 }
 
 /// A wedged loopback gpg during renewal must be killed and reported
@@ -649,6 +828,7 @@ fn wedged_renewal_stops_the_hold_and_never_blocks_shutdown() {
         stored_activation(&tools.gpg, &store, None, 60_000, None).unwrap();
     let request = common::on_request(None, &prepared, 60_000, None);
     assert_eq!(ipc_at(&sock, &request).unwrap()["ok"], true);
+    drop(prepared);
     tools.marker("hang-loopback");
 
     assert!(
@@ -919,6 +1099,7 @@ fn off_during_an_in_flight_renewal_cannot_re_enable_the_hold() {
     tools.marker("slow");
     let request = common::on_request(None, &prepared, 60_000, None);
     assert_eq!(ipc_at(&sock, &request).unwrap()["ok"], true);
+    drop(prepared);
 
     // Wait until the renewal's new clear has happened and its deliberately
     // slow loopback is still in progress (the fake remains locked).
@@ -1389,7 +1570,3 @@ fn ordinary_activation_does_not_mutate_credentials() {
     assert!(!prepared.credential_mutated);
     assert!(store.operations().is_empty());
 }
-
-/// Silence unused warnings for helpers only some configurations use.
-#[allow(dead_code)]
-fn _unused(_: &Path) {}

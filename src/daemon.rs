@@ -701,18 +701,20 @@ fn scheduler(pair: &Pair, services: &Services) {
                         apply_ping_result(pair, snapshot.generation, Ok(()))
                     }
                     (Err(ping_err), CredentialMode::Session) => {
-                        let recovery = renew_once(services, &snapshot)
+                        let recovery = renew_once(pair, services, &snapshot)
                             .map_err(|e| {
                                 Error::Message(format!(
                                     "{ping_err}; session-credential recovery \
-                                 failed: {e}"
+                                     failed: {e}"
                                 ))
                             });
-                        apply_renewal_result(
-                            pair,
-                            snapshot.generation,
-                            recovery,
-                        );
+                        if let Some(recovery) = recovery.transpose() {
+                            apply_renewal_result(
+                                pair,
+                                snapshot.generation,
+                                recovery,
+                            );
+                        }
                     }
                     (Err(e), _) => {
                         apply_ping_result(pair, snapshot.generation, Err(e))
@@ -720,8 +722,11 @@ fn scheduler(pair: &Pair, services: &Services) {
                 }
             }
             ScheduledAction::Renew(snapshot) => {
-                let result = renew_once(services, &snapshot);
-                apply_renewal_result(pair, snapshot.generation, result);
+                if let Some(result) =
+                    renew_once(pair, services, &snapshot).transpose()
+                {
+                    apply_renewal_result(pair, snapshot.generation, result);
+                }
             }
         }
     }
@@ -773,7 +778,11 @@ impl From<&Hold> for HoldSnapshot {
 /// touching the GPG cache, clear only this keygrip's normal entry, then
 /// unlock with an exact loopback sign. The credential is zeroized when
 /// this function returns.
-fn renew_once(services: &Services, snapshot: &HoldSnapshot) -> Result<()> {
+fn renew_once(
+    pair: &Pair,
+    services: &Services,
+    snapshot: &HoldSnapshot,
+) -> Result<Option<()>> {
     let Some(keygrip) = snapshot.keygrip.as_deref() else {
         return Err(Error::Message("the hold has no resolved keygrip".into()));
     };
@@ -782,6 +791,16 @@ fn renew_once(services: &Services, snapshot: &HoldSnapshot) -> Result<()> {
             "the hold has no resolved signing key".into(),
         ));
     };
+    let _transaction = services.store.lock_transaction(keygrip)?;
+    let current = lock(pair);
+    if !current.hold.enabled
+        || current.hold.generation != snapshot.generation
+        || current.hold.credential_mode != CredentialMode::Session
+        || current.hold.keygrip.as_deref() != Some(keygrip)
+    {
+        return Ok(None);
+    }
+    drop(current);
     // Retrieve before clear: a Secret Service outage must not lock a
     // currently usable key.
     let secret = services.store.load(keygrip)?.ok_or_else(|| {
@@ -794,7 +813,21 @@ fn renew_once(services: &Services, snapshot: &HoldSnapshot) -> Result<()> {
     services.gpg.clear_passphrase(keygrip)?;
     let unlocked = services.gpg.use_key_with_passphrase(&target, &secret);
     drop(secret);
-    unlocked
+    match unlocked {
+        Ok(()) => Ok(Some(())),
+        Err(Error::BadPassphrase) => match services.store.delete(keygrip) {
+            Ok(_) => Err(Error::Message(
+                "stored session credential was rejected and removed; \
+                 run foreground `keyhold on -s` again"
+                    .into(),
+            )),
+            Err(delete_error) => Err(Error::Message(format!(
+                "stored session credential was rejected, but removing it \
+                 failed: {delete_error}; run foreground `keyhold on -s` again"
+            ))),
+        },
+        Err(e) => Err(e),
+    }
 }
 
 /// One background keepalive, using the resolved exact signing target

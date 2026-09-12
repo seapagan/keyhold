@@ -42,21 +42,21 @@ pub const APPLICATION_ATTRIBUTE: &str = "keyhold";
 /// Attribute distinguishing GPG passphrases from future item kinds.
 pub const KIND_ATTRIBUTE: &str = "gpg-passphrase";
 
-/// Owned activation-lock lifetime. Dropping the guard releases its lock.
-pub trait CredentialActivationGuard: Send {}
+/// Owned key-scoped credential transaction. Dropping it releases both locks.
+pub trait CredentialTransactionGuard: Send {}
 
-impl<T: Send> CredentialActivationGuard for T {}
+impl<T: Send> CredentialTransactionGuard for T {}
 
 /// Minimal storage contract for the session credential, so daemon and
 /// activation logic can run against a fake in tests.
 ///
 /// All operations are keyed by the agent keygrip of the signing key.
 pub trait CredentialStore: Send + Sync {
-    /// Serialize stored activation for one resolved signing keygrip.
-    fn lock_activation(
+    /// Serialize credential use and mutation for one resolved keygrip.
+    fn lock_transaction(
         &self,
         keygrip: &str,
-    ) -> Result<Box<dyn CredentialActivationGuard>>;
+    ) -> Result<Box<dyn CredentialTransactionGuard>>;
 
     /// Load the stored passphrase for `keygrip`. `Ok(None)` means no
     /// credential is stored.
@@ -83,11 +83,14 @@ pub trait CredentialStore: Send + Sync {
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SessionCredentialStore;
 
-struct StoredActivationLock {
-    _file: File,
+const STORE_LOCK_FILE: &str = "credential-store.lock";
+
+struct CredentialTransactionLock {
+    _global: File,
+    _key: File,
 }
 
-impl StoredActivationLock {
+impl CredentialTransactionLock {
     fn acquire(keygrip: &str) -> Result<Self> {
         let paths = daemon::paths()?;
         daemon::ensure_private_dir(&paths.dir)?;
@@ -102,18 +105,50 @@ impl StoredActivationLock {
                 "resolved signing key has an invalid keygrip".into(),
             ));
         }
-        let file = OpenOptions::new()
+        let global = open_lock(dir, STORE_LOCK_FILE)?;
+        fs4::FileExt::lock_shared(&global)?;
+        let key = OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
             .truncate(false)
-            .open(dir.join(format!("activation-{keygrip}.lock")))?;
-        fs4::FileExt::lock(&file)?;
-        // Keep the file: unlinking a lock file can split contenders across
+            .open(dir.join(format!("credential-{keygrip}.lock")))?;
+        fs4::FileExt::lock(&key)?;
+        // Keep both files: unlinking a lock file can split contenders across
         // different inodes. Closing it releases kernel ownership on every
         // return path and after process termination.
-        Ok(Self { _file: file })
+        Ok(Self {
+            _global: global,
+            _key: key,
+        })
     }
+}
+
+struct CredentialStoreBarrier {
+    _global: File,
+}
+
+impl CredentialStoreBarrier {
+    fn acquire() -> Result<Self> {
+        let paths = daemon::paths()?;
+        daemon::ensure_private_dir(&paths.dir)?;
+        Self::acquire_in(&paths.dir)
+    }
+
+    fn acquire_in(dir: &Path) -> Result<Self> {
+        let global = open_lock(dir, STORE_LOCK_FILE)?;
+        fs4::FileExt::lock(&global)?;
+        Ok(Self { _global: global })
+    }
+}
+
+fn open_lock(dir: &Path, name: &str) -> Result<File> {
+    Ok(OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(dir.join(name))?)
 }
 
 impl SessionCredentialStore {
@@ -168,17 +203,12 @@ impl SessionCredentialStore {
     }
 }
 
-/// Attributes identifying keyhold's session item by owner, kind, keygrip and
-/// the exact signing-key fingerprint supplied by the activation flow.
-fn item_attributes<'a>(
-    keygrip: &'a str,
-    fingerprint: &'a str,
-) -> HashMap<&'a str, &'a str> {
+/// Attributes identifying keyhold's session item by owner, kind and keygrip.
+fn item_attributes(keygrip: &str) -> HashMap<&str, &str> {
     HashMap::from([
         ("application", APPLICATION_ATTRIBUTE),
         ("kind", KIND_ATTRIBUTE),
         ("keygrip", keygrip),
-        ("fingerprint", fingerprint),
     ])
 }
 
@@ -196,11 +226,11 @@ fn ss_error(context: &str, e: secret_service::Error) -> Error {
 }
 
 impl CredentialStore for SessionCredentialStore {
-    fn lock_activation(
+    fn lock_transaction(
         &self,
         keygrip: &str,
-    ) -> Result<Box<dyn CredentialActivationGuard>> {
-        Ok(Box::new(StoredActivationLock::acquire(keygrip)?))
+    ) -> Result<Box<dyn CredentialTransactionGuard>> {
+        Ok(Box::new(CredentialTransactionLock::acquire(keygrip)?))
     }
 
     fn load(&self, keygrip: &str) -> Result<Option<Zeroizing<Vec<u8>>>> {
@@ -232,7 +262,7 @@ impl CredentialStore for SessionCredentialStore {
             collection
                 .create_item(
                     &item_label(&target.fingerprint),
-                    item_attributes(keygrip, &target.fingerprint),
+                    item_attributes(keygrip),
                     secret,
                     true,
                     "application/octet-stream",
@@ -256,6 +286,7 @@ impl CredentialStore for SessionCredentialStore {
     }
 
     fn clear_all(&self) -> Result<usize> {
+        let _barrier = CredentialStoreBarrier::acquire()?;
         Self::with_session_collection(|collection| {
             let items =
                 collection.search_items(owner_attributes()).map_err(|e| {
@@ -310,29 +341,32 @@ mod tests {
 
     use super::*;
 
-    const LOCK_TEST_ENV: &str = "KEYHOLD_ACTIVATION_LOCK_CHILD_DIR";
+    const LOCK_TEST_ENV: &str = "KEYHOLD_CREDENTIAL_LOCK_CHILD_DIR";
     const TEST_KEYGRIP: &str = "0123456789ABCDEF0123456789ABCDEF01234567";
+    const OTHER_KEYGRIP: &str = "89ABCDEF0123456789ABCDEF0123456789ABCDEF";
 
     #[test]
-    fn activation_lock_process_child() {
+    fn credential_transaction_process_child() {
         let Some(dir) = std::env::var_os(LOCK_TEST_ENV) else {
             return;
         };
-        let _guard =
-            StoredActivationLock::acquire_in(Path::new(&dir), TEST_KEYGRIP)
-                .expect("child acquires activation lock");
-        println!("KEYHOLD_ACTIVATION_LOCKED");
+        let _guard = CredentialTransactionLock::acquire_in(
+            Path::new(&dir),
+            TEST_KEYGRIP,
+        )
+        .expect("child acquires credential transaction");
+        println!("KEYHOLD_CREDENTIAL_LOCKED");
         std::io::stdout().flush().unwrap();
         let _ = std::io::stdin().read(&mut [0_u8; 1]);
     }
 
     #[test]
-    fn process_exit_releases_activation_lock_without_removing_lockfile() {
+    fn process_exit_releases_transaction_without_removing_lockfiles() {
         let dir = tempfile::TempDir::new().unwrap();
         let mut child = Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
-                "credential::tests::activation_lock_process_child",
+                "credential::tests::credential_transaction_process_child",
                 "--nocapture",
             ])
             .env(LOCK_TEST_ENV, dir.path())
@@ -345,11 +379,17 @@ mod tests {
         assert!(
             lines.any(|line| line
                 .unwrap()
-                .contains("KEYHOLD_ACTIVATION_LOCKED")),
+                .contains("KEYHOLD_CREDENTIAL_LOCKED")),
             "child exited before acquiring the lock"
         );
 
-        let path = dir.path().join(format!("activation-{TEST_KEYGRIP}.lock"));
+        let path = dir.path().join(format!("credential-{TEST_KEYGRIP}.lock"));
+        let global_path = dir.path().join("credential-store.lock");
+        let global = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&global_path)
+            .unwrap();
         let contender = OpenOptions::new()
             .read(true)
             .write(true)
@@ -359,20 +399,77 @@ mod tests {
             fs4::FileExt::try_lock(&contender).is_err(),
             "child did not hold the lock"
         );
+        assert!(
+            fs4::FileExt::try_lock(&global).is_err(),
+            "child did not hold the global shared lock"
+        );
         child.kill().unwrap();
         assert!(!child.wait().unwrap().success(), "child was not terminated");
         fs4::FileExt::try_lock(&contender)
             .expect("process exit left stale lock ownership");
+        fs4::FileExt::try_lock(&global)
+            .expect("process exit left stale global lock ownership");
         assert!(path.exists(), "lock file was unexpectedly removed");
+        assert!(
+            global_path.exists(),
+            "global lock file was unexpectedly removed"
+        );
     }
 
     #[test]
-    fn item_attributes_carry_owner_kind_and_target() {
-        let attrs = item_attributes("GRIP", "FPR");
+    fn transaction_holds_shared_global_then_exclusive_key_lock() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let transaction =
+            CredentialTransactionLock::acquire_in(dir.path(), TEST_KEYGRIP)
+                .unwrap();
+        let global = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(dir.path().join("credential-store.lock"))
+            .unwrap();
+        let key = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(dir.path().join(format!("credential-{TEST_KEYGRIP}.lock")))
+            .unwrap();
+        let other_global = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(dir.path().join("credential-store.lock"))
+            .unwrap();
+        let other_key =
+            open_lock(dir.path(), &format!("credential-{OTHER_KEYGRIP}.lock"))
+                .unwrap();
+
+        assert!(fs4::FileExt::try_lock(&global).is_err());
+        assert!(fs4::FileExt::try_lock(&key).is_err());
+        fs4::FileExt::try_lock_shared(&other_global).unwrap();
+        fs4::FileExt::try_lock(&other_key).unwrap();
+        drop(transaction);
+    }
+
+    #[test]
+    fn exclusive_store_barrier_blocks_new_transactions() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let barrier = CredentialStoreBarrier::acquire_in(dir.path()).unwrap();
+        let global = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(dir.path().join("credential-store.lock"))
+            .unwrap();
+
+        assert!(fs4::FileExt::try_lock_shared(&global).is_err());
+        drop(barrier);
+        fs4::FileExt::try_lock_shared(&global).unwrap();
+    }
+
+    #[test]
+    fn item_attributes_use_keygrip_as_the_canonical_identity() {
+        let attrs = item_attributes("GRIP");
         assert_eq!(attrs.get("application"), Some(&"keyhold"));
         assert_eq!(attrs.get("kind"), Some(&"gpg-passphrase"));
         assert_eq!(attrs.get("keygrip"), Some(&"GRIP"));
-        assert_eq!(attrs.get("fingerprint"), Some(&"FPR"));
+        assert!(!attrs.contains_key("fingerprint"));
         // Owner-only search must not pin any single key.
         let owner = owner_attributes();
         assert!(!owner.contains_key("keygrip"));

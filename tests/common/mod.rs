@@ -381,7 +381,7 @@ use std::{
 
 use keyhold::{
     config::ShutdownPolicies,
-    credential::{CredentialActivationGuard, CredentialStore},
+    credential::{CredentialStore, CredentialTransactionGuard},
     daemon,
     gpg::{Gpg, SigningTarget},
 };
@@ -521,15 +521,24 @@ struct FakeState {
     items: std::collections::HashMap<String, Vec<u8>>,
     fail_load: bool,
     fail_store: bool,
+    fail_delete: bool,
     ops: Vec<String>,
     clear_gate: Option<std::sync::Arc<ClearGate>>,
 }
 
 #[derive(Default)]
 struct FakeLocks {
-    held: Mutex<HashSet<String>>,
+    state: Mutex<FakeLockState>,
     released: Condvar,
     next_contention: Mutex<Option<std::sync::mpsc::Sender<String>>>,
+    next_clear_contention: Mutex<Option<std::sync::mpsc::Sender<()>>>,
+}
+
+#[derive(Default)]
+struct FakeLockState {
+    held: HashSet<String>,
+    transactions: usize,
+    clear_active: bool,
 }
 
 struct FakeActivationGuard {
@@ -539,12 +548,29 @@ struct FakeActivationGuard {
 
 impl Drop for FakeActivationGuard {
     fn drop(&mut self) {
-        let mut held = self
+        let mut state = self
             .locks
-            .held
+            .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        held.remove(&self.keygrip);
+        state.held.remove(&self.keygrip);
+        state.transactions -= 1;
+        self.locks.released.notify_all();
+    }
+}
+
+struct FakeClearGuard {
+    locks: Arc<FakeLocks>,
+}
+
+impl Drop for FakeClearGuard {
+    fn drop(&mut self) {
+        let mut state = self
+            .locks
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.clear_active = false;
         self.locks.released.notify_all();
     }
 }
@@ -605,6 +631,10 @@ impl FakeStore {
         self.state().fail_store = true;
     }
 
+    pub fn make_deletes_fail(&self) {
+        self.state().fail_delete = true;
+    }
+
     /// Remove a stored credential, as `keyhold credential clear` would.
     pub fn remove(&self, keygrip: &str) {
         self.state().items.remove(keygrip);
@@ -646,19 +676,31 @@ impl FakeStore {
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(sender);
         receiver
     }
+
+    pub fn observe_next_clear_contention(
+        &self,
+    ) -> std::sync::mpsc::Receiver<()> {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        *self
+            .locks
+            .next_clear_contention
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(sender);
+        receiver
+    }
 }
 
 impl CredentialStore for FakeStore {
-    fn lock_activation(
+    fn lock_transaction(
         &self,
         keygrip: &str,
-    ) -> keyhold::error::Result<Box<dyn CredentialActivationGuard>> {
-        let mut held = self
+    ) -> keyhold::error::Result<Box<dyn CredentialTransactionGuard>> {
+        let mut state = self
             .locks
-            .held
+            .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if held.contains(keygrip)
+        if state.clear_active
             && let Some(sender) = self
                 .locks
                 .next_contention
@@ -668,13 +710,29 @@ impl CredentialStore for FakeStore {
         {
             let _ = sender.send(keygrip.to_string());
         }
-        held = self
+        state = self
             .locks
             .released
-            .wait_while(held, |held| held.contains(keygrip))
+            .wait_while(state, |state| state.clear_active)
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        held.insert(keygrip.to_string());
-        drop(held);
+        state.transactions += 1;
+        if state.held.contains(keygrip)
+            && let Some(sender) = self
+                .locks
+                .next_contention
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .take()
+        {
+            let _ = sender.send(keygrip.to_string());
+        }
+        state = self
+            .locks
+            .released
+            .wait_while(state, |state| state.held.contains(keygrip))
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.held.insert(keygrip.to_string());
+        drop(state);
         Ok(Box::new(FakeActivationGuard {
             keygrip: keygrip.to_string(),
             locks: Arc::clone(&self.locks),
@@ -727,10 +785,42 @@ impl CredentialStore for FakeStore {
     fn delete(&self, keygrip: &str) -> keyhold::error::Result<bool> {
         let mut state = self.state();
         state.ops.push(format!("delete:{keygrip}"));
+        if state.fail_delete {
+            return Err(keyhold::error::Error::SecretService(
+                "injected delete failure".into(),
+            ));
+        }
         Ok(state.items.remove(keygrip).is_some())
     }
 
     fn clear_all(&self) -> keyhold::error::Result<usize> {
+        let mut locks = self
+            .locks
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if (locks.transactions != 0 || locks.clear_active)
+            && let Some(sender) = self
+                .locks
+                .next_clear_contention
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .take()
+        {
+            let _ = sender.send(());
+        }
+        locks = self
+            .locks
+            .released
+            .wait_while(locks, |locks| {
+                locks.transactions != 0 || locks.clear_active
+            })
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        locks.clear_active = true;
+        drop(locks);
+        let _barrier = FakeClearGuard {
+            locks: Arc::clone(&self.locks),
+        };
         let gate = {
             let mut state = self.state();
             state.ops.push("clear_all".into());

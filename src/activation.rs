@@ -22,7 +22,7 @@ use std::{
 use zeroize::Zeroizing;
 
 use crate::{
-    credential::{CredentialActivationGuard, CredentialStore},
+    credential::{CredentialStore, CredentialTransactionGuard},
     error::{Error, Result},
     gpg::{Gpg, GpgUse, KeyProtection, PingMode, SigningTarget},
     state::{CachePlan, CredentialMode},
@@ -47,7 +47,7 @@ pub struct Prepared {
 /// remain live through daemon handoff and rollback.
 pub struct PreparedActivation {
     prepared: Prepared,
-    _credential_guard: Option<Box<dyn CredentialActivationGuard>>,
+    _credential_transaction: Option<Box<dyn CredentialTransactionGuard>>,
 }
 
 impl Deref for PreparedActivation {
@@ -62,7 +62,10 @@ impl fmt::Debug for PreparedActivation {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("PreparedActivation")
             .field("prepared", &self.prepared)
-            .field("holds_credential_lock", &self._credential_guard.is_some())
+            .field(
+                "holds_credential_transaction",
+                &self._credential_transaction.is_some(),
+            )
             .finish()
     }
 }
@@ -156,7 +159,7 @@ fn ordinary(
             credential_mutated: false,
             warnings,
         },
-        _credential_guard: None,
+        _credential_transaction: None,
     })
 }
 
@@ -217,13 +220,13 @@ fn stored(
                 credential_mutated: false,
                 warnings,
             },
-            _credential_guard: None,
+            _credential_transaction: None,
         });
     }
 
-    let credential_guard = store.lock_activation(&keygrip).map_err(|e| {
+    let credential_transaction = store.lock_transaction(&keygrip).map_err(|e| {
         Error::Message(format!(
-            "could not lock this key's session credential activation: {e}; \
+            "could not lock this key's session credential transaction: {e}; \
              the hold was NOT enabled"
         ))
     })?;
@@ -272,7 +275,7 @@ fn stored(
             credential_mutated: freshly_typed || replaced,
             warnings,
         },
-        _credential_guard: Some(credential_guard),
+        _credential_transaction: Some(credential_transaction),
     })
 }
 

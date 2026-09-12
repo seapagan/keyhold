@@ -442,10 +442,10 @@ mod tests {
     }
 
     impl CredentialStore for Store {
-        fn lock_activation(
+        fn lock_transaction(
             &self,
             _: &str,
-        ) -> Result<Box<dyn keyhold::credential::CredentialActivationGuard>>
+        ) -> Result<Box<dyn keyhold::credential::CredentialTransactionGuard>>
         {
             Ok(Box::new(()))
         }

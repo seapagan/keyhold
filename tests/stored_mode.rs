@@ -528,6 +528,9 @@ fn unexpected_cache_loss_is_recovered_once() {
     let running = Running::start(ShutdownPolicies::default());
     // Long max TTL (no renewals); frequent pings.
     running.hold(200, 600);
+    let old_expiry = running.status()["max_expires_at_ms"]
+        .as_u64()
+        .expect("initial expiry");
 
     // Simulate an agent restart/external clear between pings. The
     // activation itself did one loopback; recovery is the next one.
@@ -538,7 +541,9 @@ fn unexpected_cache_loss_is_recovered_once() {
     assert!(
         wait_until(5 * SECS, || {
             running.tools.loopbacks() > baseline_loopbacks
-                && running.status()["last_error"].is_null()
+                && running.status()["max_expires_at_ms"]
+                    .as_u64()
+                    .is_some_and(|expiry| expiry > old_expiry)
         }),
         "recovery did not happen: {} / {}",
         running.tools.ca_log(),
@@ -547,6 +552,13 @@ fn unexpected_cache_loss_is_recovered_once() {
     let status = running.status();
     assert_eq!(status["hold_on"], true, "{status}");
     assert!(status["last_error"].is_null(), "{status}");
+    let new_expiry = status["max_expires_at_ms"]
+        .as_u64()
+        .expect("recovery expiry");
+    assert!(
+        new_expiry > old_expiry,
+        "recovery did not reset the cache epoch: {old_expiry} -> {new_expiry}"
+    );
     // Recovery ran the full recreate sequence: clear + loopback.
     assert!(running.tools.clears() > before);
     assert!(running.tools.loopbacks() >= 1);

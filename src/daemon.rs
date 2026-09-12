@@ -687,24 +687,37 @@ fn scheduler(pair: &Pair, services: &Services) {
                 apply_expiry(pair, generation);
             }
             ScheduledAction::Ping(snapshot) => {
-                let result = ping(&services.gpg, &snapshot);
                 // A stored-mode ping that failed before its scheduled
                 // renewal (agent restart, external clear, race) gets
                 // exactly one recovery attempt from the session
                 // credential; the recorded error explains both halves.
-                // Normal mode keeps today's behaviour.
-                let result = match (result, snapshot.credential_mode) {
-                    (Err(ping_err), CredentialMode::Session) => {
-                        renew_once(services, &snapshot).map_err(|e| {
-                            Error::Message(format!(
-                                "{ping_err}; session-credential recovery \
-                                 failed: {e}"
-                            ))
-                        })
+                // Successful recovery establishes a new cache epoch, so it
+                // uses renewal bookkeeping rather than plain ping timing.
+                match (
+                    ping(&services.gpg, &snapshot),
+                    snapshot.credential_mode,
+                ) {
+                    (Ok(()), _) => {
+                        apply_ping_result(pair, snapshot.generation, Ok(()))
                     }
-                    (result, _) => result,
-                };
-                apply_ping_result(pair, snapshot.generation, result);
+                    (Err(ping_err), CredentialMode::Session) => {
+                        let recovery = renew_once(services, &snapshot)
+                            .map_err(|e| {
+                                Error::Message(format!(
+                                    "{ping_err}; session-credential recovery \
+                                 failed: {e}"
+                                ))
+                            });
+                        apply_renewal_result(
+                            pair,
+                            snapshot.generation,
+                            recovery,
+                        );
+                    }
+                    (Err(e), _) => {
+                        apply_ping_result(pair, snapshot.generation, Err(e))
+                    }
+                }
             }
             ScheduledAction::Renew(snapshot) => {
                 let result = renew_once(services, &snapshot);

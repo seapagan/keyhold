@@ -13,12 +13,16 @@
 //! or errors; it exists only in [`zeroize::Zeroizing`] owners for the
 //! duration of one validation.
 
-use std::time::{Duration, SystemTime};
+use std::{
+    fmt,
+    ops::Deref,
+    time::{Duration, SystemTime},
+};
 
 use zeroize::Zeroizing;
 
 use crate::{
-    credential::CredentialStore,
+    credential::{CredentialActivationGuard, CredentialStore},
     error::{Error, Result},
     gpg::{Gpg, GpgUse, KeyProtection, PingMode, SigningTarget},
     state::{CachePlan, CredentialMode},
@@ -39,6 +43,30 @@ pub struct Prepared {
     pub warnings: Vec<String>,
 }
 
+/// Prepared activation plus any same-key transaction ownership that must
+/// remain live through daemon handoff and rollback.
+pub struct PreparedActivation {
+    prepared: Prepared,
+    _credential_guard: Option<Box<dyn CredentialActivationGuard>>,
+}
+
+impl Deref for PreparedActivation {
+    type Target = Prepared;
+
+    fn deref(&self) -> &Self::Target {
+        &self.prepared
+    }
+}
+
+impl fmt::Debug for PreparedActivation {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PreparedActivation")
+            .field("prepared", &self.prepared)
+            .field("holds_credential_lock", &self._credential_guard.is_some())
+            .finish()
+    }
+}
+
 /// The prompt the foreground stored-mode flow may use once for a new or stale
 /// credential. Valid reuse and unprotected keys do not prompt. The daemon
 /// never sees it.
@@ -56,7 +84,7 @@ pub fn activate(
     hold_for: Option<Duration>,
     store: &dyn CredentialStore,
     prompt: &Prompt<'_>,
-) -> Result<Prepared> {
+) -> Result<PreparedActivation> {
     if store_enabled {
         stored(gpg, key, interval, store, prompt)
     } else {
@@ -70,7 +98,7 @@ fn ordinary(
     key: Option<&str>,
     interval: Duration,
     hold_for: Option<Duration>,
-) -> Result<Prepared> {
+) -> Result<PreparedActivation> {
     // Best-effort: a missing/unreadable TTL policy only means keyhold
     // cannot warn truthfully; the hold itself is unaffected.
     let policy = gpg.cache_policy().ok();
@@ -116,16 +144,19 @@ fn ordinary(
             None => {}
         }
     }
-    Ok(Prepared {
-        target: used.target,
-        cache: policy.map(|policy| CachePlan {
-            mode: CredentialMode::None,
-            default_ttl: policy.default_ttl,
-            max_ttl: policy.max_ttl,
-            started_wall,
-        }),
-        credential_mutated: false,
-        warnings,
+    Ok(PreparedActivation {
+        prepared: Prepared {
+            target: used.target,
+            cache: policy.map(|policy| CachePlan {
+                mode: CredentialMode::None,
+                default_ttl: policy.default_ttl,
+                max_ttl: policy.max_ttl,
+                started_wall,
+            }),
+            credential_mutated: false,
+            warnings,
+        },
+        _credential_guard: None,
     })
 }
 
@@ -137,7 +168,7 @@ fn stored(
     interval: Duration,
     store: &dyn CredentialStore,
     prompt: &Prompt<'_>,
-) -> Result<Prepared> {
+) -> Result<PreparedActivation> {
     let policy = gpg.cache_policy().map_err(|e| {
         Error::Message(format!(
             "session credential mode needs GnuPG's cache settings: {e}; \
@@ -174,18 +205,28 @@ fn stored(
         if interval >= policy.default_ttl {
             warnings.push(interval_warning(interval, policy.default_ttl));
         }
-        return Ok(Prepared {
-            target: Some(target),
-            cache: Some(CachePlan {
-                mode: CredentialMode::NotNeeded,
-                default_ttl: policy.default_ttl,
-                max_ttl: policy.max_ttl,
-                started_wall: None,
-            }),
-            credential_mutated: false,
-            warnings,
+        return Ok(PreparedActivation {
+            prepared: Prepared {
+                target: Some(target),
+                cache: Some(CachePlan {
+                    mode: CredentialMode::NotNeeded,
+                    default_ttl: policy.default_ttl,
+                    max_ttl: policy.max_ttl,
+                    started_wall: None,
+                }),
+                credential_mutated: false,
+                warnings,
+            },
+            _credential_guard: None,
         });
     }
+
+    let credential_guard = store.lock_activation(&keygrip).map_err(|e| {
+        Error::Message(format!(
+            "could not lock this key's session credential activation: {e}; \
+             the hold was NOT enabled"
+        ))
+    })?;
 
     // Obtain the credential BEFORE clearing anything: a Secret Service
     // outage must not lock a currently usable key.
@@ -219,16 +260,19 @@ fn stored(
     if interval >= policy.default_ttl {
         warnings.push(interval_warning(interval, policy.default_ttl));
     }
-    Ok(Prepared {
-        target: Some(target),
-        cache: Some(CachePlan {
-            mode: CredentialMode::Session,
-            default_ttl: policy.default_ttl,
-            max_ttl: policy.max_ttl,
-            started_wall: Some(SystemTime::now()),
-        }),
-        credential_mutated: freshly_typed || replaced,
-        warnings,
+    Ok(PreparedActivation {
+        prepared: Prepared {
+            target: Some(target),
+            cache: Some(CachePlan {
+                mode: CredentialMode::Session,
+                default_ttl: policy.default_ttl,
+                max_ttl: policy.max_ttl,
+                started_wall: Some(SystemTime::now()),
+            }),
+            credential_mutated: freshly_typed || replaced,
+            warnings,
+        },
+        _credential_guard: Some(credential_guard),
     })
 }
 
@@ -256,9 +300,6 @@ fn unlock_epoch(
         Ok(()) => Ok(false),
         Err(Error::BadPassphrase) if replace.is_some() => {
             let (store, prompt) = replace.expect("checked");
-            // Remove the stale item; the replacement store below
-            // overwrites anyway, so a delete failure is not fatal here.
-            let _ = store.delete(keygrip);
             let fresh = prompt().map_err(|e| {
                 Error::Message(format!("{e}; the hold was NOT enabled"))
             })?;
@@ -267,6 +308,16 @@ fn unlock_epoch(
             gpg.clear_passphrase(keygrip).map_err(not_enabled)?;
             gpg.use_key_with_passphrase(target, &fresh)
                 .map_err(not_enabled)?;
+            // Loads match every item for this keygrip, while Secret Service
+            // replacement matches the complete attribute set. Remove all
+            // conclusively rejected matches only after fresh validation; the
+            // caller's same-key activation guard prevents concurrent mutation.
+            store.delete(keygrip).map_err(|e| {
+                Error::Message(format!(
+                    "the key unlocked but deleting the rejected session \
+                     credential failed: {e}; the hold was NOT enabled"
+                ))
+            })?;
             store.store(target, &fresh).map_err(|e| {
                 Error::Message(format!(
                     "the key unlocked but storing the session credential \

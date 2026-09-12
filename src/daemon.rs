@@ -378,7 +378,7 @@ fn shutdown_cleanup<F>(
 /// mode 0700, as documented. Failures are real errors: a runtime directory
 /// we could not make private must not silently pass. `$XDG_RUNTIME_DIR`
 /// itself is never modified.
-fn ensure_private_dir(dir: &Path) -> Result<()> {
+pub(crate) fn ensure_private_dir(dir: &Path) -> Result<()> {
     fs::create_dir_all(dir)?;
     fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
     Ok(())

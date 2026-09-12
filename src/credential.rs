@@ -19,7 +19,11 @@
 //! The narrow [`CredentialStore`] trait keeps daemon/state logic testable
 //! with an in-process fake instead of a live desktop keyring.
 
-use std::collections::HashMap;
+use std::{
+    collections::HashMap,
+    fs::{File, OpenOptions},
+    path::Path,
+};
 
 use secret_service::{
     EncryptionType,
@@ -28,6 +32,7 @@ use secret_service::{
 use zeroize::Zeroizing;
 
 use crate::{
+    daemon,
     error::{Error, Result},
     gpg::SigningTarget,
 };
@@ -37,11 +42,22 @@ pub const APPLICATION_ATTRIBUTE: &str = "keyhold";
 /// Attribute distinguishing GPG passphrases from future item kinds.
 pub const KIND_ATTRIBUTE: &str = "gpg-passphrase";
 
+/// Owned activation-lock lifetime. Dropping the guard releases its lock.
+pub trait CredentialActivationGuard: Send {}
+
+impl<T: Send> CredentialActivationGuard for T {}
+
 /// Minimal storage contract for the session credential, so daemon and
 /// activation logic can run against a fake in tests.
 ///
 /// All operations are keyed by the agent keygrip of the signing key.
 pub trait CredentialStore: Send + Sync {
+    /// Serialize stored activation for one resolved signing keygrip.
+    fn lock_activation(
+        &self,
+        keygrip: &str,
+    ) -> Result<Box<dyn CredentialActivationGuard>>;
+
     /// Load the stored passphrase for `keygrip`. `Ok(None)` means no
     /// credential is stored.
     fn load(&self, keygrip: &str) -> Result<Option<Zeroizing<Vec<u8>>>>;
@@ -66,6 +82,39 @@ pub trait CredentialStore: Send + Sync {
 /// no D-Bus object graph is retained in daemon state.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SessionCredentialStore;
+
+struct StoredActivationLock {
+    _file: File,
+}
+
+impl StoredActivationLock {
+    fn acquire(keygrip: &str) -> Result<Self> {
+        let paths = daemon::paths()?;
+        daemon::ensure_private_dir(&paths.dir)?;
+        Self::acquire_in(&paths.dir, keygrip)
+    }
+
+    fn acquire_in(dir: &Path, keygrip: &str) -> Result<Self> {
+        if keygrip.len() != 40
+            || !keygrip.bytes().all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Err(Error::GpgTarget(
+                "resolved signing key has an invalid keygrip".into(),
+            ));
+        }
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(dir.join(format!("activation-{keygrip}.lock")))?;
+        fs4::FileExt::lock(&file)?;
+        // Keep the file: unlinking a lock file can split contenders across
+        // different inodes. Closing it releases kernel ownership on every
+        // return path and after process termination.
+        Ok(Self { _file: file })
+    }
+}
 
 impl SessionCredentialStore {
     /// Connect to the unlocked `session` collection and run `f` on it.
@@ -147,6 +196,13 @@ fn ss_error(context: &str, e: secret_service::Error) -> Error {
 }
 
 impl CredentialStore for SessionCredentialStore {
+    fn lock_activation(
+        &self,
+        keygrip: &str,
+    ) -> Result<Box<dyn CredentialActivationGuard>> {
+        Ok(Box::new(StoredActivationLock::acquire(keygrip)?))
+    }
+
     fn load(&self, keygrip: &str) -> Result<Option<Zeroizing<Vec<u8>>>> {
         Self::with_session_collection(|collection| {
             let items = Self::find(collection, keygrip)?;
@@ -247,7 +303,68 @@ pub fn prompt_passphrase() -> Result<Zeroizing<Vec<u8>>> {
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        io::{BufRead as _, BufReader, Read as _, Write as _},
+        process::{Command, Stdio},
+    };
+
     use super::*;
+
+    const LOCK_TEST_ENV: &str = "KEYHOLD_ACTIVATION_LOCK_CHILD_DIR";
+    const TEST_KEYGRIP: &str = "0123456789ABCDEF0123456789ABCDEF01234567";
+
+    #[test]
+    fn activation_lock_process_child() {
+        let Some(dir) = std::env::var_os(LOCK_TEST_ENV) else {
+            return;
+        };
+        let _guard =
+            StoredActivationLock::acquire_in(Path::new(&dir), TEST_KEYGRIP)
+                .expect("child acquires activation lock");
+        println!("KEYHOLD_ACTIVATION_LOCKED");
+        std::io::stdout().flush().unwrap();
+        let _ = std::io::stdin().read(&mut [0_u8; 1]);
+    }
+
+    #[test]
+    fn process_exit_releases_activation_lock_without_removing_lockfile() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "credential::tests::activation_lock_process_child",
+                "--nocapture",
+            ])
+            .env(LOCK_TEST_ENV, dir.path())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let stdout = child.stdout.take().unwrap();
+        let mut lines = BufReader::new(stdout).lines();
+        assert!(
+            lines.any(|line| line
+                .unwrap()
+                .contains("KEYHOLD_ACTIVATION_LOCKED")),
+            "child exited before acquiring the lock"
+        );
+
+        let path = dir.path().join(format!("activation-{TEST_KEYGRIP}.lock"));
+        let contender = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        assert!(
+            fs4::FileExt::try_lock(&contender).is_err(),
+            "child did not hold the lock"
+        );
+        child.kill().unwrap();
+        assert!(!child.wait().unwrap().success(), "child was not terminated");
+        fs4::FileExt::try_lock(&contender)
+            .expect("process exit left stale lock ownership");
+        assert!(path.exists(), "lock file was unexpectedly removed");
+    }
 
     #[test]
     fn item_attributes_carry_owner_kind_and_target() {

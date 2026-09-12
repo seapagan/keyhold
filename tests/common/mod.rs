@@ -373,11 +373,15 @@ pub fn wait_with_kill(child: &mut std::process::Child, timeout: Duration) {
 // credential store injected into `daemon::run_with`).
 // ---------------------------------------------------------------------------
 
-use std::{path::Path, sync::Mutex};
+use std::{
+    collections::HashSet,
+    path::Path,
+    sync::{Arc, Condvar, Mutex},
+};
 
 use keyhold::{
     config::ShutdownPolicies,
-    credential::CredentialStore,
+    credential::{CredentialActivationGuard, CredentialStore},
     daemon,
     gpg::{Gpg, SigningTarget},
 };
@@ -509,6 +513,7 @@ fn daemon_keys() -> String {
 #[derive(Default)]
 pub struct FakeStore {
     state: Mutex<FakeState>,
+    locks: Arc<FakeLocks>,
 }
 
 #[derive(Default)]
@@ -518,6 +523,30 @@ struct FakeState {
     fail_store: bool,
     ops: Vec<String>,
     clear_gate: Option<std::sync::Arc<ClearGate>>,
+}
+
+#[derive(Default)]
+struct FakeLocks {
+    held: Mutex<HashSet<String>>,
+    released: Condvar,
+    next_contention: Mutex<Option<std::sync::mpsc::Sender<String>>>,
+}
+
+struct FakeActivationGuard {
+    keygrip: String,
+    locks: Arc<FakeLocks>,
+}
+
+impl Drop for FakeActivationGuard {
+    fn drop(&mut self) {
+        let mut held = self
+            .locks
+            .held
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        held.remove(&self.keygrip);
+        self.locks.released.notify_all();
+    }
 }
 
 struct ClearGate {
@@ -585,6 +614,10 @@ impl FakeStore {
         self.state().items.contains_key(keygrip)
     }
 
+    pub fn credential(&self, keygrip: &str) -> Option<Vec<u8>> {
+        self.state().items.get(keygrip).cloned()
+    }
+
     pub fn operations(&self) -> Vec<String> {
         self.state().ops.clone()
     }
@@ -601,9 +634,53 @@ impl FakeStore {
             release: Some(release_tx),
         }
     }
+
+    pub fn observe_next_lock_contention(
+        &self,
+    ) -> std::sync::mpsc::Receiver<String> {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        *self
+            .locks
+            .next_contention
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(sender);
+        receiver
+    }
 }
 
 impl CredentialStore for FakeStore {
+    fn lock_activation(
+        &self,
+        keygrip: &str,
+    ) -> keyhold::error::Result<Box<dyn CredentialActivationGuard>> {
+        let mut held = self
+            .locks
+            .held
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if held.contains(keygrip)
+            && let Some(sender) = self
+                .locks
+                .next_contention
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .take()
+        {
+            let _ = sender.send(keygrip.to_string());
+        }
+        held = self
+            .locks
+            .released
+            .wait_while(held, |held| held.contains(keygrip))
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        held.insert(keygrip.to_string());
+        drop(held);
+        Ok(Box::new(FakeActivationGuard {
+            keygrip: keygrip.to_string(),
+            locks: Arc::clone(&self.locks),
+        }))
+    }
+
     fn load(
         &self,
         keygrip: &str,
@@ -805,7 +882,7 @@ pub fn stored_activation(
     key: Option<&str>,
     interval_ms: u64,
     hold_ms: Option<u64>,
-) -> keyhold::error::Result<keyhold::activation::Prepared> {
+) -> keyhold::error::Result<keyhold::activation::PreparedActivation> {
     keyhold::activation::activate(
         gpg,
         true,

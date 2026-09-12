@@ -442,6 +442,14 @@ mod tests {
     }
 
     impl CredentialStore for Store {
+        fn lock_activation(
+            &self,
+            _: &str,
+        ) -> Result<Box<dyn keyhold::credential::CredentialActivationGuard>>
+        {
+            Ok(Box::new(()))
+        }
+
         fn load(&self, _: &str) -> Result<Option<Zeroizing<Vec<u8>>>> {
             unreachable!()
         }

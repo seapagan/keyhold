@@ -21,6 +21,7 @@ use common::{
 use keyhold::{
     activation,
     config::ShutdownPolicies,
+    credential::CredentialStore,
     error::{Error, Result},
     gpg::{Gpg, KeyProtection, PingMode},
 };
@@ -169,16 +170,267 @@ fn stale_stored_credential_is_replaced_after_one_prompt() {
         keyhold::state::CredentialMode::Session
     );
     let ops = store.operations();
-    // The stale item was deleted and the replacement stored, in order.
+    // Delete only after the fresh passphrase has validated. Secret Service
+    // replacement matches the complete attribute set, while loads match the
+    // keygrip, so clearing all stale keygrip matches avoids duplicates.
     let delete = ops
         .iter()
         .position(|op| op == &format!("delete:{SUB2_GRIP}"))
-        .expect("stale deleted");
+        .expect("stale keygrip items deleted after validation");
     let store_at = ops
         .iter()
         .position(|op| op == &format!("store:{SUB2_GRIP}"))
         .expect("replacement stored");
     assert!(delete < store_at, "{ops:?}");
+}
+
+#[test]
+fn stale_replacement_store_failure_leaves_no_rejected_credential() {
+    let tools = DaemonTools::new();
+    let store = FakeStore::default();
+    store.preload(SUB2_GRIP, b"stale-wrong-passphrase");
+    store.make_stores_fail();
+
+    let err = activation::activate(
+        &tools.gpg,
+        true,
+        None,
+        Duration::from_secs(60),
+        None,
+        &store,
+        &Prompted::new(common::FAKE_PASSPHRASE).as_fn(),
+    )
+    .unwrap_err();
+
+    assert!(
+        err.to_string()
+            .contains("storing the session credential failed"),
+        "{err}"
+    );
+    assert!(
+        !store.contains_key(SUB2_GRIP),
+        "conclusively rejected credential survived replacement"
+    );
+    assert_eq!(
+        store.operations(),
+        [
+            format!("load:{SUB2_GRIP}"),
+            format!("delete:{SUB2_GRIP}"),
+            format!("store:{SUB2_GRIP}"),
+        ]
+    );
+}
+
+#[test]
+fn cancelled_stale_replacement_preserves_the_stored_credential() {
+    let tools = DaemonTools::new();
+    let store = FakeStore::default();
+    store.preload(SUB2_GRIP, b"stale-wrong-passphrase");
+
+    let err = activation::activate(
+        &tools.gpg,
+        true,
+        None,
+        Duration::from_secs(60),
+        None,
+        &store,
+        &|| Err(Error::Message("prompt cancelled".into())),
+    )
+    .unwrap_err();
+
+    assert!(err.to_string().contains("prompt cancelled"), "{err}");
+    assert!(
+        store.contains_key(SUB2_GRIP),
+        "cancel removed the stale credential"
+    );
+    assert!(
+        !store
+            .operations()
+            .iter()
+            .any(|op| op.starts_with("delete:") || op.starts_with("store:")),
+        "cancel partially mutated the store: {:?}",
+        store.operations()
+    );
+}
+
+#[test]
+fn same_key_activation_cannot_supersede_before_rollback_finishes() {
+    let first_tools = DaemonTools::new();
+    first_tools.set_passphrase("first-passphrase");
+    let store = Arc::new(FakeStore::default());
+    let daemon_tools = DaemonTools::new();
+    let daemon = spawn_daemon(
+        daemon_tools.gpg.clone(),
+        Arc::clone(&store),
+        ShutdownPolicies::default(),
+    );
+    let first = activation::activate(
+        &first_tools.gpg,
+        true,
+        None,
+        Duration::from_secs(60),
+        None,
+        store.as_ref(),
+        &|| Ok(Zeroizing::new(b"first-passphrase".to_vec())),
+    )
+    .expect("first activation prepares");
+
+    let contention = store.observe_next_lock_contention();
+    let second_store = Arc::clone(&store);
+    let second = thread::spawn(move || {
+        let tools = DaemonTools::new();
+        tools.set_passphrase("second-passphrase");
+        activation::activate(
+            &tools.gpg,
+            true,
+            Some(SUB2_FPR),
+            Duration::from_secs(60),
+            None,
+            second_store.as_ref(),
+            &|| Ok(Zeroizing::new(b"second-passphrase".to_vec())),
+        )
+    });
+
+    assert_eq!(
+        contention.recv_timeout(5 * SECS).unwrap(),
+        SUB2_GRIP,
+        "second activation did not contend on the resolved keygrip"
+    );
+    store.delete(SUB2_GRIP).expect("first rollback succeeds");
+    drop(first);
+    let second = second.join().unwrap().expect("second activation prepares");
+    let request = common::on_request(None, &second, 60_000, None);
+    assert_eq!(ipc_at(daemon.sock(), &request).unwrap()["ok"], true);
+    drop(second);
+
+    assert_eq!(
+        store.credential(SUB2_GRIP).as_deref(),
+        Some(b"second-passphrase".as_slice()),
+        "older rollback removed the later successful activation"
+    );
+    assert_eq!(status_at(daemon.sock()).unwrap()["hold_on"], true);
+}
+
+#[test]
+fn different_keygrips_do_not_share_an_activation_lock() {
+    let first_tools = DaemonTools::new();
+    let store = Arc::new(FakeStore::default());
+    let first = activation::activate(
+        &first_tools.gpg,
+        true,
+        None,
+        Duration::from_secs(60),
+        None,
+        store.as_ref(),
+        &|| Ok(Zeroizing::new(common::FAKE_PASSPHRASE.as_bytes().to_vec())),
+    )
+    .expect("first activation prepares");
+
+    let second_store = Arc::clone(&store);
+    let (completed_tx, completed_rx) = std::sync::mpsc::channel();
+    let second = thread::spawn(move || {
+        let tools = DaemonTools::new();
+        // Force probe_target through the selector-aware key listing; the
+        // hot-cache fixture's SIG_CREATED is intentionally always SUB2_FPR.
+        tools.drop_cache();
+        let result = activation::activate(
+            &tools.gpg,
+            true,
+            Some(SUB_FPR),
+            Duration::from_secs(60),
+            None,
+            second_store.as_ref(),
+            &|| {
+                Ok(Zeroizing::new(common::FAKE_PASSPHRASE.as_bytes().to_vec()))
+            },
+        );
+        completed_tx.send(result).unwrap();
+    });
+
+    let second_prepared = completed_rx
+        .recv_timeout(5 * SECS)
+        .expect("different-key activation was unnecessarily serialized")
+        .expect("different-key activation prepares");
+    assert_eq!(
+        second_prepared
+            .target
+            .as_ref()
+            .and_then(|target| target.keygrip.as_deref()),
+        Some(SUB_GRIP)
+    );
+    drop(second_prepared);
+    drop(first);
+    second.join().unwrap();
+}
+
+#[test]
+fn stale_replacement_blocks_same_key_until_cancel_releases_ownership() {
+    let store = Arc::new(FakeStore::default());
+    store.preload(SUB2_GRIP, b"stale-wrong-passphrase");
+    let (prompted_tx, prompted_rx) = std::sync::mpsc::channel();
+    let (cancel_tx, cancel_rx) = std::sync::mpsc::channel();
+    let first_store = Arc::clone(&store);
+    let first = thread::spawn(move || {
+        let tools = DaemonTools::new();
+        activation::activate(
+            &tools.gpg,
+            true,
+            None,
+            Duration::from_secs(60),
+            None,
+            first_store.as_ref(),
+            &|| {
+                prompted_tx.send(()).unwrap();
+                cancel_rx.recv().unwrap();
+                Err(Error::Message("prompt cancelled".into()))
+            },
+        )
+    });
+    prompted_rx
+        .recv_timeout(5 * SECS)
+        .expect("first activation did not reach replacement prompt");
+
+    let contention = store.observe_next_lock_contention();
+    let second_store = Arc::clone(&store);
+    let second = thread::spawn(move || {
+        let tools = DaemonTools::new();
+        activation::activate(
+            &tools.gpg,
+            true,
+            None,
+            Duration::from_secs(60),
+            None,
+            second_store.as_ref(),
+            &|| {
+                Ok(Zeroizing::new(common::FAKE_PASSPHRASE.as_bytes().to_vec()))
+            },
+        )
+    });
+    assert_eq!(
+        contention.recv_timeout(5 * SECS).unwrap(),
+        SUB2_GRIP,
+        "second stale replacement entered the same-key transaction"
+    );
+
+    cancel_tx.send(()).unwrap();
+    assert!(
+        first.join().unwrap().is_err(),
+        "cancel unexpectedly succeeded"
+    );
+    drop(second.join().unwrap().expect("second replacement succeeds"));
+    assert_eq!(
+        store.credential(SUB2_GRIP).as_deref(),
+        Some(common::FAKE_PASSPHRASE.as_bytes())
+    );
+    let operations = store.operations();
+    assert_eq!(
+        operations
+            .iter()
+            .filter(|op| *op == &format!("delete:{SUB2_GRIP}"))
+            .count(),
+        1,
+        "only the successful replacement may delete: {operations:?}"
+    );
 }
 
 #[test]

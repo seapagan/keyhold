@@ -229,14 +229,14 @@ pub fn run(gpg: Gpg) -> Result<()> {
 /// to inject a refresh.
 ///
 /// Clean shutdown (a `shutdown` IPC request, SIGTERM, or SIGINT on a
-/// foreground daemon) removes the socket and then runs the configured
-/// [`ShutdownPolicies`] synchronously: optionally delete keyhold's
-/// Secret Service session items, then optionally clear the GPG cache
-/// entry of the most recently resolved signing key — metadata that is
-/// deliberately retained after `off`, `--for` expiry or a hold
-/// failure, because the cache entry can outlive the hold. Cleanup
-/// failures are reported to stderr and never prevent the rest of
-/// shutdown; no guarantee exists for SIGKILL, crashes or power loss.
+/// foreground daemon) first quiesces and drains accepted requests, then runs
+/// the configured [`ShutdownPolicies`] synchronously, and then removes the
+/// socket. Policies optionally delete keyhold's Secret Service session items
+/// and clear the GPG cache entry of the most recently resolved signing key.
+/// The daemon retains this metadata after `off`, `--for` expiry or a hold
+/// failure because the cache entry can outlive the hold. Cleanup failures are
+/// reported to stderr and never prevent the rest of shutdown; no guarantee
+/// exists for SIGKILL, crashes or power loss.
 pub fn run_with(
     paths: &Paths,
     gpg: Gpg,
@@ -265,7 +265,9 @@ where
     let pair: Pair = Arc::new((
         Mutex::new(Shared {
             hold: Hold::default(),
+            stopping: false,
             shutdown: false,
+            active_connections: 0,
         }),
         Condvar::new(),
     ));
@@ -277,22 +279,48 @@ where
     // self-pipe based, so nothing but async-signal-safe bookkeeping ever
     // runs inside a signal handler.
     let mut signals = Signals::new([SIGINT, SIGTERM])?;
+    let signal_handle = signals.handle();
     let signal_pair = Arc::clone(&pair);
-    thread::Builder::new()
+    let signal_join = thread::Builder::new()
         .name("keyhold-signals".into())
         .spawn(move || {
             if signals.forever().next().is_some() {
-                lock(&signal_pair).shutdown = true;
+                let mut shared = lock(&signal_pair);
+                shared.stopping = true;
+                shared.shutdown = true;
+                drop(shared);
                 signal_pair.1.notify_all();
             }
         })?;
 
     let accept_pair = Arc::clone(&pair);
-    thread::Builder::new()
+    let accept_join = thread::Builder::new()
         .name("keyhold-accept".into())
         .spawn(move || accept_loop(listener, accept_pair))?;
 
     scheduler(&pair, &services);
+
+    // Wake the blocking accept after final shutdown is permitted, then wait
+    // until it can no longer admit connections. A connection accepted before
+    // `stopping` was set already owns an active-count guard and is drained
+    // below; the wake connection is rejected without becoming active.
+    let _ = UnixStream::connect(&paths.sock);
+    if accept_join.join().is_err() {
+        eprintln!("keyhold: daemon: accept thread panicked during shutdown");
+    }
+    let mut shared = lock(&pair);
+    while shared.active_connections != 0 {
+        shared = pair
+            .1
+            .wait(shared)
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+    }
+    drop(shared);
+
+    signal_handle.close();
+    if signal_join.join().is_err() {
+        eprintln!("keyhold: daemon: signal thread panicked during shutdown");
+    }
 
     // Synchronous cleanup while the process still exists: the policies
     // run after the scheduler stops and before the socket disappears.
@@ -399,7 +427,13 @@ type Pair = Arc<(Mutex<Shared>, Condvar)>;
 #[derive(Debug)]
 struct Shared {
     hold: Hold,
+    /// A shutdown request has linearized; ordinary work is rejected.
+    stopping: bool,
+    /// The scheduler may exit because the Shutdown ACK was written, or a
+    /// termination signal requires no acknowledgement.
     shutdown: bool,
+    /// Handlers for connections accepted while admission was still open.
+    active_connections: usize,
 }
 
 fn lock(pair: &Pair) -> MutexGuard<'_, Shared> {
@@ -409,13 +443,31 @@ fn lock(pair: &Pair) -> MutexGuard<'_, Shared> {
 }
 
 fn accept_loop(listener: UnixListener, pair: Pair) {
-    for stream in listener.incoming() {
-        match stream {
-            Ok(stream) => {
+    loop {
+        match listener.accept() {
+            Ok((stream, _)) => {
+                let guard = {
+                    let mut shared = lock(&pair);
+                    if shared.stopping {
+                        return;
+                    }
+                    shared.active_connections += 1;
+                    ActiveConnection {
+                        pair: Arc::clone(&pair),
+                    }
+                };
                 let pair = Arc::clone(&pair);
-                let _ = thread::Builder::new()
+                if let Err(e) = thread::Builder::new()
                     .name("keyhold-conn".into())
-                    .spawn(move || handle(stream, pair));
+                    .spawn(move || {
+                        let _guard = guard;
+                        handle(stream, pair);
+                    })
+                {
+                    eprintln!(
+                        "keyhold: daemon: spawning a connection handler failed: {e}"
+                    );
+                }
             }
             // A failing `accept` must not busy-spin the loop: report it
             // and pause before the next attempt.
@@ -426,9 +478,23 @@ fn accept_loop(listener: UnixListener, pair: Pair) {
                 thread::sleep(ACCEPT_RETRY_DELAY);
             }
         }
-        if lock(&pair).shutdown {
+        if lock(&pair).stopping {
             return;
         }
+    }
+}
+
+struct ActiveConnection {
+    pair: Pair,
+}
+
+impl Drop for ActiveConnection {
+    fn drop(&mut self) {
+        let mut shared = lock(&self.pair);
+        shared.active_connections =
+            shared.active_connections.saturating_sub(1);
+        drop(shared);
+        self.pair.1.notify_all();
     }
 }
 
@@ -462,6 +528,12 @@ fn handle(stream: UnixStream, pair: Pair) {
 /// should shut down once that response has been acknowledged.
 fn apply(request: Request, pair: &Pair) -> (Response, bool) {
     let mut shared = lock(pair);
+    if shared.stopping {
+        return match request {
+            Request::Shutdown => (Response::ok(), false),
+            _ => (Response::err("daemon is shutting down"), false),
+        };
+    }
     match request {
         Request::Ping => (Response::ok(), false),
         Request::On {
@@ -561,9 +633,12 @@ fn apply(request: Request, pair: &Pair) -> (Response, bool) {
         Request::Status => {
             (Response::with_status(shared.hold.status()), false)
         }
-        // The flag itself is set by `handle` after the acknowledgement is
-        // written; setting it here would let the scheduler exit first.
-        Request::Shutdown => (Response::ok(), true),
+        // Close request admission under the state lock. The distinct final
+        // flag is set by `handle` only after writing the acknowledgement.
+        Request::Shutdown => {
+            shared.stopping = true;
+            (Response::ok(), true)
+        }
     }
 }
 
@@ -853,10 +928,58 @@ mod tests {
         Arc::new((
             Mutex::new(Shared {
                 hold,
+                stopping: false,
                 shutdown: false,
+                active_connections: 0,
             }),
             Condvar::new(),
         ))
+    }
+
+    fn ordinary_on(key: &str) -> Request {
+        Request::On {
+            key: Some(key.into()),
+            key_source: crate::state::KeySource::Explicit,
+            interval_ms: 60_000,
+            hold_ms: None,
+            activated_at_ms: 2_000,
+            fingerprint: None,
+            keygrip: None,
+            credential_mode: CredentialMode::None,
+            default_cache_ttl_ms: None,
+            max_cache_ttl_ms: None,
+            cache_started_at_ms: None,
+        }
+    }
+
+    #[test]
+    fn shutdown_stops_admission_before_final_shutdown_is_permitted() {
+        let pair = pair_with(Hold::default());
+
+        let (response, permit_final_shutdown) =
+            apply(Request::Shutdown, &pair);
+
+        assert!(response.ok);
+        assert!(permit_final_shutdown);
+        let shared = lock(&pair);
+        assert!(shared.stopping);
+        assert!(!shared.shutdown, "scheduler may not exit before the ACK");
+    }
+
+    #[test]
+    fn mutable_requests_are_rejected_after_shutdown_linearizes() {
+        let pair = pair_with(Hold::default());
+        assert!(apply(ordinary_on("OLD"), &pair).0.ok);
+        assert!(apply(Request::Shutdown, &pair).0.ok);
+
+        let on = apply(ordinary_on("NEW"), &pair).0;
+        let off = apply(Request::Off, &pair).0;
+
+        assert_eq!(on.error.as_deref(), Some("daemon is shutting down"));
+        assert_eq!(off.error.as_deref(), Some("daemon is shutting down"));
+        let shared = lock(&pair);
+        assert!(shared.hold.enabled);
+        assert_eq!(shared.hold.key.as_deref(), Some("OLD"));
     }
 
     fn target(fingerprint: &str, keygrip: &str) -> SigningTarget {

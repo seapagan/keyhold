@@ -32,6 +32,9 @@ pub struct Prepared {
     pub target: Option<SigningTarget>,
     /// GPG cache tracking metadata for the daemon.
     pub cache: Option<CachePlan>,
+    /// Whether this activation stored or replaced a session credential.
+    /// This is non-secret provenance used only for safe handoff rollback.
+    pub credential_mutated: bool,
     /// Truthfulness warnings for the user (ordinary-mode limitations).
     pub warnings: Vec<String>,
 }
@@ -120,6 +123,7 @@ fn ordinary(
             max_ttl: policy.max_ttl,
             started_wall,
         }),
+        credential_mutated: false,
         warnings,
     })
 }
@@ -177,6 +181,7 @@ fn stored(
                 max_ttl: policy.max_ttl,
                 started_wall: None,
             }),
+            credential_mutated: false,
             warnings,
         });
     }
@@ -200,7 +205,7 @@ fn stored(
     // A freshly typed credential that is rejected simply fails; a stored
     // one may be stale and gets one replacement round.
     let replace = (!freshly_typed).then_some((store, prompt));
-    unlock_epoch(gpg, &target, &keygrip, &secret, replace)?;
+    let replaced = unlock_epoch(gpg, &target, &keygrip, &secret, replace)?;
     if freshly_typed {
         store.store(&target, &secret).map_err(|e| {
             Error::Message(format!(
@@ -221,6 +226,7 @@ fn stored(
             max_ttl: policy.max_ttl,
             started_wall: Some(SystemTime::now()),
         }),
+        credential_mutated: freshly_typed || replaced,
         warnings,
     })
 }
@@ -236,7 +242,7 @@ fn unlock_epoch(
     keygrip: &str,
     secret: &Zeroizing<Vec<u8>>,
     replace: Option<(&dyn CredentialStore, &Prompt)>,
-) -> Result<()> {
+) -> Result<bool> {
     let not_enabled =
         |e: Error| Error::Message(format!("{e}; the hold was NOT enabled"));
     gpg.clear_passphrase(keygrip).map_err(|e| {
@@ -246,7 +252,7 @@ fn unlock_epoch(
         ))
     })?;
     match gpg.use_key_with_passphrase(target, secret) {
-        Ok(()) => Ok(()),
+        Ok(()) => Ok(false),
         Err(Error::BadPassphrase) if replace.is_some() => {
             let (store, prompt) = replace.expect("checked");
             // Remove the stale item; the replacement store below
@@ -265,7 +271,8 @@ fn unlock_epoch(
                     "the key unlocked but storing the session credential \
                      failed: {e}; the hold was NOT enabled"
                 ))
-            })
+            })?;
+            Ok(true)
         }
         Err(e) => Err(not_enabled(e)),
     }

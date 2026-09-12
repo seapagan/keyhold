@@ -5,7 +5,14 @@
 
 mod common;
 
-use std::{path::Path, sync::Arc, thread, time::Duration};
+use std::{
+    io::{Read, Write},
+    os::unix::net::UnixStream,
+    path::Path,
+    sync::Arc,
+    thread,
+    time::Duration,
+};
 
 use common::{
     DaemonTools, FakeStore, SUB_FPR, SUB_GRIP, SUB2_FPR, SUB2_GRIP, ipc_at,
@@ -20,10 +27,6 @@ use keyhold::{
 use zeroize::Zeroizing;
 
 const SECS: Duration = Duration::from_secs(1);
-
-fn tmp() -> tempfile::TempDir {
-    tempfile::TempDir::new().unwrap()
-}
 
 /// A prompt stub that hands out the correct passphrase and records that
 /// it was used.
@@ -62,7 +65,7 @@ fn no_prompt() -> Result<Zeroizing<Vec<u8>>> {
 
 #[test]
 fn first_stored_activation_prompts_validates_and_stores() {
-    let tools = DaemonTools::new(tmp().path());
+    let tools = DaemonTools::new();
     let store = FakeStore::default();
     // Cache starts hot (unlocked) so probing resolves via SIG_CREATED.
     assert!(!tools.has("locked"));
@@ -80,6 +83,7 @@ fn first_stored_activation_prompts_validates_and_stores() {
     )
     .expect("activation succeeds");
     assert_eq!(prompted.count(), 1, "exactly one prompt");
+    assert!(prepared.credential_mutated, "fresh credential was stored");
     assert!(prepared.target.is_some());
     let cache = prepared.cache.expect("cache plan");
     assert_eq!(cache.mode, keyhold::state::CredentialMode::Session);
@@ -108,7 +112,7 @@ fn first_stored_activation_prompts_validates_and_stores() {
 
 #[test]
 fn stored_activation_reuses_an_existing_credential_without_prompting() {
-    let tools = DaemonTools::new(tmp().path());
+    let tools = DaemonTools::new();
     let store = FakeStore::default();
     store.preload(SUB2_GRIP, common::FAKE_PASSPHRASE.as_bytes());
 
@@ -126,6 +130,10 @@ fn stored_activation_reuses_an_existing_credential_without_prompting() {
         prepared.cache.unwrap().mode,
         keyhold::state::CredentialMode::Session
     );
+    assert!(
+        !prepared.credential_mutated,
+        "reused credential was not replaced"
+    );
     // Validated with the stored credential (loopback happened) and not
     // stored again.
     assert!(tools.loopbacks() >= 1);
@@ -138,7 +146,7 @@ fn stored_activation_reuses_an_existing_credential_without_prompting() {
 
 #[test]
 fn stale_stored_credential_is_replaced_after_one_prompt() {
-    let tools = DaemonTools::new(tmp().path());
+    let tools = DaemonTools::new();
     let store = FakeStore::default();
     store.preload(SUB2_GRIP, b"stale-wrong-passphrase");
 
@@ -155,6 +163,7 @@ fn stale_stored_credential_is_replaced_after_one_prompt() {
     )
     .expect("replacement activation succeeds");
     assert_eq!(prompted.count(), 1);
+    assert!(prepared.credential_mutated, "stale credential was replaced");
     assert_eq!(
         prepared.cache.unwrap().mode,
         keyhold::state::CredentialMode::Session
@@ -174,7 +183,7 @@ fn stale_stored_credential_is_replaced_after_one_prompt() {
 
 #[test]
 fn secret_service_outage_leaves_the_gpg_cache_untouched() {
-    let tools = DaemonTools::new(tmp().path());
+    let tools = DaemonTools::new();
     let store = FakeStore::default();
     store.make_loads_fail();
 
@@ -201,7 +210,7 @@ fn secret_service_outage_leaves_the_gpg_cache_untouched() {
 
 #[test]
 fn unprotected_key_needs_no_credential() {
-    let tools = DaemonTools::new(tmp().path());
+    let tools = DaemonTools::new();
     tools.set_key_protection("C");
     let store = FakeStore::default();
 
@@ -218,6 +227,7 @@ fn unprotected_key_needs_no_credential() {
     let cache = prepared.cache.unwrap();
     assert_eq!(cache.mode, keyhold::state::CredentialMode::NotNeeded);
     assert!(cache.started_wall.is_none());
+    assert!(!prepared.credential_mutated);
     assert!(
         !store
             .operations()
@@ -232,7 +242,7 @@ fn unprotected_key_needs_no_credential() {
 
 #[test]
 fn unknown_protection_is_rejected() {
-    let tools = DaemonTools::new(tmp().path());
+    let tools = DaemonTools::new();
     tools.set_key_protection("-");
     let store = FakeStore::default();
 
@@ -256,7 +266,7 @@ fn unknown_protection_is_rejected() {
 
 #[test]
 fn wrong_typed_passphrase_fails_without_storing() {
-    let tools = DaemonTools::new(tmp().path());
+    let tools = DaemonTools::new();
     let store = FakeStore::default();
     let prompted = Prompted::new("definitely-wrong");
 
@@ -280,7 +290,7 @@ fn wrong_typed_passphrase_fails_without_storing() {
 
 #[test]
 fn store_failure_after_unlock_fails_the_activation() {
-    let tools = DaemonTools::new(tmp().path());
+    let tools = DaemonTools::new();
     let store = FakeStore::default();
     store.make_stores_fail();
     let prompted = Prompted::new(common::FAKE_PASSPHRASE);
@@ -309,7 +319,7 @@ fn store_failure_after_unlock_fails_the_activation() {
 /// nothing (a hot cache would satisfy it).
 #[test]
 fn rejected_cache_clear_aborts_the_stored_activation() {
-    let tools = DaemonTools::new(tmp().path());
+    let tools = DaemonTools::new();
     let store = FakeStore::default();
     store.preload(SUB2_GRIP, common::FAKE_PASSPHRASE.as_bytes());
     tools.marker("fail-clear");
@@ -371,19 +381,19 @@ fn rejected_cache_clear_stops_renewal_before_any_loopback_sign() {
 /// (the hold stops cleanly), and must never block daemon shutdown.
 #[test]
 fn wedged_renewal_stops_the_hold_and_never_blocks_shutdown() {
-    let runtime = tmp();
-    let mut tools = DaemonTools::new(runtime.path());
+    let mut tools = DaemonTools::new();
     tools.gpg = tools
         .gpg
         .clone()
         .with_unattended_timeout(Duration::from_millis(300));
     let store = Arc::new(FakeStore::default());
     store.preload(SUB2_GRIP, common::FAKE_PASSPHRASE.as_bytes());
-    let (daemon_runtime, sock) = spawn_daemon(
+    let mut daemon = spawn_daemon(
         tools.gpg.clone(),
         Arc::clone(&store),
         Default::default(),
     );
+    let sock = daemon.sock().to_path_buf();
 
     // 2s hard max renews ~1.8s in; the renewal's loopback sign hangs.
     tools.set_ttls(600, 2);
@@ -425,7 +435,8 @@ fn wedged_renewal_stops_the_hold_and_never_blocks_shutdown() {
         wait_until(2 * SECS, || !sock.exists()),
         "daemon shutdown was blocked by the wedged operation"
     );
-    drop((daemon_runtime, tools));
+    daemon.wait().unwrap();
+    drop(tools);
 }
 
 // ---------------------------------------------------------------------------
@@ -434,7 +445,7 @@ fn wedged_renewal_stops_the_hold_and_never_blocks_shutdown() {
 
 /// A running in-process daemon plus its tooling and store.
 struct Running {
-    _runtime: tempfile::TempDir,
+    _daemon: common::TestDaemon,
     sock: std::path::PathBuf,
     tools: DaemonTools,
     store: Arc<FakeStore>,
@@ -442,15 +453,15 @@ struct Running {
 
 impl Running {
     fn start(policies: ShutdownPolicies) -> Self {
-        let runtime = tmp();
-        let tools = DaemonTools::new(runtime.path());
+        let tools = DaemonTools::new();
         // Each daemon needs its own tooling (logs are per-tools).
         let store = Arc::new(FakeStore::default());
         store.preload(SUB2_GRIP, common::FAKE_PASSPHRASE.as_bytes());
-        let (daemon_runtime, sock) =
+        let daemon =
             spawn_daemon(tools.gpg.clone(), Arc::clone(&store), policies);
+        let sock = daemon.sock().to_path_buf();
         Self {
-            _runtime: daemon_runtime,
+            _daemon: daemon,
             sock,
             tools,
             store,
@@ -631,38 +642,46 @@ fn secret_service_outage_at_renewal_stops_the_hold_without_clearing() {
 
 #[test]
 fn off_during_an_in_flight_renewal_cannot_re_enable_the_hold() {
-    let runtime = tmp();
-    let tools = DaemonTools::new(runtime.path());
+    let tools = DaemonTools::new();
     let store = Arc::new(FakeStore::default());
     store.preload(SUB2_GRIP, common::FAKE_PASSPHRASE.as_bytes());
-    let (daemon_runtime, sock) = spawn_daemon(
+    let mut daemon = spawn_daemon(
         tools.gpg.clone(),
         Arc::clone(&store),
         Default::default(),
     );
+    let sock = daemon.sock().to_path_buf();
 
     tools.set_ttls(600, 2);
     let prepared =
         stored_activation(&tools.gpg, &store, None, 60_000, None).unwrap();
+    let baseline_clears = tools.clears();
+    tools.marker("slow");
     let request = common::on_request(None, &prepared, 60_000, None);
     assert_eq!(ipc_at(&sock, &request).unwrap()["ok"], true);
 
-    // Make the loopback renewal slow, then let one start.
-    tools.marker("slow");
+    // Wait until the renewal's new clear has happened and its deliberately
+    // slow loopback is still in progress (the fake remains locked).
     assert!(
-        wait_until(5 * SECS, || tools.clears() >= 1),
+        wait_until(5 * SECS, || {
+            tools.clears() > baseline_clears && tools.has("locked")
+        }),
         "no renewal started: {}",
         tools.ca_log()
     );
     // `off` arrives while the renewal is in flight.
     assert_eq!(ipc_at(&sock, "{\"cmd\":\"off\"}").unwrap()["ok"], true);
 
-    // The late renewal result is discarded: hold stays off, no error.
-    thread::sleep(Duration::from_millis(2500));
+    // Completion removes the fake agent's locked marker. The late renewal
+    // result is then known to have arrived and must have been discarded.
+    assert!(
+        wait_until(5 * SECS, || !tools.has("locked")),
+        "renewal loopback did not complete"
+    );
     let status = status_at(&sock).unwrap();
     assert_eq!(status["hold_on"], false, "{status}");
     assert!(status["last_error"].is_null(), "{status}");
-    drop(daemon_runtime);
+    daemon.shutdown().unwrap();
 }
 
 #[test]
@@ -770,6 +789,57 @@ fn clear_secret_on_daemon_stop_removes_the_credential() {
     );
     // The lock policy is independent and off: no GPG clear happened.
     assert_eq!(running.tools.clears(), clears);
+}
+
+#[test]
+fn shutdown_drains_accepted_handlers_before_cleanup_and_socket_removal() {
+    let tools = DaemonTools::new();
+    let store = Arc::new(FakeStore::default());
+    let mut daemon = spawn_daemon(
+        tools.gpg.clone(),
+        Arc::clone(&store),
+        ShutdownPolicies {
+            clear_secret: true,
+            lock_key: false,
+        },
+    );
+    let sock = daemon.sock().to_path_buf();
+    let mut accepted = UnixStream::connect(&sock).unwrap();
+    accepted
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    // A later status response proves the accept loop has already accepted
+    // the earlier connection and spawned its handler.
+    assert!(status_at(&sock).is_some());
+    let clear_gate = store.block_next_clear();
+
+    assert_eq!(ipc_at(&sock, "{\"cmd\":\"shutdown\"}").unwrap()["ok"], true);
+    assert!(
+        !store.operations().iter().any(|op| op == "clear_all"),
+        "cleanup overtook an accepted handler"
+    );
+
+    accepted
+        .write_all(
+            b"{\"cmd\":\"on\",\"key\":\"LATE\",\
+              \"key_source\":\"explicit\",\"interval_ms\":60000,\
+              \"hold_ms\":null,\"activated_at_ms\":2000}\n",
+        )
+        .unwrap();
+    let mut response = String::new();
+    accepted.read_to_string(&mut response).unwrap();
+    let response: serde_json::Value =
+        serde_json::from_str(response.trim()).unwrap();
+    assert_eq!(response["ok"], false, "{response}");
+    assert_eq!(response["error"], "daemon is shutting down");
+    drop(accepted);
+
+    clear_gate.wait_until_entered();
+    assert!(sock.exists(), "socket removed before cleanup completed");
+    clear_gate.release();
+    daemon.wait().unwrap();
+    assert!(!sock.exists(), "socket remained after daemon joined");
+    assert!(store.operations().iter().any(|op| op == "clear_all"));
 }
 
 #[test]
@@ -992,23 +1062,21 @@ fn off_does_not_clear_the_credential_or_the_cache() {
 fn cleanup_failure_still_removes_the_socket() {
     // clear_secret policy against a real (absent) Secret Service: the
     // cleanup fails, but the daemon must still shut down cleanly.
-    let runtime = tmp();
-    let tools = DaemonTools::new(runtime.path());
-    let (daemon_runtime, sock) =
-        spawn_daemon_with_failing_store(tools.gpg.clone());
+    let tools = DaemonTools::new();
+    let mut daemon = spawn_daemon_with_failing_store(tools.gpg.clone());
+    let sock = daemon.sock().to_path_buf();
     assert_eq!(ipc_at(&sock, "{\"cmd\":\"shutdown\"}").unwrap()["ok"], true);
     assert!(
         wait_until(5 * SECS, || !sock.exists()),
         "socket not removed despite cleanup failure"
     );
-    drop((daemon_runtime, tools));
+    daemon.wait().unwrap();
+    drop(tools);
 }
 
 /// A daemon whose credential store always fails, with both cleanup
 /// policies enabled.
-fn spawn_daemon_with_failing_store(
-    gpg: Gpg,
-) -> (tempfile::TempDir, std::path::PathBuf) {
+fn spawn_daemon_with_failing_store(gpg: Gpg) -> common::TestDaemon {
     let store = Arc::new(FakeStore::default());
     store.make_loads_fail();
     store.make_stores_fail();
@@ -1025,7 +1093,7 @@ fn spawn_daemon_with_failing_store(
 
 #[test]
 fn ordinary_background_ping_still_uses_exact_target_when_resolved() {
-    let tools = DaemonTools::new(tmp().path());
+    let tools = DaemonTools::new();
     let used = tools.gpg.use_key(None, PingMode::Foreground).unwrap();
     assert_eq!(
         used.target.map(|t| t.fingerprint),
@@ -1035,6 +1103,26 @@ fn ordinary_background_ping_still_uses_exact_target_when_resolved() {
     let state = tools.gpg.key_state(SUB2_GRIP).unwrap();
     assert_eq!(state.protection, KeyProtection::Passphrase);
     assert!(state.cached, "fake agent starts unlocked");
+}
+
+#[test]
+fn ordinary_activation_does_not_mutate_credentials() {
+    let tools = DaemonTools::new();
+    let store = FakeStore::default();
+
+    let prepared = activation::activate(
+        &tools.gpg,
+        false,
+        None,
+        Duration::from_secs(60),
+        Some(Duration::from_secs(30)),
+        &store,
+        &no_prompt,
+    )
+    .unwrap();
+
+    assert!(!prepared.credential_mutated);
+    assert!(store.operations().is_empty());
 }
 
 /// Silence unused warnings for helpers only some configurations use.

@@ -125,32 +125,31 @@ fn on(
     // (an immediate `status` then reports it instead of "Last ping: -").
     let activated_at_ms = now_ms();
 
-    let request = Request::On {
+    let request = match activation_request(
         key,
         key_source,
         interval_ms,
         hold_ms,
         activated_at_ms,
-        fingerprint: prepared.target.as_ref().map(|t| t.fingerprint.clone()),
-        keygrip: prepared.target.as_ref().and_then(|t| t.keygrip.clone()),
-        credential_mode: prepared
-            .cache
-            .map(|cache| cache.mode)
-            .unwrap_or_default(),
-        default_cache_ttl_ms: prepared
-            .cache
-            .map(|cache| duration_ms(&cache.default_ttl))
-            .transpose()?,
-        max_cache_ttl_ms: prepared
-            .cache
-            .map(|cache| duration_ms(&cache.max_ttl))
-            .transpose()?,
-        cache_started_at_ms: prepared
-            .cache
-            .and_then(|cache| cache.started_wall)
-            .and_then(epoch_ms),
+        &prepared,
+    ) {
+        Ok(request) => request,
+        Err(e) => {
+            return finish_activation_handoff(
+                ActivationHandoff::NotDelivered(e),
+                &prepared,
+                &SessionCredentialStore,
+            );
+        }
     };
-    check(ipc::request(&request)?)?;
+    let handoff = match daemon::connect() {
+        Ok(stream) => match ipc::request_on_stream(&stream, &request) {
+            Ok(response) => ActivationHandoff::Response(response),
+            Err(e) => ActivationHandoff::Ambiguous(e),
+        },
+        Err(e) => ActivationHandoff::NotDelivered(e),
+    };
+    finish_activation_handoff(handoff, &prepared, &SessionCredentialStore)?;
 
     for warning in &prepared.warnings {
         presentation::warning(warning);
@@ -296,7 +295,10 @@ fn credential_clear() -> Result<()> {
 
 fn daemon_stop() -> Result<()> {
     match daemon::connect() {
-        Ok(_) => {
+        Ok(probe) => {
+            // Do not keep an idle admitted connection alive while asking the
+            // daemon to drain its handlers.
+            drop(probe);
             check(ipc::request(&Request::Shutdown)?)?;
             // The ACK confirms acceptance. Success is not reported until the
             // daemon has finished cleanup and removed its socket.
@@ -333,6 +335,88 @@ fn check(response: Response) -> Result<()> {
     }
 }
 
+fn activation_request(
+    key: Option<String>,
+    key_source: KeySource,
+    interval_ms: u64,
+    hold_ms: Option<u64>,
+    activated_at_ms: u64,
+    prepared: &activation::Prepared,
+) -> Result<Request> {
+    Ok(Request::On {
+        key,
+        key_source,
+        interval_ms,
+        hold_ms,
+        activated_at_ms,
+        fingerprint: prepared.target.as_ref().map(|t| t.fingerprint.clone()),
+        keygrip: prepared.target.as_ref().and_then(|t| t.keygrip.clone()),
+        credential_mode: prepared
+            .cache
+            .map(|cache| cache.mode)
+            .unwrap_or_default(),
+        default_cache_ttl_ms: prepared
+            .cache
+            .map(|cache| duration_ms(&cache.default_ttl))
+            .transpose()?,
+        max_cache_ttl_ms: prepared
+            .cache
+            .map(|cache| duration_ms(&cache.max_ttl))
+            .transpose()?,
+        cache_started_at_ms: prepared
+            .cache
+            .and_then(|cache| cache.started_wall)
+            .and_then(epoch_ms),
+    })
+}
+
+enum ActivationHandoff {
+    Response(Response),
+    NotDelivered(Error),
+    Ambiguous(Error),
+}
+
+/// Complete activation handoff and undo only this activation's credential
+/// mutation when the daemon definitely did not apply the request.
+fn finish_activation_handoff(
+    handoff: ActivationHandoff,
+    prepared: &activation::Prepared,
+    store: &dyn keyhold::credential::CredentialStore,
+) -> Result<()> {
+    let handoff_error = match handoff {
+        ActivationHandoff::Response(response) => match check(response) {
+            Ok(()) => return Ok(()),
+            Err(e) => e,
+        },
+        ActivationHandoff::NotDelivered(e) => e,
+        // Once connected, an I/O or protocol failure may mean the request
+        // was applied and only the response was lost. Preserve the item so
+        // a potentially active session-mode hold retains its recovery secret.
+        ActivationHandoff::Ambiguous(e) => return Err(e),
+    };
+
+    if !prepared.credential_mutated {
+        return Err(handoff_error);
+    }
+    let Some(keygrip) = prepared
+        .target
+        .as_ref()
+        .and_then(|target| target.keygrip.as_deref())
+    else {
+        return Err(Error::Message(format!(
+            "{handoff_error}; the hold was NOT enabled; rollback of the newly \
+             stored session credential failed: no keygrip was available"
+        )));
+    };
+    store.delete(keygrip).map_err(|rollback_error| {
+        Error::Message(format!(
+            "{handoff_error}; the hold was NOT enabled; rollback of the newly \
+             stored session credential failed: {rollback_error}"
+        ))
+    })?;
+    Err(handoff_error)
+}
+
 fn now_ms() -> u64 {
     epoch_ms(SystemTime::now()).unwrap_or(0)
 }
@@ -343,9 +427,63 @@ fn epoch_ms(t: SystemTime) -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
-    use std::cell::Cell;
+    use std::{cell::Cell, sync::Mutex};
 
     use super::*;
+    use keyhold::{
+        credential::CredentialStore, gpg::SigningTarget, state::CachePlan,
+    };
+    use zeroize::Zeroizing;
+
+    #[derive(Default)]
+    struct Store {
+        deleted: Mutex<Vec<String>>,
+        fail_delete: bool,
+    }
+
+    impl CredentialStore for Store {
+        fn load(&self, _: &str) -> Result<Option<Zeroizing<Vec<u8>>>> {
+            unreachable!()
+        }
+
+        fn contains(&self, _: &str) -> Result<bool> {
+            unreachable!()
+        }
+
+        fn store(&self, _: &SigningTarget, _: &[u8]) -> Result<()> {
+            unreachable!()
+        }
+
+        fn delete(&self, keygrip: &str) -> Result<bool> {
+            self.deleted.lock().unwrap().push(keygrip.into());
+            if self.fail_delete {
+                Err(Error::SecretService("injected delete failure".into()))
+            } else {
+                Ok(true)
+            }
+        }
+
+        fn clear_all(&self) -> Result<usize> {
+            unreachable!()
+        }
+    }
+
+    fn prepared(credential_mutated: bool) -> activation::Prepared {
+        activation::Prepared {
+            target: Some(SigningTarget {
+                fingerprint: "FINGERPRINT".into(),
+                keygrip: Some("KEYGRIP".into()),
+            }),
+            cache: Some(CachePlan {
+                mode: CredentialMode::Session,
+                default_ttl: Duration::from_secs(10),
+                max_ttl: Duration::from_secs(20),
+                started_wall: Some(SystemTime::now()),
+            }),
+            credential_mutated,
+            warnings: Vec::new(),
+        }
+    }
 
     fn status(hold_on: bool, mode: CredentialMode) -> StatusData {
         StatusData {
@@ -394,5 +532,131 @@ mod tests {
         );
         assert_eq!(row.as_deref(), Some("session stored"));
         assert_eq!(calls.get(), 1);
+    }
+
+    #[test]
+    fn unavailable_daemon_rolls_back_fresh_credential() {
+        let store = Store::default();
+        let err = finish_activation_handoff(
+            ActivationHandoff::NotDelivered(Error::DaemonNotRunning),
+            &prepared(true),
+            &store,
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::DaemonNotRunning));
+        assert_eq!(*store.deleted.lock().unwrap(), ["KEYGRIP"]);
+    }
+
+    #[test]
+    fn any_connection_failure_rolls_back_fresh_credential() {
+        let store = Store::default();
+        finish_activation_handoff(
+            ActivationHandoff::NotDelivered(Error::Io(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "connect denied",
+            ))),
+            &prepared(true),
+            &store,
+        )
+        .unwrap_err();
+        assert_eq!(*store.deleted.lock().unwrap(), ["KEYGRIP"]);
+    }
+
+    #[test]
+    fn unrepresentable_cache_metadata_is_a_definite_handoff_failure() {
+        let store = Store::default();
+        let mut prepared = prepared(true);
+        prepared.cache.as_mut().unwrap().max_ttl = Duration::MAX;
+        let error = activation_request(
+            None,
+            KeySource::Default,
+            1,
+            None,
+            1,
+            &prepared,
+        )
+        .unwrap_err();
+
+        finish_activation_handoff(
+            ActivationHandoff::NotDelivered(error),
+            &prepared,
+            &store,
+        )
+        .unwrap_err();
+        assert_eq!(*store.deleted.lock().unwrap(), ["KEYGRIP"]);
+    }
+
+    #[test]
+    fn explicit_rejection_rolls_back_fresh_credential() {
+        let store = Store::default();
+        let err = finish_activation_handoff(
+            ActivationHandoff::Response(Response::err(
+                "daemon is shutting down",
+            )),
+            &prepared(true),
+            &store,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("daemon is shutting down"));
+        assert_eq!(*store.deleted.lock().unwrap(), ["KEYGRIP"]);
+    }
+
+    #[test]
+    fn explicit_rejection_rolls_back_stale_replacement_credential() {
+        let store = Store::default();
+        finish_activation_handoff(
+            ActivationHandoff::Response(Response::err("invalid hold state")),
+            &prepared(true),
+            &store,
+        )
+        .unwrap_err();
+        assert_eq!(*store.deleted.lock().unwrap(), ["KEYGRIP"]);
+    }
+
+    #[test]
+    fn explicit_rejection_preserves_reused_credential() {
+        let store = Store::default();
+        finish_activation_handoff(
+            ActivationHandoff::Response(Response::err(
+                "daemon is shutting down",
+            )),
+            &prepared(false),
+            &store,
+        )
+        .unwrap_err();
+        assert!(store.deleted.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn ambiguous_post_delivery_failure_preserves_mutated_credential() {
+        let store = Store::default();
+        let err = finish_activation_handoff(
+            ActivationHandoff::Ambiguous(Error::Ipc(
+                "response was lost".into(),
+            )),
+            &prepared(true),
+            &store,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("response was lost"));
+        assert!(store.deleted.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn rollback_failure_reports_handoff_and_delete_errors() {
+        let store = Store {
+            fail_delete: true,
+            ..Store::default()
+        };
+        let err = finish_activation_handoff(
+            ActivationHandoff::NotDelivered(Error::DaemonNotRunning),
+            &prepared(true),
+            &store,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("keyhold daemon is not running"), "{err}");
+        assert!(err.contains("the hold was NOT enabled"), "{err}");
+        assert!(err.contains("injected delete failure"), "{err}");
     }
 }

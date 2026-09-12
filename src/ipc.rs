@@ -118,18 +118,29 @@ impl Response {
 /// Send one request to the running daemon and await its response.
 pub fn request(req: &Request) -> Result<Response> {
     let stream = daemon::connect()?;
+    request_on_stream(&stream, req)
+}
+
+/// Send one request over an already-connected daemon stream.
+///
+/// This split lets activation distinguish a definite connection failure from
+/// transport errors after delivery may have begun.
+pub fn request_on_stream(
+    stream: &UnixStream,
+    req: &Request,
+) -> Result<Response> {
     stream.set_read_timeout(Some(IO_TIMEOUT))?;
     stream.set_write_timeout(Some(IO_TIMEOUT))?;
 
     let payload =
         serde_json::to_vec(req).map_err(|e| Error::Ipc(e.to_string()))?;
-    let mut writer = &stream;
+    let mut writer = stream;
     writer.write_all(&payload)?;
     writer.write_all(b"\n")?;
     writer.flush()?;
 
     let mut line = String::new();
-    let read = BufReader::new(&stream).read_line(&mut line)?;
+    let read = BufReader::new(stream).read_line(&mut line)?;
     if read == 0 {
         return Err(Error::Ipc(
             "daemon closed the connection without a response".into(),

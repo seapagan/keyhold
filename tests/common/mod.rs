@@ -394,11 +394,10 @@ pub struct DaemonTools {
     pub root: PathBuf,
     pub gpg_log: PathBuf,
     pub ca_log: PathBuf,
-    pub sock: PathBuf,
 }
 
 impl DaemonTools {
-    pub fn new(runtime_root: &Path) -> Self {
+    pub fn new() -> Self {
         let dir = TempDir::new().expect("scratch dir");
         let root = dir.path().to_path_buf();
         let gpg_log = root.join("gpg.log");
@@ -413,15 +412,12 @@ impl DaemonTools {
         )
         .with_tool_env("KEYHOLD_TEST_ROOT", root.as_os_str());
 
-        let runtime = runtime_root.to_path_buf();
-        let sock = runtime.join("keyhold").join("keyhold.sock");
         let tools = Self {
             gpg,
             _dir: dir,
             gpg_log,
             ca_log,
             root,
-            sock,
         };
         tools.set_keys(&daemon_keys());
         tools.set_ttls(600, 7200);
@@ -521,6 +517,39 @@ struct FakeState {
     fail_load: bool,
     fail_store: bool,
     ops: Vec<String>,
+    clear_gate: Option<std::sync::Arc<ClearGate>>,
+}
+
+struct ClearGate {
+    entered: std::sync::mpsc::Sender<()>,
+    release: Mutex<std::sync::mpsc::Receiver<()>>,
+}
+
+pub struct ClearGateHandle {
+    entered: std::sync::mpsc::Receiver<()>,
+    release: Option<std::sync::mpsc::Sender<()>>,
+}
+
+impl ClearGateHandle {
+    pub fn wait_until_entered(&self) {
+        self.entered
+            .recv_timeout(Duration::from_secs(5))
+            .expect("clear_all was not entered");
+    }
+
+    pub fn release(mut self) {
+        if let Some(release) = self.release.take() {
+            let _ = release.send(());
+        }
+    }
+}
+
+impl Drop for ClearGateHandle {
+    fn drop(&mut self) {
+        if let Some(release) = self.release.take() {
+            let _ = release.send(());
+        }
+    }
 }
 
 impl FakeStore {
@@ -558,6 +587,19 @@ impl FakeStore {
 
     pub fn operations(&self) -> Vec<String> {
         self.state().ops.clone()
+    }
+
+    pub fn block_next_clear(&self) -> ClearGateHandle {
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        self.state().clear_gate = Some(std::sync::Arc::new(ClearGate {
+            entered: entered_tx,
+            release: Mutex::new(release_rx),
+        }));
+        ClearGateHandle {
+            entered: entered_rx,
+            release: Some(release_tx),
+        }
     }
 }
 
@@ -612,22 +654,91 @@ impl CredentialStore for FakeStore {
     }
 
     fn clear_all(&self) -> keyhold::error::Result<usize> {
+        let gate = {
+            let mut state = self.state();
+            state.ops.push("clear_all".into());
+            state.clear_gate.take()
+        };
+        if let Some(gate) = gate {
+            let _ = gate.entered.send(());
+            let _ = gate
+                .release
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .recv_timeout(Duration::from_secs(5));
+        }
         let mut state = self.state();
-        state.ops.push("clear_all".into());
         let count = state.items.len();
         state.items.clear();
         Ok(count)
     }
 }
 
-/// Spawn an in-process daemon against the given tools and store; the
-/// runtime directory is a fresh tempdir per call. Returns once the
-/// socket answers.
+/// Owned in-process daemon. Its runtime directory outlives the daemon, and
+/// dropping the handle performs best-effort shutdown and joins the thread.
+pub struct TestDaemon {
+    runtime: TempDir,
+    sock: PathBuf,
+    join: Option<thread::JoinHandle<keyhold::error::Result<()>>>,
+}
+
+impl TestDaemon {
+    pub fn sock(&self) -> &Path {
+        &self.sock
+    }
+
+    pub fn shutdown(&mut self) -> keyhold::error::Result<()> {
+        if self.join.is_none() {
+            return Ok(());
+        }
+        if self
+            .join
+            .as_ref()
+            .is_some_and(thread::JoinHandle::is_finished)
+        {
+            return self.wait();
+        }
+        let response = ipc_at(&self.sock, "{\"cmd\":\"shutdown\"}")
+            .ok_or_else(|| {
+                keyhold::error::Error::Daemon(
+                    "in-process daemon did not answer shutdown".into(),
+                )
+            })?;
+        if response["ok"] != true {
+            return Err(keyhold::error::Error::Daemon(
+                response["error"].as_str().unwrap_or("unknown error").into(),
+            ));
+        }
+        self.wait()
+    }
+
+    pub fn wait(&mut self) -> keyhold::error::Result<()> {
+        let Some(join) = self.join.take() else {
+            return Ok(());
+        };
+        join.join().map_err(|_| {
+            keyhold::error::Error::Daemon(
+                "in-process daemon thread panicked".into(),
+            )
+        })?
+    }
+}
+
+impl Drop for TestDaemon {
+    fn drop(&mut self) {
+        let _ = self.shutdown();
+        let _ = self.wait();
+        let _ = &self.runtime;
+    }
+}
+
+/// Spawn an in-process daemon against the given tools and store. Returns an
+/// owned handle once its socket answers.
 pub fn spawn_daemon(
     gpg: Gpg,
     store: std::sync::Arc<FakeStore>,
     policies: ShutdownPolicies,
-) -> (TempDir, PathBuf) {
+) -> TestDaemon {
     let runtime = TempDir::new().expect("runtime dir");
     let sock = runtime.path().join("keyhold").join("keyhold.sock");
     let paths = daemon::Paths {
@@ -638,19 +749,37 @@ pub fn spawn_daemon(
         let paths = paths.clone();
         thread::Builder::new()
             .name("test-daemon".into())
-            .spawn(move || {
-                let _ = daemon::run_with(&paths, gpg, store, policies);
-            })
+            .spawn(move || daemon::run_with(&paths, gpg, store, policies))
             .expect("spawn daemon thread")
     };
-    std::mem::forget(join); // detached; the socket outlives the test
-    assert!(
-        wait_until(Duration::from_secs(5), || {
-            UnixStream::connect(&sock).is_ok()
-        }),
-        "in-process daemon never answered on {sock:?}"
-    );
-    (runtime, sock)
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        if UnixStream::connect(&sock).is_ok() {
+            return TestDaemon {
+                runtime,
+                sock,
+                join: Some(join),
+            };
+        }
+        if join.is_finished() {
+            match join.join() {
+                Ok(Err(e)) => panic!("in-process daemon failed to start: {e}"),
+                Ok(Ok(())) => {
+                    panic!("in-process daemon exited during startup")
+                }
+                Err(_) => panic!("in-process daemon panicked during startup"),
+            }
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+    let mut daemon = TestDaemon {
+        runtime,
+        sock,
+        join: Some(join),
+    };
+    let path = daemon.sock.clone();
+    let _ = daemon.shutdown();
+    panic!("in-process daemon remained alive but never answered on {path:?}")
 }
 
 /// Raw IPC against an explicit socket path.

@@ -326,7 +326,6 @@ session may be able to read it depending on the keyring's policy. This is
 the price of unattended signing reliability; see
 [SECURITY.md](SECURITY.md) for the full model.
 
-
 ## Daemon model
 
 - One resident daemon per user, listening on a Unix socket at
@@ -451,7 +450,7 @@ before submitting.
 
 ## Limitations
 
-- Linux only (v0.1).
+- Linux only (This may change in later versions).
 - The daemon handles `SIGTERM` (and `SIGINT` when running in the foreground)
   with the same clean shutdown as `keyhold daemon --stop`: no new keepalive
   pings are scheduled, the socket file is removed, and the process exits

@@ -83,7 +83,8 @@ workflow files.
 - Keep changes minimal and scoped; no drive-by refactors.
 - Tests must not touch a real GPG keyring. Use the fake-`gpg` harness in
   `tests/common/` (`KEYHOLD_GPG`) or an isolated `GNUPGHOME`.
-- Update `CHANGELOG.md` for user-visible changes.
+- DO NOT Update `CHANGELOG.md`, this will be done automatically after PR merge
+  or before a release.
 
 ## Design constraints to respect
 

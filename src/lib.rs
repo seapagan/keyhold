@@ -12,12 +12,19 @@
 //! * `keyhold off` stops the pings and leaves the cache to expire naturally
 //!   according to `gpg-agent`'s normal idle TTL.
 //!
-//! keyhold never handles passphrases, never uses loopback pinentry, and never
-//! edits GnuPG configuration. It only refreshes `gpg-agent`'s normal idle
-//! cache timeout by genuinely using the key.
-
+//! keyhold has two operating modes. In the default mode it never handles
+//! the passphrase, never uses loopback pinentry, and never edits GnuPG
+//! configuration: it only refreshes `gpg-agent`'s normal idle cache
+//! timeout by genuinely using the key. The explicitly opted-in session
+//! credential mode (`keyhold on --store-passphrase`) additionally stores
+//! the passphrase in the Linux Secret Service **session** collection so
+//! keyhold can recreate the selected key's cache entry before GnuPG's
+//! absolute `max-cache-ttl` expires; see [`credential`] for that mode's
+//! contract.
+pub mod activation;
 pub mod cli;
 pub mod config;
+pub mod credential;
 pub mod daemon;
 pub mod error;
 pub mod git;

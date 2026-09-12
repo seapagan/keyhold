@@ -25,12 +25,13 @@ use std::{
 };
 
 use crate::{
+    config::ShutdownPolicies,
+    credential::CredentialStore,
     error::{Error, Result},
-    gpg::{Gpg, PingMode},
+    gpg::{Gpg, PingMode, SigningTarget},
     ipc::{self, Request, Response},
-    state::{Action, Hold},
+    state::{Action, Activation, CachePlan, CredentialMode, Hold},
 };
-
 use signal_hook::{
     consts::{SIGINT, SIGTERM},
     iterator::Signals,
@@ -39,6 +40,11 @@ use signal_hook::{
 /// How long `keyhold on` and `keyhold daemon --background` wait for a
 /// freshly spawned daemon to answer.
 const START_TIMEOUT: Duration = Duration::from_secs(5);
+/// Shutdown may include bounded GPG cleanup, so allow substantially longer
+/// than daemon startup while still preventing a wedged cleanup from hanging
+/// the client forever.
+const STOP_TIMEOUT: Duration = Duration::from_secs(60);
+const STOP_POLL_INTERVAL: Duration = Duration::from_millis(25);
 /// How long the daemon waits for a client to send its request.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long the accept loop waits before retrying after a failed `accept`,
@@ -74,7 +80,10 @@ pub fn paths() -> Result<Paths> {
 /// Connect to the daemon socket, mapping "nothing there" (absent socket,
 /// stale socket) to [`Error::DaemonNotRunning`].
 pub fn connect() -> Result<UnixStream> {
-    let paths = paths()?;
+    connect_at(&paths()?)
+}
+
+fn connect_at(paths: &Paths) -> Result<UnixStream> {
     match UnixStream::connect(&paths.sock) {
         Ok(stream) => Ok(stream),
         Err(e)
@@ -86,6 +95,41 @@ pub fn connect() -> Result<UnixStream> {
             Err(Error::DaemonNotRunning)
         }
         Err(e) => Err(e.into()),
+    }
+}
+
+/// Wait for an acknowledged shutdown request to finish cleanly.
+///
+/// The shutdown response means the request was accepted, not that teardown is
+/// complete. The daemon intentionally removes its socket only after scheduler
+/// exit and cleanup, so completion requires both an absent socket path and a
+/// failed connection. `ConnectionRefused` while the path remains is therefore
+/// not sufficient. The wait is bounded so wedged cleanup cannot hang the CLI.
+pub fn wait_until_stopped() -> Result<()> {
+    wait_until_stopped_at(&paths()?, STOP_TIMEOUT)
+}
+
+fn wait_until_stopped_at(paths: &Paths, timeout: Duration) -> Result<()> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        match connect_at(paths) {
+            Err(Error::DaemonNotRunning) => {
+                if !paths.sock.try_exists()? {
+                    return Ok(());
+                }
+            }
+            Ok(_) => {}
+            Err(e) => return Err(e),
+        }
+
+        let now = Instant::now();
+        if now >= deadline {
+            return Err(Error::Daemon(format!(
+                "daemon acknowledged shutdown but did not finish stopping within {}s",
+                timeout.as_secs()
+            )));
+        }
+        thread::sleep(STOP_POLL_INTERVAL.min(deadline.duration_since(now)));
     }
 }
 
@@ -127,14 +171,20 @@ fn start_background() -> Result<()> {
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
-    // The daemon re-detects gpg itself, but runs with cwd "/": hand it an
-    // absolute KEYHOLD_GPG so relative overrides keep working.
-    if let Some(spec) = std::env::var_os(crate::gpg::GPG_ENV) {
-        let path = PathBuf::from(&spec);
-        if !path.is_absolute()
-            && let Ok(cwd) = std::env::current_dir()
-        {
-            cmd.env(crate::gpg::GPG_ENV, cwd.join(path));
+    // The daemon re-detects the gpg tools itself, but runs with cwd "/":
+    // hand it absolute overrides so relative paths keep working.
+    for env_key in [
+        crate::gpg::GPG_ENV,
+        crate::gpg::GPGCONF_ENV,
+        crate::gpg::CONNECT_AGENT_ENV,
+    ] {
+        if let Some(spec) = std::env::var_os(env_key) {
+            let path = PathBuf::from(&spec);
+            if !path.is_absolute()
+                && let Ok(cwd) = std::env::current_dir()
+            {
+                cmd.env(env_key, cwd.join(path));
+            }
         }
     }
     // SAFETY: the closure runs in the child between fork and exec and must be
@@ -155,51 +205,180 @@ fn start_background() -> Result<()> {
 /// Run the daemon until a `shutdown` IPC request or a termination signal
 /// arrives.
 ///
+/// Loads the user configuration for the shutdown policies and uses the
+/// real Secret Service session store. The shutdown policies are
+/// re-read from disk at clean shutdown, so edits made while the daemon
+/// was running govern teardown (falling back to the start-time
+/// snapshot if that read fails).
+///
 /// Returns cleanly after removing the socket file.
 pub fn run(gpg: Gpg) -> Result<()> {
-    let paths = paths()?;
-    let listener = bind(&paths)?;
+    let config = crate::config::load()?;
+    run_with_policies(
+        &paths()?,
+        gpg,
+        Arc::new(crate::credential::SessionCredentialStore),
+        config.shutdown_policies(),
+        crate::config::shutdown_policies_from_disk,
+    )
+}
+
+/// The testable daemon entry point: explicit runtime paths, credential
+/// store and shutdown policies. The supplied policies are fixed for
+/// the process lifetime (no config re-read); use [`run_with_policies`]
+/// to inject a refresh.
+///
+/// Clean shutdown (a `shutdown` IPC request, SIGTERM, or SIGINT on a
+/// foreground daemon) first quiesces and drains accepted requests, then runs
+/// the configured [`ShutdownPolicies`] synchronously, and then removes the
+/// socket. Policies optionally delete keyhold's Secret Service session items
+/// and clear the GPG cache entry of the most recently resolved signing key.
+/// The daemon retains this metadata after `off`, `--for` expiry or a hold
+/// failure because the cache entry can outlive the hold. Cleanup failures are
+/// reported to stderr and never prevent the rest of shutdown; no guarantee
+/// exists for SIGKILL, crashes or power loss.
+pub fn run_with(
+    paths: &Paths,
+    gpg: Gpg,
+    store: Arc<dyn CredentialStore>,
+    policies: ShutdownPolicies,
+) -> Result<()> {
+    run_with_policies(paths, gpg, store, policies, || Ok(policies))
+}
+
+/// [`run_with`] plus a shutdown-policy refresher, invoked at clean
+/// shutdown to obtain the current teardown policies. The start-time
+/// snapshot is kept as the fallback for a failed read (a policy
+/// enabled at startup is never silently weakened).
+pub fn run_with_policies<F>(
+    paths: &Paths,
+    gpg: Gpg,
+    store: Arc<dyn CredentialStore>,
+    start_policies: ShutdownPolicies,
+    refresh_policies: F,
+) -> Result<()>
+where
+    F: Fn() -> Result<ShutdownPolicies>,
+{
+    let listener = bind(paths)?;
+    let services = Arc::new(Services { gpg, store });
     let pair: Pair = Arc::new((
         Mutex::new(Shared {
             hold: Hold::default(),
+            stopping: false,
             shutdown: false,
+            active_connections: 0,
         }),
         Condvar::new(),
     ));
 
     // SIGTERM (service managers, plain `kill`) and SIGINT (Ctrl-C on a
     // foreground daemon) run through the same shutdown path as a shutdown
-    // IPC request: set the flag, wake the scheduler, and let `run` below
-    // remove the socket and exit successfully. The iterator is self-pipe
-    // based, so nothing but async-signal-safe bookkeeping ever runs inside
-    // a signal handler.
+    // IPC request: set the flag, wake the scheduler, and let the loop
+    // below remove the socket and exit successfully. The iterator is
+    // self-pipe based, so nothing but async-signal-safe bookkeeping ever
+    // runs inside a signal handler.
     let mut signals = Signals::new([SIGINT, SIGTERM])?;
+    let signal_handle = signals.handle();
     let signal_pair = Arc::clone(&pair);
-    thread::Builder::new()
+    let signal_join = thread::Builder::new()
         .name("keyhold-signals".into())
         .spawn(move || {
             if signals.forever().next().is_some() {
-                lock(&signal_pair).shutdown = true;
+                let mut shared = lock(&signal_pair);
+                shared.stopping = true;
+                shared.shutdown = true;
+                drop(shared);
                 signal_pair.1.notify_all();
             }
         })?;
 
     let accept_pair = Arc::clone(&pair);
-    thread::Builder::new()
+    let accept_join = thread::Builder::new()
         .name("keyhold-accept".into())
         .spawn(move || accept_loop(listener, accept_pair))?;
 
-    scheduler(&pair, &gpg);
+    scheduler(&pair, &services);
 
+    // Wake the blocking accept after final shutdown is permitted, then wait
+    // until it can no longer admit connections. A connection accepted before
+    // `stopping` was set already owns an active-count guard and is drained
+    // below; the wake connection is rejected without becoming active.
+    let _ = UnixStream::connect(&paths.sock);
+    if accept_join.join().is_err() {
+        eprintln!("keyhold: daemon: accept thread panicked during shutdown");
+    }
+    let mut shared = lock(&pair);
+    while shared.active_connections != 0 {
+        shared = pair
+            .1
+            .wait(shared)
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+    }
+    drop(shared);
+
+    signal_handle.close();
+    if signal_join.join().is_err() {
+        eprintln!("keyhold: daemon: signal thread panicked during shutdown");
+    }
+
+    // Synchronous cleanup while the process still exists: the policies
+    // run after the scheduler stops and before the socket disappears.
+    shutdown_cleanup(&services, &start_policies, &refresh_policies, &pair);
     let _ = fs::remove_file(&paths.sock);
     Ok(())
+}
+
+/// Apply the configured shutdown policies. `keyhold off` never reaches
+/// this: only clean daemon shutdown does. Failures are reported, never
+/// fatal, and never include secret material.
+fn shutdown_cleanup<F>(
+    services: &Services,
+    start: &ShutdownPolicies,
+    refresh: &F,
+    pair: &Pair,
+) where
+    F: Fn() -> Result<ShutdownPolicies>,
+{
+    // The most recently resolved signing keygrip. It is retained
+    // (non-secret metadata) after `off`, `--for` expiry and hold
+    // failures precisely so this cleanup can still target it: the
+    // cache entry outlives the hold. No resolved keygrip (a fresh
+    // daemon, or no hold ever resolved one) means no clearing — never
+    // a guess.
+    let keygrip = lock(pair).hold.keygrip.clone();
+    // Teardown follows the config as it stands at shutdown, so edits
+    // made while the daemon ran take effect. A read failure falls back
+    // to the start-time snapshot — a policy enabled at startup is never
+    // silently weakened by a later config problem — and is reported.
+    let policies = match refresh() {
+        Ok(policies) => policies,
+        Err(e) => {
+            eprintln!(
+                "keyhold: daemon: re-reading shutdown config failed \
+                 ({e}); using start-time shutdown policies"
+            );
+            *start
+        }
+    };
+    if policies.clear_secret
+        && let Err(e) = services.store.clear_all()
+    {
+        eprintln!("keyhold: daemon: clearing session credentials failed: {e}");
+    }
+    if policies.lock_key
+        && let Some(keygrip) = keygrip.as_deref()
+        && let Err(e) = services.gpg.clear_passphrase(keygrip)
+    {
+        eprintln!("keyhold: daemon: clearing the GPG cache entry failed: {e}");
+    }
 }
 
 /// Create the private runtime directory (or accept an existing one) with
 /// mode 0700, as documented. Failures are real errors: a runtime directory
 /// we could not make private must not silently pass. `$XDG_RUNTIME_DIR`
 /// itself is never modified.
-fn ensure_private_dir(dir: &Path) -> Result<()> {
+pub(crate) fn ensure_private_dir(dir: &Path) -> Result<()> {
     fs::create_dir_all(dir)?;
     fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
     Ok(())
@@ -235,12 +414,26 @@ fn bind(paths: &Paths) -> Result<UnixListener> {
     Err(Error::Daemon("could not bind the daemon socket".into()))
 }
 
+/// Runtime services the scheduler needs: GPG tooling and the session
+/// credential store. Injected as a whole so tests can supply fakes, and
+/// never part of `Hold` state.
+struct Services {
+    gpg: Gpg,
+    store: Arc<dyn CredentialStore>,
+}
+
 type Pair = Arc<(Mutex<Shared>, Condvar)>;
 
 #[derive(Debug)]
 struct Shared {
     hold: Hold,
+    /// A shutdown request has linearized; ordinary work is rejected.
+    stopping: bool,
+    /// The scheduler may exit because the Shutdown ACK was written, or a
+    /// termination signal requires no acknowledgement.
     shutdown: bool,
+    /// Handlers for connections accepted while admission was still open.
+    active_connections: usize,
 }
 
 fn lock(pair: &Pair) -> MutexGuard<'_, Shared> {
@@ -250,13 +443,31 @@ fn lock(pair: &Pair) -> MutexGuard<'_, Shared> {
 }
 
 fn accept_loop(listener: UnixListener, pair: Pair) {
-    for stream in listener.incoming() {
-        match stream {
-            Ok(stream) => {
+    loop {
+        match listener.accept() {
+            Ok((stream, _)) => {
+                let guard = {
+                    let mut shared = lock(&pair);
+                    if shared.stopping {
+                        return;
+                    }
+                    shared.active_connections += 1;
+                    ActiveConnection {
+                        pair: Arc::clone(&pair),
+                    }
+                };
                 let pair = Arc::clone(&pair);
-                let _ = thread::Builder::new()
+                if let Err(e) = thread::Builder::new()
                     .name("keyhold-conn".into())
-                    .spawn(move || handle(stream, pair));
+                    .spawn(move || {
+                        let _guard = guard;
+                        handle(stream, pair);
+                    })
+                {
+                    eprintln!(
+                        "keyhold: daemon: spawning a connection handler failed: {e}"
+                    );
+                }
             }
             // A failing `accept` must not busy-spin the loop: report it
             // and pause before the next attempt.
@@ -267,9 +478,23 @@ fn accept_loop(listener: UnixListener, pair: Pair) {
                 thread::sleep(ACCEPT_RETRY_DELAY);
             }
         }
-        if lock(&pair).shutdown {
+        if lock(&pair).stopping {
             return;
         }
+    }
+}
+
+struct ActiveConnection {
+    pair: Pair,
+}
+
+impl Drop for ActiveConnection {
+    fn drop(&mut self) {
+        let mut shared = lock(&self.pair);
+        shared.active_connections =
+            shared.active_connections.saturating_sub(1);
+        drop(shared);
+        self.pair.1.notify_all();
     }
 }
 
@@ -303,6 +528,12 @@ fn handle(stream: UnixStream, pair: Pair) {
 /// should shut down once that response has been acknowledged.
 fn apply(request: Request, pair: &Pair) -> (Response, bool) {
     let mut shared = lock(pair);
+    if shared.stopping {
+        return match request {
+            Request::Shutdown => (Response::ok(), false),
+            _ => (Response::err("daemon is shutting down"), false),
+        };
+    }
     match request {
         Request::Ping => (Response::ok(), false),
         Request::On {
@@ -311,6 +542,12 @@ fn apply(request: Request, pair: &Pair) -> (Response, bool) {
             interval_ms,
             hold_ms,
             activated_at_ms,
+            fingerprint,
+            keygrip,
+            credential_mode,
+            default_cache_ttl_ms,
+            max_cache_ttl_ms,
+            cache_started_at_ms,
         } => {
             if interval_ms == 0 {
                 return (
@@ -331,6 +568,43 @@ fn apply(request: Request, pair: &Pair) -> (Response, bool) {
                     false,
                 );
             };
+            // Session mode promises proactive renewal: it is only valid
+            // with the full metadata needed to schedule it.
+            if credential_mode == CredentialMode::Session
+                && (keygrip.as_deref().is_none_or(str::is_empty)
+                    || max_cache_ttl_ms.is_none()
+                    || cache_started_at_ms.is_none())
+            {
+                return (
+                    Response::err(
+                        "session mode requires a keygrip, max cache TTL \
+                         and a known cache epoch",
+                    ),
+                    false,
+                );
+            }
+            let cache = match (credential_mode, max_cache_ttl_ms) {
+                // Without a TTL there is nothing to track; an ordinary
+                // hold may legitimately arrive with no cache metadata.
+                (_, None) => None,
+                (_, Some(max_ms)) => {
+                    let started = cache_started_at_ms.and_then(|ms| {
+                        UNIX_EPOCH.checked_add(Duration::from_millis(ms))
+                    });
+                    Some(CachePlan {
+                        mode: credential_mode,
+                        default_ttl: Duration::from_millis(
+                            default_cache_ttl_ms.unwrap_or(max_ms),
+                        ),
+                        max_ttl: Duration::from_millis(max_ms),
+                        started_wall: started,
+                    })
+                }
+            };
+            let target = fingerprint.map(|fingerprint| SigningTarget {
+                fingerprint,
+                keygrip: keygrip.clone(),
+            });
             match shared.hold.turn_on(
                 key,
                 key_source,
@@ -338,6 +612,10 @@ fn apply(request: Request, pair: &Pair) -> (Response, bool) {
                 hold_ms.map(Duration::from_millis),
                 Instant::now(),
                 activated,
+                Activation {
+                    target: target.as_ref(),
+                    cache,
+                },
             ) {
                 Ok(()) => {
                     pair.1.notify_all();
@@ -355,18 +633,23 @@ fn apply(request: Request, pair: &Pair) -> (Response, bool) {
         Request::Status => {
             (Response::with_status(shared.hold.status()), false)
         }
-        // The flag itself is set by `handle` after the acknowledgement is
-        // written; setting it here would let the scheduler exit first.
-        Request::Shutdown => (Response::ok(), true),
+        // Close request admission under the state lock. The distinct final
+        // flag is set by `handle` only after writing the acknowledgement.
+        Request::Shutdown => {
+            shared.stopping = true;
+            (Response::ok(), true)
+        }
     }
 }
 
 /// The keepalive scheduler.
 ///
-/// Sleeps on the condvar until the next ping or deadline (or an IPC wake-up),
-/// then acts. Pings run outside the shared lock; their results are applied
-/// only if no `on`/`off` transition happened meanwhile (generation check).
-fn scheduler(pair: &Pair, gpg: &Gpg) {
+/// Sleeps on the condvar until the next ping, renewal or deadline (or an
+/// IPC wake-up), then acts. All GPG/Secret Service work runs outside the
+/// shared lock. The due action and its hold snapshot are captured under
+/// that lock; results are applied only if the generation still matches
+/// and the hold remains enabled.
+fn scheduler(pair: &Pair, services: &Services) {
     loop {
         let action = {
             let mut shared = lock(pair);
@@ -375,7 +658,7 @@ fn scheduler(pair: &Pair, gpg: &Gpg) {
                     return;
                 }
                 let now = Instant::now();
-                if let Some(action) = shared.hold.due_action(now) {
+                if let Some(action) = scheduled_action(&shared.hold, now) {
                     break action;
                 }
                 let timeout = match shared.hold.next_wake(now) {
@@ -400,26 +683,199 @@ fn scheduler(pair: &Pair, gpg: &Gpg) {
         };
 
         match action {
-            Action::Expire => lock(pair).hold.turn_off(),
-            Action::Ping => {
-                let (generation, key) = {
-                    let shared = lock(pair);
-                    (shared.hold.generation, shared.hold.key.clone())
-                };
-                let result = gpg.ping(key.as_deref(), PingMode::Background);
-                let mut shared = lock(pair);
-                if shared.hold.generation == generation && shared.hold.enabled
-                {
-                    match result {
-                        Ok(()) => shared
-                            .hold
-                            .record_ping_ok(Instant::now(), SystemTime::now()),
-                        Err(e) => {
-                            shared.hold.record_ping_failure(e.to_string())
+            ScheduledAction::Expire { generation } => {
+                apply_expiry(pair, generation);
+            }
+            ScheduledAction::Ping(snapshot) => {
+                // A stored-mode ping that failed before its scheduled
+                // renewal (agent restart, external clear, race) gets
+                // exactly one recovery attempt from the session
+                // credential; the recorded error explains both halves.
+                // Successful recovery establishes a new cache epoch, so it
+                // uses renewal bookkeeping rather than plain ping timing.
+                match (
+                    ping(&services.gpg, &snapshot),
+                    snapshot.credential_mode,
+                ) {
+                    (Ok(()), _) => {
+                        apply_ping_result(pair, snapshot.generation, Ok(()))
+                    }
+                    (Err(ping_err), CredentialMode::Session) => {
+                        let recovery = renew_once(pair, services, &snapshot)
+                            .map_err(|e| {
+                                Error::Message(format!(
+                                    "{ping_err}; session-credential recovery \
+                                     failed: {e}"
+                                ))
+                            });
+                        if let Some(recovery) = recovery.transpose() {
+                            apply_renewal_result(
+                                pair,
+                                snapshot.generation,
+                                recovery,
+                            );
                         }
+                    }
+                    (Err(e), _) => {
+                        apply_ping_result(pair, snapshot.generation, Err(e))
                     }
                 }
             }
+            ScheduledAction::Renew(snapshot) => {
+                if let Some(result) =
+                    renew_once(pair, services, &snapshot).transpose()
+                {
+                    apply_renewal_result(pair, snapshot.generation, result);
+                }
+            }
+        }
+    }
+}
+
+enum ScheduledAction {
+    Ping(HoldSnapshot),
+    Renew(HoldSnapshot),
+    Expire { generation: u64 },
+}
+
+fn scheduled_action(hold: &Hold, now: Instant) -> Option<ScheduledAction> {
+    match hold.due_action(now)? {
+        Action::Ping => Some(ScheduledAction::Ping(HoldSnapshot::from(hold))),
+        Action::Renew => {
+            Some(ScheduledAction::Renew(HoldSnapshot::from(hold)))
+        }
+        Action::Expire => Some(ScheduledAction::Expire {
+            generation: hold.generation,
+        }),
+    }
+}
+
+/// Everything a background operation needs from the hold, captured
+/// under one lock and used outside it.
+#[derive(Debug, Clone)]
+struct HoldSnapshot {
+    generation: u64,
+    key: Option<String>,
+    fingerprint: Option<String>,
+    keygrip: Option<String>,
+    credential_mode: CredentialMode,
+}
+
+impl From<&Hold> for HoldSnapshot {
+    fn from(hold: &Hold) -> Self {
+        Self {
+            generation: hold.generation,
+            key: hold.key.clone(),
+            fingerprint: hold.fingerprint.clone(),
+            keygrip: hold.keygrip.clone(),
+            credential_mode: hold.credential_mode,
+        }
+    }
+}
+
+/// The stored-mode recreate sequence, shared by proactive renewal and
+/// ping-failure recovery: retrieve the session credential **before**
+/// touching the GPG cache, clear only this keygrip's normal entry, then
+/// unlock with an exact loopback sign. The credential is zeroized when
+/// this function returns.
+fn renew_once(
+    pair: &Pair,
+    services: &Services,
+    snapshot: &HoldSnapshot,
+) -> Result<Option<()>> {
+    let Some(keygrip) = snapshot.keygrip.as_deref() else {
+        return Err(Error::Message("the hold has no resolved keygrip".into()));
+    };
+    let Some(target) = exact_target(snapshot) else {
+        return Err(Error::Message(
+            "the hold has no resolved signing key".into(),
+        ));
+    };
+    let _transaction = services.store.lock_transaction(keygrip)?;
+    let current = lock(pair);
+    if !current.hold.enabled
+        || current.hold.generation != snapshot.generation
+        || current.hold.credential_mode != CredentialMode::Session
+        || current.hold.keygrip.as_deref() != Some(keygrip)
+    {
+        return Ok(None);
+    }
+    drop(current);
+    // Retrieve before clear: a Secret Service outage must not lock a
+    // currently usable key.
+    let secret = services.store.load(keygrip)?.ok_or_else(|| {
+        Error::Message(
+            "session credential is no longer available; \
+             stored-mode hold stopped"
+                .into(),
+        )
+    })?;
+    services.gpg.clear_passphrase(keygrip)?;
+    let unlocked = services.gpg.use_key_with_passphrase(&target, &secret);
+    drop(secret);
+    match unlocked {
+        Ok(()) => Ok(Some(())),
+        Err(Error::BadPassphrase) => match services.store.delete(keygrip) {
+            Ok(_) => Err(Error::Message(
+                "stored session credential was rejected and removed; \
+                 run foreground `keyhold on -s` again"
+                    .into(),
+            )),
+            Err(delete_error) => Err(Error::Message(format!(
+                "stored session credential was rejected, but removing it \
+                 failed: {delete_error}; run foreground `keyhold on -s` again"
+            ))),
+        },
+        Err(e) => Err(e),
+    }
+}
+
+/// One background keepalive, using the resolved exact signing target
+/// when known (falling back to the original selector).
+fn ping(gpg: &Gpg, snapshot: &HoldSnapshot) -> Result<()> {
+    let exact = snapshot.fingerprint.as_ref().map(|fpr| format!("{fpr}!"));
+    let selector = exact.as_deref().or(snapshot.key.as_deref());
+    gpg.use_key(selector, PingMode::Background).map(|_| ())
+}
+
+fn exact_target(snapshot: &HoldSnapshot) -> Option<SigningTarget> {
+    snapshot
+        .fingerprint
+        .as_ref()
+        .map(|fingerprint| SigningTarget {
+            fingerprint: fingerprint.clone(),
+            keygrip: snapshot.keygrip.clone(),
+        })
+}
+
+fn apply_expiry(pair: &Pair, generation: u64) {
+    let mut shared = lock(pair);
+    if shared.hold.generation == generation && shared.hold.enabled {
+        shared.hold.turn_off();
+    }
+}
+
+/// Apply a ping outcome under the lock, discarding races.
+fn apply_ping_result(pair: &Pair, generation: u64, result: Result<()>) {
+    let mut shared = lock(pair);
+    if shared.hold.generation == generation && shared.hold.enabled {
+        match result {
+            Ok(()) => shared
+                .hold
+                .record_ping_ok(Instant::now(), SystemTime::now()),
+            Err(e) => shared.hold.record_ping_failure(e.to_string()),
+        }
+    }
+}
+
+fn apply_renewal_result(pair: &Pair, generation: u64, result: Result<()>) {
+    let mut shared = lock(pair);
+    if shared.hold.generation == generation && shared.hold.enabled {
+        match result {
+            Ok(()) => shared
+                .hold
+                .record_renewal(Instant::now(), SystemTime::now()),
+            Err(e) => shared.hold.record_ping_failure(e.to_string()),
         }
     }
 }
@@ -427,6 +883,289 @@ fn scheduler(pair: &Pair, gpg: &Gpg) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_paths(base: &Path) -> Paths {
+        let dir = base.join("keyhold");
+        Paths {
+            sock: dir.join("keyhold.sock"),
+            dir,
+        }
+    }
+
+    #[test]
+    fn shutdown_wait_returns_when_socket_is_absent() {
+        let base = tempfile::TempDir::new().unwrap();
+        wait_until_stopped_at(
+            &test_paths(base.path()),
+            Duration::from_millis(100),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn shutdown_wait_rejects_refused_socket_until_path_is_removed() {
+        let base = tempfile::TempDir::new().unwrap();
+        let paths = test_paths(base.path());
+        fs::create_dir_all(&paths.dir).unwrap();
+        drop(UnixListener::bind(&paths.sock).unwrap());
+
+        let error = wait_until_stopped_at(&paths, Duration::ZERO).unwrap_err();
+
+        assert!(matches!(
+            error,
+            Error::Daemon(message)
+                if message
+                    == "daemon acknowledged shutdown but did not finish stopping within 0s"
+        ));
+        fs::remove_file(&paths.sock).unwrap();
+        wait_until_stopped_at(&paths, Duration::from_millis(100)).unwrap();
+    }
+
+    #[test]
+    fn shutdown_wait_rejects_live_socket_until_it_is_removed() {
+        let base = tempfile::TempDir::new().unwrap();
+        let paths = test_paths(base.path());
+        fs::create_dir_all(&paths.dir).unwrap();
+        let listener = UnixListener::bind(&paths.sock).unwrap();
+
+        let error = wait_until_stopped_at(&paths, Duration::ZERO).unwrap_err();
+
+        assert!(matches!(
+            error,
+            Error::Daemon(message)
+                if message
+                    == "daemon acknowledged shutdown but did not finish stopping within 0s"
+        ));
+        drop(listener);
+        fs::remove_file(&paths.sock).unwrap();
+        wait_until_stopped_at(&paths, Duration::from_millis(100)).unwrap();
+    }
+
+    #[test]
+    fn shutdown_wait_times_out_while_socket_path_remains() {
+        let base = tempfile::TempDir::new().unwrap();
+        let paths = test_paths(base.path());
+        fs::create_dir_all(&paths.dir).unwrap();
+        drop(UnixListener::bind(&paths.sock).unwrap());
+
+        let error = wait_until_stopped_at(&paths, Duration::ZERO).unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "daemon error: daemon acknowledged shutdown but did not finish stopping within 0s"
+        );
+    }
+
+    #[test]
+    fn shutdown_wait_propagates_unexpected_connection_errors() {
+        let base = tempfile::TempDir::new().unwrap();
+        let paths = Paths {
+            dir: base.path().into(),
+            sock: base.path().join("x".repeat(256)),
+        };
+
+        assert!(matches!(
+            wait_until_stopped_at(&paths, Duration::from_millis(100)),
+            Err(Error::Io(error)) if error.kind() == io::ErrorKind::InvalidInput
+        ));
+    }
+
+    fn pair_with(hold: Hold) -> Pair {
+        Arc::new((
+            Mutex::new(Shared {
+                hold,
+                stopping: false,
+                shutdown: false,
+                active_connections: 0,
+            }),
+            Condvar::new(),
+        ))
+    }
+
+    fn ordinary_on(key: &str) -> Request {
+        Request::On {
+            key: Some(key.into()),
+            key_source: crate::state::KeySource::Explicit,
+            interval_ms: 60_000,
+            hold_ms: None,
+            activated_at_ms: 2_000,
+            fingerprint: None,
+            keygrip: None,
+            credential_mode: CredentialMode::None,
+            default_cache_ttl_ms: None,
+            max_cache_ttl_ms: None,
+            cache_started_at_ms: None,
+        }
+    }
+
+    #[test]
+    fn shutdown_stops_admission_before_final_shutdown_is_permitted() {
+        let pair = pair_with(Hold::default());
+
+        let (response, permit_final_shutdown) =
+            apply(Request::Shutdown, &pair);
+
+        assert!(response.ok);
+        assert!(permit_final_shutdown);
+        let shared = lock(&pair);
+        assert!(shared.stopping);
+        assert!(!shared.shutdown, "scheduler may not exit before the ACK");
+    }
+
+    #[test]
+    fn mutable_requests_are_rejected_after_shutdown_linearizes() {
+        let pair = pair_with(Hold::default());
+        assert!(apply(ordinary_on("OLD"), &pair).0.ok);
+        assert!(apply(Request::Shutdown, &pair).0.ok);
+
+        let on = apply(ordinary_on("NEW"), &pair).0;
+        let off = apply(Request::Off, &pair).0;
+
+        assert_eq!(on.error.as_deref(), Some("daemon is shutting down"));
+        assert_eq!(off.error.as_deref(), Some("daemon is shutting down"));
+        let shared = lock(&pair);
+        assert!(shared.hold.enabled);
+        assert_eq!(shared.hold.key.as_deref(), Some("OLD"));
+    }
+
+    fn target(fingerprint: &str, keygrip: &str) -> SigningTarget {
+        SigningTarget {
+            fingerprint: fingerprint.into(),
+            keygrip: Some(keygrip.into()),
+        }
+    }
+
+    fn replace_with_ordinary(pair: &Pair, now: Instant) {
+        let new_target = target("NEW-FINGERPRINT", "NEW-KEYGRIP");
+        lock(pair)
+            .hold
+            .turn_on(
+                Some("NEW".into()),
+                crate::state::KeySource::Explicit,
+                Duration::from_secs(60),
+                None,
+                now,
+                UNIX_EPOCH + Duration::from_secs(2),
+                Activation {
+                    target: Some(&new_target),
+                    cache: None,
+                },
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn selected_expiry_cannot_disable_a_replacement_hold() {
+        let start = Instant::now();
+        let mut hold = Hold::default();
+        hold.turn_on(
+            Some("OLD".into()),
+            crate::state::KeySource::Explicit,
+            Duration::from_secs(60),
+            Some(Duration::from_millis(1)),
+            start,
+            UNIX_EPOCH + Duration::from_secs(1),
+            Activation::default(),
+        )
+        .unwrap();
+        let action = scheduled_action(&hold, start + Duration::from_millis(1))
+            .expect("expiry due");
+        let pair = pair_with(hold);
+        replace_with_ordinary(&pair, start + Duration::from_millis(2));
+
+        let ScheduledAction::Expire { generation } = action else {
+            panic!("wrong action")
+        };
+        apply_expiry(&pair, generation);
+
+        let shared = lock(&pair);
+        assert!(shared.hold.enabled);
+        assert_eq!(shared.hold.key.as_deref(), Some("NEW"));
+    }
+
+    #[test]
+    fn selected_ping_keeps_the_old_snapshot_and_discards_late_results() {
+        let start = Instant::now();
+        let old_target = target("OLD-FINGERPRINT", "OLD-KEYGRIP");
+        let mut hold = Hold::default();
+        hold.turn_on(
+            Some("OLD".into()),
+            crate::state::KeySource::Explicit,
+            Duration::from_millis(1),
+            None,
+            start,
+            UNIX_EPOCH + Duration::from_secs(1),
+            Activation {
+                target: Some(&old_target),
+                cache: None,
+            },
+        )
+        .unwrap();
+        let action = scheduled_action(&hold, start + Duration::from_millis(1))
+            .expect("ping due");
+        let pair = pair_with(hold);
+        replace_with_ordinary(&pair, start + Duration::from_millis(2));
+
+        let ScheduledAction::Ping(snapshot) = action else {
+            panic!("wrong action")
+        };
+        assert_eq!(snapshot.key.as_deref(), Some("OLD"));
+        assert_eq!(snapshot.fingerprint.as_deref(), Some("OLD-FINGERPRINT"));
+        for result in [Ok(()), Err(Error::Message("old ping failed".into()))] {
+            apply_ping_result(&pair, snapshot.generation, result);
+        }
+
+        let shared = lock(&pair);
+        assert!(shared.hold.enabled);
+        assert_eq!(shared.hold.key.as_deref(), Some("NEW"));
+        assert!(shared.hold.last_error.is_none());
+    }
+
+    #[test]
+    fn selected_renewal_keeps_the_old_snapshot_and_discards_late_results() {
+        let start = Instant::now();
+        let activated = UNIX_EPOCH + Duration::from_secs(1);
+        let old_target = target("OLD-FINGERPRINT", "OLD-KEYGRIP");
+        let mut hold = Hold::default();
+        hold.turn_on(
+            Some("OLD".into()),
+            crate::state::KeySource::Explicit,
+            Duration::from_secs(60),
+            None,
+            start,
+            activated,
+            Activation {
+                target: Some(&old_target),
+                cache: Some(CachePlan {
+                    mode: CredentialMode::Session,
+                    default_ttl: Duration::from_secs(5),
+                    max_ttl: Duration::from_secs(10),
+                    started_wall: Some(activated),
+                }),
+            },
+        )
+        .unwrap();
+        let action = scheduled_action(&hold, start + Duration::from_secs(9))
+            .expect("renewal due");
+        let pair = pair_with(hold);
+        replace_with_ordinary(&pair, start + Duration::from_secs(10));
+
+        let ScheduledAction::Renew(snapshot) = action else {
+            panic!("wrong action")
+        };
+        assert_eq!(snapshot.keygrip.as_deref(), Some("OLD-KEYGRIP"));
+        assert_eq!(snapshot.credential_mode, CredentialMode::Session);
+        for result in
+            [Ok(()), Err(Error::Message("old renewal failed".into()))]
+        {
+            apply_renewal_result(&pair, snapshot.generation, result);
+        }
+
+        let shared = lock(&pair);
+        assert!(shared.hold.enabled);
+        assert_eq!(shared.hold.key.as_deref(), Some("NEW"));
+        assert!(shared.hold.last_error.is_none());
+    }
 
     fn mode_of(path: &Path) -> u32 {
         fs::metadata(path).unwrap().permissions().mode() & 0o777

@@ -16,10 +16,8 @@ use serde::{Deserialize, Serialize};
 use crate::{
     daemon,
     error::{Error, Result},
-    state::{KeySource, StatusData},
+    state::{CredentialMode, KeySource, StatusData},
 };
-
-/// Largest request line accepted (defensive; real requests are tiny).
 const MAX_REQUEST: usize = 64 * 1024;
 /// Client-side I/O timeout.
 const IO_TIMEOUT: Duration = Duration::from_secs(10);
@@ -46,6 +44,27 @@ pub enum Request {
         /// first successful ping, so an immediate `status` is truthful and
         /// a replacement hold never displays the previous hold's timestamp.
         activated_at_ms: u64,
+        /// Fingerprint of the exact signing key that actually signed at
+        /// activation (a subkey, not necessarily the primary).
+        #[serde(default)]
+        fingerprint: Option<String>,
+        /// Agent keygrip of the exact signing key.
+        #[serde(default)]
+        keygrip: Option<String>,
+        /// Credential mode of the hold; metadata only, never a secret.
+        #[serde(default)]
+        credential_mode: CredentialMode,
+        /// GnuPG's effective `default-cache-ttl`, in milliseconds.
+        #[serde(default)]
+        default_cache_ttl_ms: Option<u64>,
+        /// GnuPG's effective `max-cache-ttl`, in milliseconds.
+        #[serde(default)]
+        max_cache_ttl_ms: Option<u64>,
+        /// Epoch milliseconds when the current GPG cache entry began
+        /// (the epoch keyhold established). `None` when the entry
+        /// predates this activation.
+        #[serde(default)]
+        cache_started_at_ms: Option<u64>,
     },
     Off,
     /// Request a status snapshot.
@@ -99,18 +118,29 @@ impl Response {
 /// Send one request to the running daemon and await its response.
 pub fn request(req: &Request) -> Result<Response> {
     let stream = daemon::connect()?;
+    request_on_stream(&stream, req)
+}
+
+/// Send one request over an already-connected daemon stream.
+///
+/// This split lets activation distinguish a definite connection failure from
+/// transport errors after delivery may have begun.
+pub fn request_on_stream(
+    stream: &UnixStream,
+    req: &Request,
+) -> Result<Response> {
     stream.set_read_timeout(Some(IO_TIMEOUT))?;
     stream.set_write_timeout(Some(IO_TIMEOUT))?;
 
     let payload =
         serde_json::to_vec(req).map_err(|e| Error::Ipc(e.to_string()))?;
-    let mut writer = &stream;
+    let mut writer = stream;
     writer.write_all(&payload)?;
     writer.write_all(b"\n")?;
     writer.flush()?;
 
     let mut line = String::new();
-    let read = BufReader::new(&stream).read_line(&mut line)?;
+    let read = BufReader::new(stream).read_line(&mut line)?;
     if read == 0 {
         return Err(Error::Ipc(
             "daemon closed the connection without a response".into(),
@@ -181,23 +211,59 @@ mod tests {
             interval_ms: 300_000,
             hold_ms: Some(7_200_000),
             activated_at_ms: 1_700_000_000_000,
+            fingerprint: Some(
+                "54BD088B3AC62D6BC6E4F888212181504E7D2CD7".into(),
+            ),
+            keygrip: Some("4B88DD924C36F6085738E95FB112B482E33A3220".into()),
+            credential_mode: CredentialMode::Session,
+            default_cache_ttl_ms: Some(600_000),
+            max_cache_ttl_ms: Some(7_200_000),
+            cache_started_at_ms: Some(1_700_000_000_000),
         };
         let json = serde_json::to_string(&req).unwrap();
         assert!(json.contains("\"cmd\":\"on\""), "{json}");
         assert!(json.contains("\"key_source\":\"git\""), "{json}");
+        assert!(json.contains("\"credential_mode\":\"session\""), "{json}");
         let back: Request = serde_json::from_str(&json).unwrap();
         assert!(matches!(
-            back,
+            &back,
             Request::On {
                 key: Some(_),
                 key_source: KeySource::Git,
                 interval_ms: 300_000,
                 hold_ms: Some(_),
-                activated_at_ms: 1_700_000_000_000
+                activated_at_ms: 1_700_000_000_000,
+                fingerprint: Some(_),
+                keygrip: Some(_),
+                credential_mode: CredentialMode::Session,
+                default_cache_ttl_ms: Some(600_000),
+                max_cache_ttl_ms: Some(7_200_000),
+                cache_started_at_ms: Some(1_700_000_000_000)
             }
         ));
         let json = serde_json::to_string(&Request::Off).unwrap();
         assert_eq!(json, "{\"cmd\":\"off\"}");
+    }
+
+    #[test]
+    fn legacy_on_request_without_cache_metadata_still_parses() {
+        // Old clients (and raw-IPC tests) may omit the new fields
+        // entirely: they default to an ordinary, cache-untracked hold.
+        let back: Request = serde_json::from_str(
+            "{\"cmd\":\"on\",\"key\":null,\"key_source\":\"default\",\
+             \"interval_ms\":300000,\"hold_ms\":null,\
+             \"activated_at_ms\":1700000000000}",
+        )
+        .unwrap();
+        assert!(matches!(
+            back,
+            Request::On {
+                credential_mode: CredentialMode::None,
+                fingerprint: None,
+                keygrip: None,
+                ..
+            }
+        ));
     }
 
     #[test]

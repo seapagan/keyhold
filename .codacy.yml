@@ -1,0 +1,5 @@
+---
+engines:
+  lizard:
+    exclude_paths:
+      - "tests/**"

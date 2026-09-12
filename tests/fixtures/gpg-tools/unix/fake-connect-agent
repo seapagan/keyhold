@@ -1,0 +1,72 @@
+#!/bin/sh
+# Static subprocess fixture for tests/gpg_tools.rs and tests/common/mod.rs.
+#
+# IMPORTANT: parallel tests must not generate, rewrite, or copy this
+# executable. Linux can return ETXTBSY when a forked child temporarily
+# inherits a writable descriptor for an executable. Mutable Assuan state and
+# logs therefore live under KEYHOLD_TEST_ROOT; this file remains immutable.
+
+: "${KEYHOLD_TEST_ROOT:?KEYHOLD_TEST_ROOT is required}"
+root=$KEYHOLD_TEST_ROOT
+
+echo "$*" >> "$root/ca.log"
+cmd=$1
+
+if [ -e "$root/hang-ca" ]; then
+  i=0
+  while [ "$i" -lt 3000 ]; do
+    echo b >> "$root/beats"
+    sleep 0.1
+    i=$((i + 1))
+  done
+  exit 0
+fi
+
+if [ -e "$root/malformed-ca" ]; then
+  echo 'gibberish, not assuan'
+  exit 0
+fi
+if [ -e "$root/bare-ok" ]; then
+  echo OK
+  exit 0
+fi
+
+case "$cmd" in
+  'CLEAR_PASSPHRASE '*)
+    if [ -e "$root/fail-clear" ]; then
+      echo 'ERR 67109139 Unknown IPC command <GPG Agent>'
+      exit 0
+    fi
+    if [ -e "$root/daemon-tools" ]; then
+      touch "$root/locked"
+    fi
+    echo OK
+    exit 0
+    ;;
+  KEYINFO\ *)
+    if [ -e "$root/fail-keyinfo" ]; then
+      echo 'ERR 67109139 Unknown IPC command <GPG Agent>'
+      exit 0
+    fi
+    grip=$(echo "$cmd" | cut -d' ' -f2)
+    case "$grip" in
+      0000000000000000000000000000000000000000)
+        echo 'ERR 67108891 Not found <GPG Agent>'
+        exit 0
+        ;;
+    esac
+    prot=P
+    [ -f "$root/prot" ] && prot=$(cat "$root/prot")
+    cached=-
+    if [ -e "$root/daemon-tools" ]; then
+      [ ! -e "$root/locked" ] && cached=1
+    else
+      [ -e "$root/key-cached" ] && cached=1
+    fi
+    echo "S KEYINFO $grip D - - $cached $prot - - -"
+    echo OK
+    exit 0
+    ;;
+esac
+
+echo OK

@@ -102,7 +102,7 @@ fn global_signing_key_is_used() {
         "{}",
         env.gpg_log()
     );
-    assert!(env.status().contains("Key        DEADBEEF (git)"));
+    assert!(env.status().contains("Key          DEADBEEF (git)"));
 }
 
 #[test]
@@ -116,7 +116,7 @@ fn local_repo_signing_key_overrides_global() {
         .unwrap();
     assert!(out.status.success(), "{}", stderr(&out));
     let text = env.status();
-    assert!(text.contains("Key        LOCALKEY (git)"), "{text}");
+    assert!(text.contains("Key          LOCALKEY (git)"), "{text}");
     assert!(env.gpg_log().contains("--local-user LOCALKEY"));
 }
 
@@ -130,7 +130,7 @@ fn repo_without_local_key_uses_global() {
         .output()
         .unwrap();
     assert!(out.status.success(), "{}", stderr(&out));
-    assert!(env.status().contains("Key        GLOBALKEY (git)"));
+    assert!(env.status().contains("Key          GLOBALKEY (git)"));
 }
 
 #[test]
@@ -151,7 +151,7 @@ fn git_output_whitespace_is_trimmed() {
     let lines: Vec<&str> = log.lines().collect();
     assert_eq!(lines.len(), 1, "newline leaked into key: {log:?}");
     assert!(lines[0].ends_with("--local-user PADDEDKEY"), "{log}");
-    assert!(env.status().contains("Key        PADDEDKEY (git)"));
+    assert!(env.status().contains("Key          PADDEDKEY (git)"));
 }
 
 #[test]
@@ -166,7 +166,7 @@ fn unset_format_defaults_to_openpgp() {
         .output()
         .unwrap();
     assert!(out.status.success(), "{}", stderr(&out));
-    assert!(env.status().contains("Key        DEFAULTKEY (git)"));
+    assert!(env.status().contains("Key          DEFAULTKEY (git)"));
 }
 
 #[test]
@@ -183,7 +183,7 @@ fn explicit_openpgp_format_succeeds() {
         .unwrap();
     assert!(out.status.success(), "{}", stderr(&out));
     assert!(env.gpg_log().contains("--local-user OPENPGPKEY"));
-    assert!(env.status().contains("Key        OPENPGPKEY (git)"));
+    assert!(env.status().contains("Key          OPENPGPKEY (git)"));
 }
 
 #[test]
@@ -191,7 +191,7 @@ fn ssh_format_is_rejected_without_side_effects() {
     let env = TestEnv::new();
     // A healthy default hold first: the rejection must not disturb it.
     env.succeed(&["on"]);
-    assert!(env.status().contains("Key        default"));
+    assert!(env.status().contains("Key          default"));
 
     let home = neutral_dir();
     global_config(
@@ -210,8 +210,8 @@ fn ssh_format_is_rejected_without_side_effects() {
     // No new foreground GPG call, no On request: the existing hold and
     // daemon state are unchanged.
     let text = env.status();
-    assert!(text.contains("Hold       on"), "{text}");
-    assert!(text.contains("Key        default"), "{text}");
+    assert!(text.contains("Hold         on"), "{text}");
+    assert!(text.contains("Key          default"), "{text}");
     assert!(!env.gpg_log().contains("id_ed25519"), "{}", env.gpg_log());
 }
 
@@ -234,7 +234,7 @@ fn x509_format_is_rejected() {
         stderr(&out)
     );
     assert_eq!(env.gpg_log(), "");
-    assert!(env.status().contains("Daemon     stopped"));
+    assert!(env.status().contains("Daemon       stopped"));
 }
 
 #[test]
@@ -271,7 +271,7 @@ fn local_format_overrides_global() {
         .output()
         .unwrap();
     assert!(out.status.success(), "{}", stderr(&out));
-    assert!(env.status().contains("Key        LOCALKEY (git)"));
+    assert!(env.status().contains("Key          LOCALKEY (git)"));
 }
 
 #[test]
@@ -311,7 +311,7 @@ fn missing_signing_key_fails_without_side_effects() {
     // No daemon was started, no GPG call was made.
     assert_eq!(
         env.status(),
-        "Keyhold status\n\nDaemon     stopped\nHold       off\n"
+        "Keyhold status\n\nDaemon       stopped\nHold         off\n"
     );
     assert_eq!(env.gpg_log(), "");
 }
@@ -321,7 +321,7 @@ fn failed_git_resolution_leaves_existing_hold_untouched() {
     let env = TestEnv::new();
     // A healthy default hold first (with normal keyhold env, no git env).
     env.succeed(&["on"]);
-    assert!(env.status().contains("Key        default"));
+    assert!(env.status().contains("Key          default"));
 
     let nowhere = neutral_dir();
     let out = git_isolated(&env, &["on", "--git-key"], nowhere.path())
@@ -332,8 +332,8 @@ fn failed_git_resolution_leaves_existing_hold_untouched() {
 
     // The existing hold is unchanged.
     let text = env.status();
-    assert!(text.contains("Hold       on"), "{text}");
-    assert!(text.contains("Key        default"), "{text}");
+    assert!(text.contains("Hold         on"), "{text}");
+    assert!(text.contains("Key          default"), "{text}");
 }
 
 #[test]
@@ -354,7 +354,7 @@ fn missing_git_executable_is_reported() {
         stderr(&out)
     );
     assert_eq!(env.gpg_log(), "");
-    assert!(env.status().contains("Daemon     stopped"));
+    assert!(env.status().contains("Daemon       stopped"));
 }
 
 #[test]
@@ -390,7 +390,7 @@ fn config_git_key_acts_like_the_flag() {
 
     let out = git_isolated(&env, &["on"], home.path()).output().unwrap();
     assert!(out.status.success(), "{}", stderr(&out));
-    assert!(env.status().contains("Key        CFGKEY (git)"));
+    assert!(env.status().contains("Key          CFGKEY (git)"));
 }
 
 #[test]
@@ -410,7 +410,7 @@ fn cli_key_overrides_config_git_key() {
         .unwrap();
     assert!(out.status.success(), "{}", stderr(&out));
     let text = env.status();
-    assert!(text.contains("Key        OVERRIDE"), "{text}");
+    assert!(text.contains("Key          OVERRIDE"), "{text}");
     assert!(!text.contains("(git)"), "{text}");
     assert!(env.gpg_log().contains("--local-user OVERRIDE"));
 }
@@ -432,7 +432,7 @@ fn cli_git_key_overrides_configured_static_key() {
         .unwrap();
     assert!(out.status.success(), "{}", stderr(&out));
     let text = env.status();
-    assert!(text.contains("Key        GITKEY (git)"), "{text}");
+    assert!(text.contains("Key          GITKEY (git)"), "{text}");
     assert!(env.gpg_log().contains("--local-user GITKEY"));
 }
 
@@ -458,7 +458,7 @@ fn config_key_plus_git_key_is_rejected() {
     );
     // Failed before any side effect.
     assert_eq!(env.gpg_log(), "");
-    assert!(env.status().contains("Daemon     stopped"));
+    assert!(env.status().contains("Daemon       stopped"));
 }
 
 #[test]
@@ -481,9 +481,9 @@ fn git_tag_is_styled_and_aligned() {
     let plain = strip_ansi(&styled);
     let key_row = plain
         .lines()
-        .find(|l| l.starts_with("Key        "))
+        .find(|l| l.starts_with("Key          "))
         .expect("key row");
-    assert_eq!(key_row, "Key        DEADBEEF (git)", "{plain}");
+    assert_eq!(key_row, "Key          DEADBEEF (git)", "{plain}");
 }
 
 /// Remove ANSI SGR sequences for visible-layout assertions.
@@ -517,6 +517,6 @@ fn config_static_key_is_not_tagged_git() {
 
     env.succeed(&["on"]);
     let text = env.status();
-    assert!(text.contains("Key        CONFONLY"), "{text}");
+    assert!(text.contains("Key          CONFONLY"), "{text}");
     assert!(!text.contains("(git)"), "{text}");
 }

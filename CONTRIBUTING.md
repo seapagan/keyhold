@@ -87,7 +87,9 @@ workflow files.
 
 ## Design constraints to respect
 
-- `keyhold` never handles passphrases or uses loopback pinentry.
+- Ordinary mode never handles passphrases or uses loopback pinentry; the
+  opt-in session credential mode must keep the passphrase out of argv,
+  environment, files, daemon IPC and logs, zeroized in memory otherwise.
 - `keyhold` never edits GnuPG configuration files.
 - Linux-only for now; do not add untested platform shims.
 

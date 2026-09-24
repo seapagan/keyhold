@@ -71,6 +71,22 @@ description = "Audit dependencies for known vulnerabilities (cargo audit)"
 command = "cargo"
 args = ["audit"]
 
+[tasks.shellcheck-present]
+private = true
+command = "shellcheck"
+args = ["--version"]
+
+[tasks.installers-shellcheck]
+description = "Check the Unix installer and its test script with ShellCheck"
+dependencies = ["shellcheck-present"]
+command = "shellcheck"
+args = ["install.sh", "tests/installers/unix.sh"]
+
+[tasks.unix-installer-test]
+description = "Test the Unix installer with local release archives"
+command = "sh"
+args = ["tests/installers/unix.sh"]
+
 [tasks.actions-lint]
 description = "Validate GitHub Actions workflow syntax"
 command = "actionlint"
@@ -136,6 +152,8 @@ dependencies = [
   "release",
   "package",
   "msrv",
+  "installers-shellcheck",
+  "unix-installer-test",
   "actions-lint",
   "zizmor",
 ]

@@ -32,34 +32,65 @@ GnuPG's absolute `max-cache-ttl` expires; see
 
 ## Installation
 
-Using [cargo-binstall](https://github.com/cargo-bins/cargo-binstall) —
-recommended and fastest if you already have it; downloads the prebuilt
-release binary from GitHub without compiling anything locally:
+### Install script (recommended)
+
+Install the latest release without a Rust toolchain:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/seapagan/keyhold/main/install.sh | sh
+# or
+wget -qO- https://raw.githubusercontent.com/seapagan/keyhold/main/install.sh | sh
+```
+
+The installer currently supports Linux x86_64 and ARM64/aarch64. It installs
+to `$XDG_BIN_HOME` when set, otherwise to `~/.local/bin`. Set
+`KEYHOLD_INSTALL_DIR` to select another directory, or `KEYHOLD_VERSION` to
+select an exact release tag such as `v0.2.0`. The installer does not modify
+`PATH`; it warns when the selected directory is not already on `PATH`.
+
+### cargo-binstall
+
+[cargo-binstall](https://github.com/cargo-bins/cargo-binstall) normally uses
+the prebuilt release binary on supported platforms and avoids compiling
+locally:
 
 ```sh
 cargo binstall keyhold
 ```
 
-Using Cargo — standard installation from crates.io (compiles from source):
+### cargo install
+
+This builds Keyhold from source and requires Rust 1.88 or newer:
 
 ```sh
 cargo install keyhold
 ```
 
-From source:
+### Prebuilt GitHub releases
+
+[GitHub releases](https://github.com/seapagan/keyhold/releases) currently
+provide archives for Linux x86_64 and Linux ARM64/aarch64. Each archive
+contains `keyhold`, `README.md`, and `LICENSE.txt`.
+
+Extract the archive, then place `keyhold` in a directory on `PATH`. For a
+per-user installation:
+
+```sh
+mkdir -p ~/.local/bin
+install -m 755 keyhold ~/.local/bin/keyhold
+```
+
+Another directory already on `PATH` is equally valid.
+
+### Build from source
 
 ```sh
 git clone https://github.com/seapagan/keyhold
 cd keyhold
-cargo install --path .
+cargo build --release --locked
 ```
 
-Or build and run in place:
-
-```sh
-cargo build --release
-./target/release/keyhold --help
-```
+The resulting executable is `target/release/keyhold`.
 
 ## Usage
 
@@ -418,7 +449,8 @@ not re-prompt).
 
 ```sh
 cargo make verify        # full local gate: fmt, check, clippy, tests, docs,
-                         # release build, package, MSRV, actionlint, zizmor
+                         # release build, package, MSRV, ShellCheck,
+                         # installer tests, actionlint, zizmor
 cargo make test          # tests only (cargo nextest)
 cargo make coverage-html # HTML coverage report in target/llvm-cov/html
 cargo make msrv          # check against the minimum supported Rust

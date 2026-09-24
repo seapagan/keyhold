@@ -79,6 +79,23 @@ jobs:
         with:
           tool: cargo-make@0.37.24, cargo-nextest@0.9.143
 
+      - name: Install ShellCheck
+        env:
+          SHELLCHECK_SHA256: 8c3be12b05d5c177a04c29e3c78ce89ac86f1595681cab149b65b97c4e227198
+          SHELLCHECK_VERSION: v0.11.0
+        run: |
+          archive="$RUNNER_TEMP/shellcheck.tar.xz"
+          curl -fsSL \
+            "https://github.com/koalaman/shellcheck/releases/download/$SHELLCHECK_VERSION/shellcheck-$SHELLCHECK_VERSION.linux.x86_64.tar.xz" \
+            -o "$archive"
+          echo "$SHELLCHECK_SHA256  $archive" | sha256sum --check
+          tar -xJf "$archive" -C "$RUNNER_TEMP"
+          mkdir -p "$HOME/.local/bin"
+          install -m 755 \
+            "$RUNNER_TEMP/shellcheck-$SHELLCHECK_VERSION/shellcheck" \
+            "$HOME/.local/bin/shellcheck"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
       - name: Check formatting
         run: cargo make format
 
@@ -99,3 +116,9 @@ jobs:
 
       - name: Verify crate is packageable
         run: cargo make package
+
+      - name: Check installer shell scripts
+        run: cargo make installers-shellcheck
+
+      - name: Test Unix installer
+        run: cargo make unix-installer-test

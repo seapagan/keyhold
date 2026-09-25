@@ -42,11 +42,19 @@ curl -fsSL https://raw.githubusercontent.com/seapagan/keyhold/main/install.sh | 
 wget -qO- https://raw.githubusercontent.com/seapagan/keyhold/main/install.sh | sh
 ```
 
-The installer currently supports Linux x86_64 and ARM64/aarch64. It installs
-to `$XDG_BIN_HOME` when set, otherwise to `~/.local/bin`. Set
-`KEYHOLD_INSTALL_DIR` to select another directory, or `KEYHOLD_VERSION` to
-select an exact release tag such as `v0.2.0`. The installer does not modify
-`PATH`; it warns when the selected directory is not already on `PATH`.
+The installer supports Linux x86_64 and ARM64/aarch64. Releases provide GNU
+and static musl binaries. GNU builds require glibc 2.28 or newer; the installer
+selects GNU on compatible hosts, musl on musl hosts, and static musl on older
+glibc hosts. Set `KEYHOLD_LIBC=gnu` or `KEYHOLD_LIBC=musl` to override this
+selection.
+
+The installer verifies the archive's SHA-256 checksum, executes the downloaded
+binary to confirm its version, then replaces an existing installation with an
+atomic rename. It installs to `$XDG_BIN_HOME` when set, otherwise to
+`~/.local/bin`. Set `KEYHOLD_INSTALL_DIR` to select another directory, or
+`KEYHOLD_VERSION` to select an exact release tag such as `v0.3.0`. The
+installer does not modify `PATH`; it warns when the selected directory is not
+already on `PATH`.
 
 ### cargo-binstall
 
@@ -68,9 +76,23 @@ cargo install keyhold
 
 ### Prebuilt GitHub releases
 
-[GitHub releases](https://github.com/seapagan/keyhold/releases) currently
-provide archives for Linux x86_64 and Linux ARM64/aarch64. Each archive
-contains `keyhold`, `README.md`, and `LICENSE.txt`.
+[GitHub releases](https://github.com/seapagan/keyhold/releases) provide four
+Linux archives:
+
+- `x86_64-unknown-linux-gnu`
+- `x86_64-unknown-linux-musl`
+- `aarch64-unknown-linux-gnu`
+- `aarch64-unknown-linux-musl`
+
+Choose GNU on systems with glibc 2.28 or newer. The musl archive is statically
+linked and works on musl systems; you may also use it on a glibc system. Each
+archive contains `keyhold`, `README.md`, and `LICENSE.txt`. Its matching
+`.sha256` file is a separate release asset. Verify both downloaded files before
+extracting the archive:
+
+```sh
+sha256sum -c keyhold-vX.Y.Z-x86_64-unknown-linux-gnu.tar.gz.sha256
+```
 
 Extract the archive, then place `keyhold` in a directory on `PATH`. For a
 per-user installation:
@@ -81,6 +103,26 @@ install -m 755 keyhold ~/.local/bin/keyhold
 ```
 
 Another directory already on `PATH` is equally valid.
+
+GitHub also records build provenance for each archive. With GitHub CLI:
+
+```sh
+gh attestation verify \
+  keyhold-vX.Y.Z-x86_64-unknown-linux-gnu.tar.gz \
+  --repo seapagan/keyhold
+
+gh release verify vX.Y.Z -R seapagan/keyhold
+# or verify one asset
+gh release verify-asset \
+  vX.Y.Z \
+  keyhold-vX.Y.Z-x86_64-unknown-linux-gnu.tar.gz \
+  -R seapagan/keyhold
+```
+
+SHA-256 confirms that an archive matches the published checksum asset. Build
+provenance ties its digest to the GitHub Actions build identity, repository,
+and source revision. Immutable-release verification covers the published tag
+and assets. These checks do not prove that the software is bug-free or safe.
 
 ### Build from source
 

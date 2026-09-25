@@ -159,7 +159,17 @@ test "$TEST_MOVE_FAIL" != 1 || exit 1
 exec "$REAL_MV" "$@"
 EOF
 
-chmod +x "$test_bin"/*
+chmod +x \
+    "$test_bin/uname" \
+    "$test_bin/getconf" \
+    "$test_bin/ldd" \
+    "$test_bin/mktemp" \
+    "$test_bin/curl" \
+    "$test_bin/wget" \
+    "$test_bin/sha256sum" \
+    "$test_bin/tar" \
+    "$test_bin/install" \
+    "$test_bin/mv"
 for name in uname getconf ldd mktemp tar install mv sha256sum; do
     for directory in "$wget_bin" "$no_download_bin" "$no_sha_bin"; do
         if test "$directory:$name" = "$no_sha_bin:sha256sum"; then

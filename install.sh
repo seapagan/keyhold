@@ -93,15 +93,7 @@ cleanup() {
     fi
 }
 
-main() {
-    architecture=$(detect_arch)
-    libc=$(select_libc)
-    target="$architecture-unknown-linux-$libc"
-
-    tmp_dir=$(mktemp -d)
-    trap cleanup 0
-    trap 'exit 1' 1 2 3 15
-
+resolve_version() {
     version=${KEYHOLD_VERSION:-}
     if test -z "$version"; then
         download \
@@ -112,9 +104,13 @@ main() {
             "$tmp_dir/latest.json" | head -n 1)
         test -n "$version" || die 'latest release tag was not found'
     fi
+    printf '%s\n' "$version"
+}
 
+fetch_and_verify_release() {
+    version=$1
+    target=$2
     command -v sha256sum >/dev/null 2>&1 || die 'sha256sum is required'
-
     asset="keyhold-$version-$target.tar.gz"
     base_url="https://github.com/seapagan/keyhold/releases/download/$version"
     download "$base_url/$asset" "$tmp_dir/$asset"
@@ -132,17 +128,22 @@ main() {
     fi
 
     tar -xzf "$tmp_dir/$asset" -C "$tmp_dir"
+}
+
+validate_candidate() {
+    version=$1
     test -f "$tmp_dir/keyhold" || die 'release archive is missing keyhold'
     chmod 755 "$tmp_dir/keyhold" || die 'release keyhold is not executable'
-
     if ! reported_version=$("$tmp_dir/keyhold" --version); then
         die 'candidate failed --version validation'
     fi
     expected_version="keyhold ${version#v}"
     test "$reported_version" = "$expected_version" || \
         die "reported version does not match $version: $reported_version"
+}
 
-    install_dir=${KEYHOLD_INSTALL_DIR:-${XDG_BIN_HOME:-$HOME/.local/bin}}
+replace_candidate() {
+    install_dir=$1
     mkdir -p "$install_dir"
     stage_file=$(mktemp "$install_dir/.keyhold.XXXXXX") || \
         die 'could not create destination staging file'
@@ -151,6 +152,23 @@ main() {
     mv -f "$stage_file" "$install_dir/keyhold" || \
         die 'could not atomically replace keyhold'
     stage_file=
+}
+
+main() {
+    architecture=$(detect_arch)
+    libc=$(select_libc)
+    target="$architecture-unknown-linux-$libc"
+
+    tmp_dir=$(mktemp -d)
+    trap cleanup 0
+    trap 'exit 1' 1 2 3 15
+
+    version=$(resolve_version)
+    fetch_and_verify_release "$version" "$target"
+    validate_candidate "$version"
+
+    install_dir=${KEYHOLD_INSTALL_DIR:-${XDG_BIN_HOME:-$HOME/.local/bin}}
+    replace_candidate "$install_dir"
 
     printf 'Installed keyhold %s to %s.\n' "$version" "$install_dir"
     case ":${PATH:-}:" in

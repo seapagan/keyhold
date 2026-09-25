@@ -115,6 +115,13 @@ assert_fails_with 'GNU ELF without an interpreter was accepted' \
     ./scripts/verify-release-binary.sh gnu x86_64 "$root/keyhold"
 
 write_elf_fixture 'Advanced Micro Devices X86-64' \
+    '  INTERP         0x0000000000000350' '' \
+    'Name: GLIBC_2.28'
+assert_fails_with 'GNU ELF without NEEDED dependencies was accepted' \
+    'has no dynamic NEEDED dependencies' \
+    ./scripts/verify-release-binary.sh gnu x86_64 "$root/keyhold"
+
+write_elf_fixture 'Advanced Micro Devices X86-64' \
     '  INTERP         0x0000000000000350' '' ''
 assert_fails_with 'dynamic musl ELF was accepted' 'must not contain PT_INTERP' \
     ./scripts/verify-release-binary.sh musl x86_64 "$root/keyhold"
@@ -125,4 +132,4 @@ assert_fails_with 'musl ELF with NEEDED dependencies was accepted' \
     'must not contain NEEDED dependencies' \
     ./scripts/verify-release-binary.sh musl x86_64 "$root/keyhold"
 
-printf 'Release verification tests passed: 10 cases.\n'
+printf 'Release verification tests passed: 11 cases.\n'

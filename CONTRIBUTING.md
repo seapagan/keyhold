@@ -22,6 +22,7 @@ Required for the normal `cargo make verify` gate:
 | ---- | --------- | ------- |
 | `cargo-make` | every `cargo make ...` task | `cargo install cargo-make` |
 | `cargo-nextest` | tests, coverage | `cargo install cargo-nextest --locked` |
+| `shellcheck` | shell-script checks | `apt install shellcheck` or `brew install shellcheck` |
 | `actionlint` | `verify` | [see notes below][actionlint-install] |
 | `zizmor` | `verify` | `pipx install zizmor` |
 
@@ -58,8 +59,9 @@ cargo make verify
 ```
 
 That runs formatting, check, Clippy (`-D warnings`), tests (nextest), docs,
-release build, packaging, the MSRV check, `actionlint`, and Zizmor
-(pedantic). Other useful tasks:
+release build, packaging, the MSRV check, ShellCheck, deterministic installer
+tests, deterministic release-binary verification helper tests, `actionlint`,
+and Zizmor (pedantic). Other useful tasks:
 
 ```sh
 cargo make test           # tests only (cargo nextest)
@@ -71,8 +73,8 @@ cargo make changelog      # regenerate CHANGELOG.md
 The tasks live in `Makefile.toml`; see *Development tools* above for the
 external tools they require.
 
-CI runs the same cargo-make tasks on Ubuntu 24.04 plus a Zizmor audit of the
-workflow files.
+CI runs the Rust, packaging, ShellCheck, installer, and release-verifier tasks
+on Ubuntu 24.04; a dedicated workflow runs Zizmor.
 
 ## Conventions
 

@@ -44,7 +44,7 @@ jobs:
           REF_NAME: ${{ github.ref_name }}
         run: |
           crate_version=$(cargo metadata --locked --no-deps --format-version 1 |
-            python3 -c 'import json, sys; print(next(p["version"] for p in json.load(sys.stdin)["packages"] if p["name"] == "keyhold"))')
+            jq -r '.packages[] | select(.name == "keyhold") | .version')
           release_tag="v$crate_version"
           if [ "$EVENT_NAME" = push ]; then
             if [ "$REF_NAME" != "$release_tag" ]; then

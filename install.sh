@@ -110,11 +110,28 @@ resolve_version() {
 fetch_and_verify_release() {
     version=$1
     target=$2
+    explicit_version=$3
     command -v sha256sum >/dev/null 2>&1 || die 'sha256sum is required'
     asset="keyhold-$version-$target.tar.gz"
     base_url="https://github.com/seapagan/keyhold/releases/download/$version"
-    download "$base_url/$asset" "$tmp_dir/$asset"
-    download "$base_url/$asset.sha256" "$tmp_dir/$asset.sha256"
+    if ! download "$base_url/$asset" "$tmp_dir/$asset"; then
+        printf 'error: release asset not found: %s\n' "$asset" >&2
+        if test "$explicit_version" = 1; then
+            printf '%s\n' \
+                "Requested historical release $version may predate the current GNU/musl artifact layout." \
+                "See https://github.com/seapagan/keyhold/releases/tag/$version for the files it provides." >&2
+        fi
+        return 1
+    fi
+    if ! download "$base_url/$asset.sha256" "$tmp_dir/$asset.sha256"; then
+        printf 'error: required checksum asset not found: %s.sha256\n' "$asset" >&2
+        if test "$explicit_version" = 1; then
+            printf '%s\n' \
+                "The selected historical release $version predates or lacks the checksum asset required by the current verified installer." \
+                "See https://github.com/seapagan/keyhold/releases/tag/$version for the files it provides." >&2
+        fi
+        return 1
+    fi
 
     if ! awk -v expected="$asset" '
         NR == 1 && NF == 2 && length($1) == 64 &&
@@ -158,13 +175,15 @@ main() {
     architecture=$(detect_arch)
     libc=$(select_libc)
     target="$architecture-unknown-linux-$libc"
+    explicit_version=0
+    if test -n "${KEYHOLD_VERSION:-}"; then explicit_version=1; fi
 
     tmp_dir=$(mktemp -d)
     trap cleanup 0
     trap 'exit 1' 1 2 3 15
 
     version=$(resolve_version)
-    fetch_and_verify_release "$version" "$target"
+    fetch_and_verify_release "$version" "$target" "$explicit_version"
     validate_candidate "$version"
 
     install_dir=${KEYHOLD_INSTALL_DIR:-${XDG_BIN_HOME:-$HOME/.local/bin}}

@@ -266,6 +266,10 @@ assert_fails() {
 
 assert_output() { grep -Fq "$1" "$root/output" || fail "missing output: $1"; }
 
+assert_no_output() {
+    if grep -Fq "$1" "$root/output"; then fail "unexpected output: $1"; fi
+}
+
 assert_downloaded() {
     grep -Fxq "https://github.com/seapagan/keyhold/releases/download/v0.2.0/$1" "$TEST_DOWNLOAD_LOG" || fail "asset was not downloaded: $1"
 }
@@ -433,6 +437,71 @@ reset_env; KEYHOLD_VERSION=v0.2.0; export KEYHOLD_VERSION
 run_install || fail 'explicit version failed'
 if grep -Fq '/releases/latest' "$TEST_DOWNLOAD_LOG"; then fail 'explicit version queried latest release'; fi
 pass
+
+for install_state in existing fresh; do
+    reset_env
+    KEYHOLD_VERSION=v0.1.0; export KEYHOLD_VERSION
+    if test "$install_state" = existing; then
+        mkdir -p "$KEYHOLD_INSTALL_DIR"; printf 'old keyhold\n' >"$KEYHOLD_INSTALL_DIR/keyhold"
+    fi
+    assert_fails "explicit old version with missing archive succeeded ($install_state)"
+    assert_output 'release asset not found: keyhold-v0.1.0-x86_64-unknown-linux-gnu.tar.gz'
+    assert_output 'may predate the current GNU/musl artifact layout'
+    assert_output 'https://github.com/seapagan/keyhold/releases/tag/v0.1.0'
+    if test "$install_state" = existing; then assert_old_binary; else assert_no_binary; fi
+    pass
+done
+
+old_archive=keyhold-v0.1.0-x86_64-unknown-linux-gnu.tar.gz
+cp "$release_dir/keyhold-v0.2.0-x86_64-unknown-linux-gnu.tar.gz" "$release_dir/$old_archive"
+for install_state in existing fresh; do
+    reset_env
+    KEYHOLD_VERSION=v0.1.0; export KEYHOLD_VERSION
+    if test "$install_state" = existing; then
+        mkdir -p "$KEYHOLD_INSTALL_DIR"; printf 'old keyhold\n' >"$KEYHOLD_INSTALL_DIR/keyhold"
+    fi
+    assert_fails "explicit old version with missing checksum succeeded ($install_state)"
+    assert_output "required checksum asset not found: $old_archive.sha256"
+    assert_output 'predates or lacks the checksum asset required by the current verified installer'
+    assert_output 'https://github.com/seapagan/keyhold/releases/tag/v0.1.0'
+    if test "$install_state" = existing; then assert_old_binary; else assert_no_binary; fi
+    pass
+done
+rm "$release_dir/$old_archive"
+
+current_archive=keyhold-v0.2.0-x86_64-unknown-linux-gnu.tar.gz
+mv "$release_dir/$current_archive" "$root/current-archive"
+for install_state in existing fresh; do
+    reset_env
+    KEYHOLD_VERSION=; export KEYHOLD_VERSION
+    if test "$install_state" = existing; then
+        mkdir -p "$KEYHOLD_INSTALL_DIR"; printf 'old keyhold\n' >"$KEYHOLD_INSTALL_DIR/keyhold"
+    fi
+    assert_fails "latest release with missing archive succeeded ($install_state)"
+    assert_output "release asset not found: $current_archive"
+    assert_no_output 'historical release'
+    assert_no_output 'may predate'
+    if test "$install_state" = existing; then assert_old_binary; else assert_no_binary; fi
+    pass
+done
+mv "$root/current-archive" "$release_dir/$current_archive"
+
+mv "$release_dir/$current_archive.sha256" "$root/current-checksum"
+for install_state in existing fresh; do
+    reset_env
+    KEYHOLD_VERSION=; export KEYHOLD_VERSION
+    if test "$install_state" = existing; then
+        mkdir -p "$KEYHOLD_INSTALL_DIR"; printf 'old keyhold\n' >"$KEYHOLD_INSTALL_DIR/keyhold"
+    fi
+    assert_fails "latest release with missing checksum succeeded ($install_state)"
+    assert_output "required checksum asset not found: $current_archive.sha256"
+    assert_no_output 'historical release'
+    assert_no_output 'predates or lacks'
+    if test "$install_state" = existing; then assert_old_binary; else assert_no_binary; fi
+    pass
+done
+mv "$root/current-checksum" "$release_dir/$current_archive.sha256"
+
 reset_env
 run_install || fail 'curl path failed'; grep -Fxq curl "$TEST_DOWNLOADER_LOG" || fail 'curl was not preferred'; pass
 reset_env; TEST_BIN=$wget_bin; export TEST_BIN

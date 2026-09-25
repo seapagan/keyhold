@@ -4,14 +4,6 @@ on:
   push:
     tags:
       - "v*"
-  pull_request:
-    paths:
-      - Cargo.toml
-      - Cargo.lock
-      - "src/**"
-      - "scripts/verify-release-*.sh"
-      - .github/workflows/release.yml
-  workflow_dispatch:
 
 concurrency:
   group: release-${{ github.ref }}
@@ -184,7 +176,24 @@ jobs:
           merge-multiple: true
 
       - name: Verify complete release asset set
-        run: scripts/verify-release-assets.sh "$TAG_NAME" dist
+        run: |
+          for target in \
+            x86_64-unknown-linux-gnu \
+            x86_64-unknown-linux-musl \
+            aarch64-unknown-linux-gnu \
+            aarch64-unknown-linux-musl
+          do
+            archive="keyhold-$TAG_NAME-$target.tar.gz"
+            test -s "dist/$archive" || {
+              echo "error: missing or empty release asset: $archive" >&2
+              exit 1
+            }
+            test -s "dist/$archive.sha256" || {
+              echo "error: missing or empty release asset: $archive.sha256" >&2
+              exit 1
+            }
+            (cd dist && sha256sum -c "$archive.sha256")
+          done
 
       - name: Create or validate draft release
         env:
@@ -205,25 +214,10 @@ jobs:
               --generate-notes
           fi
 
-      - name: Attest x86_64 GNU archive
+      - name: Attest release archives
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
         with:
-          subject-path: dist/keyhold-${{ env.TAG_NAME }}-x86_64-unknown-linux-gnu.tar.gz
-
-      - name: Attest x86_64 musl archive
-        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
-        with:
-          subject-path: dist/keyhold-${{ env.TAG_NAME }}-x86_64-unknown-linux-musl.tar.gz
-
-      - name: Attest aarch64 GNU archive
-        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
-        with:
-          subject-path: dist/keyhold-${{ env.TAG_NAME }}-aarch64-unknown-linux-gnu.tar.gz
-
-      - name: Attest aarch64 musl archive
-        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
-        with:
-          subject-path: dist/keyhold-${{ env.TAG_NAME }}-aarch64-unknown-linux-musl.tar.gz
+          subject-path: dist/*.tar.gz
 
       - name: Upload all draft release assets
         run: gh release upload "$TAG_NAME" dist/* --clobber

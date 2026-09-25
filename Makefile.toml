@@ -82,7 +82,6 @@ dependencies = ["shellcheck-present"]
 command = "shellcheck"
 args = [
   "install.sh",
-  "scripts/verify-release-assets.sh",
   "scripts/verify-release-binary.sh",
   "tests/installers/unix.sh",
   "tests/release/verify.sh",
@@ -94,7 +93,7 @@ command = "sh"
 args = ["tests/installers/unix.sh"]
 
 [tasks.release-verification-test]
-description = "Test release ELF and asset verification helpers"
+description = "Test the release ELF verification helper"
 command = "sh"
 args = ["tests/release/verify.sh"]
 

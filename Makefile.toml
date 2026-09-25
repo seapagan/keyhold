@@ -77,15 +77,26 @@ command = "shellcheck"
 args = ["--version"]
 
 [tasks.installers-shellcheck]
-description = "Check the Unix installer and its test script with ShellCheck"
+description = "Check maintained shell scripts with ShellCheck"
 dependencies = ["shellcheck-present"]
 command = "shellcheck"
-args = ["install.sh", "tests/installers/unix.sh"]
+args = [
+  "install.sh",
+  "scripts/verify-release-assets.sh",
+  "scripts/verify-release-binary.sh",
+  "tests/installers/unix.sh",
+  "tests/release/verify.sh",
+]
 
 [tasks.unix-installer-test]
 description = "Test the Unix installer with local release archives"
 command = "sh"
 args = ["tests/installers/unix.sh"]
+
+[tasks.release-verification-test]
+description = "Test release ELF and asset verification helpers"
+command = "sh"
+args = ["tests/release/verify.sh"]
 
 [tasks.actions-lint]
 description = "Validate GitHub Actions workflow syntax"
@@ -154,6 +165,7 @@ dependencies = [
   "msrv",
   "installers-shellcheck",
   "unix-installer-test",
+  "release-verification-test",
   "actions-lint",
   "zizmor",
 ]

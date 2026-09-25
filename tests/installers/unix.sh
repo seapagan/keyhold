@@ -445,8 +445,8 @@ for install_state in existing fresh; do
         mkdir -p "$KEYHOLD_INSTALL_DIR"; printf 'old keyhold\n' >"$KEYHOLD_INSTALL_DIR/keyhold"
     fi
     assert_fails "explicit old version with missing archive succeeded ($install_state)"
-    assert_output 'release asset not found: keyhold-v0.1.0-x86_64-unknown-linux-gnu.tar.gz'
-    assert_output 'may predate the current GNU/musl artifact layout'
+    assert_output 'could not download required release asset: keyhold-v0.1.0-x86_64-unknown-linux-gnu.tar.gz'
+    assert_output 'If this is an older release, it may predate the current GNU/musl artifact layout.'
     assert_output 'https://github.com/seapagan/keyhold/releases/tag/v0.1.0'
     if test "$install_state" = existing; then assert_old_binary; else assert_no_binary; fi
     pass
@@ -461,8 +461,8 @@ for install_state in existing fresh; do
         mkdir -p "$KEYHOLD_INSTALL_DIR"; printf 'old keyhold\n' >"$KEYHOLD_INSTALL_DIR/keyhold"
     fi
     assert_fails "explicit old version with missing checksum succeeded ($install_state)"
-    assert_output "required checksum asset not found: $old_archive.sha256"
-    assert_output 'predates or lacks the checksum asset required by the current verified installer'
+    assert_output "could not download required checksum asset: $old_archive.sha256"
+    assert_output 'If this is an older release, it may predate checksum-backed installer support.'
     assert_output 'https://github.com/seapagan/keyhold/releases/tag/v0.1.0'
     if test "$install_state" = existing; then assert_old_binary; else assert_no_binary; fi
     pass
@@ -478,9 +478,8 @@ for install_state in existing fresh; do
         mkdir -p "$KEYHOLD_INSTALL_DIR"; printf 'old keyhold\n' >"$KEYHOLD_INSTALL_DIR/keyhold"
     fi
     assert_fails "latest release with missing archive succeeded ($install_state)"
-    assert_output "release asset not found: $current_archive"
-    assert_no_output 'historical release'
-    assert_no_output 'may predate'
+    assert_output "could not download required release asset: $current_archive"
+    assert_no_output 'If this is an older release'
     if test "$install_state" = existing; then assert_old_binary; else assert_no_binary; fi
     pass
 done
@@ -494,9 +493,8 @@ for install_state in existing fresh; do
         mkdir -p "$KEYHOLD_INSTALL_DIR"; printf 'old keyhold\n' >"$KEYHOLD_INSTALL_DIR/keyhold"
     fi
     assert_fails "latest release with missing checksum succeeded ($install_state)"
-    assert_output "required checksum asset not found: $current_archive.sha256"
-    assert_no_output 'historical release'
-    assert_no_output 'predates or lacks'
+    assert_output "could not download required checksum asset: $current_archive.sha256"
+    assert_no_output 'If this is an older release'
     if test "$install_state" = existing; then assert_old_binary; else assert_no_binary; fi
     pass
 done

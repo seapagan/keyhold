@@ -120,5 +120,7 @@ jobs:
       - name: Check installer shell scripts
         run: cargo make installers-shellcheck
 
-      - name: Test Unix installer
-        run: cargo make unix-installer-test
+      - name: Test shell tooling
+        run: |
+          cargo make unix-installer-test
+          cargo make release-verification-test

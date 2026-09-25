@@ -115,20 +115,20 @@ fetch_and_verify_release() {
     asset="keyhold-$version-$target.tar.gz"
     base_url="https://github.com/seapagan/keyhold/releases/download/$version"
     if ! download "$base_url/$asset" "$tmp_dir/$asset"; then
-        printf 'error: release asset not found: %s\n' "$asset" >&2
+        printf 'error: could not download required release asset: %s\n' "$asset" >&2
         if test "$explicit_version" = 1; then
             printf '%s\n' \
-                "Requested historical release $version may predate the current GNU/musl artifact layout." \
-                "See https://github.com/seapagan/keyhold/releases/tag/$version for the files it provides." >&2
+                'If this is an older release, it may predate the current GNU/musl artifact layout.' \
+                "See https://github.com/seapagan/keyhold/releases/tag/$version for the files provided by that release." >&2
         fi
         return 1
     fi
     if ! download "$base_url/$asset.sha256" "$tmp_dir/$asset.sha256"; then
-        printf 'error: required checksum asset not found: %s.sha256\n' "$asset" >&2
+        printf 'error: could not download required checksum asset: %s.sha256\n' "$asset" >&2
         if test "$explicit_version" = 1; then
             printf '%s\n' \
-                "The selected historical release $version predates or lacks the checksum asset required by the current verified installer." \
-                "See https://github.com/seapagan/keyhold/releases/tag/$version for the files it provides." >&2
+                'If this is an older release, it may predate checksum-backed installer support.' \
+                "See https://github.com/seapagan/keyhold/releases/tag/$version for the files provided by that release." >&2
         fi
         return 1
     fi

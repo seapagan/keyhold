@@ -4,6 +4,7 @@ on:
   push:
     tags:
       - "v*"
+  workflow_dispatch:
 
 concurrency:
   group: release-${{ github.ref }}
@@ -33,17 +34,17 @@ jobs:
       - name: Resolve and validate release version
         id: version
         env:
+          EVENT_NAME: ${{ github.event_name }}
           REF_NAME: ${{ github.ref_name }}
-          REF_TYPE: ${{ github.ref_type }}
         run: |
           crate_version=$(cargo metadata --locked --no-deps --format-version 1 |
             python3 -c 'import json, sys; print(next(p["version"] for p in json.load(sys.stdin)["packages"] if p["name"] == "keyhold"))')
           release_tag="v$crate_version"
-          if [ "$REF_TYPE" = tag ] && [ "$REF_NAME" != "$release_tag" ]; then
-            echo "error: release tag $REF_NAME does not match Cargo version $crate_version" >&2
-            exit 1
-          fi
-          if [ "$REF_TYPE" = tag ]; then
+          if [ "$EVENT_NAME" = push ]; then
+            if [ "$REF_NAME" != "$release_tag" ]; then
+              echo "error: release tag $REF_NAME does not match Cargo version $crate_version" >&2
+              exit 1
+            fi
             release_tag=$REF_NAME
           fi
           echo "crate-version=$crate_version" >> "$GITHUB_OUTPUT"
@@ -150,7 +151,7 @@ jobs:
 
   publish:
     name: Publish immutable release
-    if: github.ref_type == 'tag'
+    if: github.event_name == 'push' && github.ref_type == 'tag'
     needs: [prepare, build]
     runs-on: ubuntu-24.04
     permissions:

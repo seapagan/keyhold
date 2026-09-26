@@ -1,14 +1,31 @@
 # Changelog
 
-## [v0.2.0](https://github.com/seapagan/keyhold/releases/tag/v0.2.0) (2026-09-12)
+This is an auto-generated log of all the changes that have been made to the
+project since the first release, with the latest changes at the top.
 
-### Enhancements
+This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [v0.3.0](https://github.com/seapagan/keyhold/releases/tag/v0.3.0) (September 26, 2026)
+
+### New Features
+
+- Feat: add Linux release installer ([#4](https://github.com/seapagan/keyhold/pull/4)) by [seapagan](https://github.com/seapagan)
+
+### Testing
+
+- Test: clarify synthetic installer release fixtures ([#5](https://github.com/seapagan/keyhold/pull/5)) by [seapagan](https://github.com/seapagan)
+
+[`Full Changelog`](https://github.com/seapagan/keyhold/compare/v0.2.0...v0.3.0) | [`Diff`](https://github.com/seapagan/keyhold/compare/v0.2.0...v0.3.0.diff) | [`Patch`](https://github.com/seapagan/keyhold/compare/v0.2.0...v0.3.0.patch)
+
+## [v0.2.0](https://github.com/seapagan/keyhold/releases/tag/v0.2.0) (September 12, 2026)
+
+### New Features
 
 - Feat: add session credential recovery for GPG holds ([#1](https://github.com/seapagan/keyhold/pull/1)) by [seapagan](https://github.com/seapagan)
 
 [`Full Changelog`](https://github.com/seapagan/keyhold/compare/v0.1.0...v0.2.0) | [`Diff`](https://github.com/seapagan/keyhold/compare/v0.1.0...v0.2.0.diff) | [`Patch`](https://github.com/seapagan/keyhold/compare/v0.1.0...v0.2.0.patch)
 
-## [v0.1.0](https://github.com/seapagan/keyhold/releases/tag/v0.1.0) (2026-09-11)
+## [v0.1.0](https://github.com/seapagan/keyhold/releases/tag/v0.1.0) (September 11, 2026)
 
 Initial release of `keyhold`.
 

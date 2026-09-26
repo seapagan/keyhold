@@ -645,7 +645,7 @@ dependencies = [
 
 [[package]]
 name = "keyhold"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "clap",
  "colored_text",

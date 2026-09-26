@@ -32,34 +32,118 @@ GnuPG's absolute `max-cache-ttl` expires; see
 
 ## Installation
 
-Using [cargo-binstall](https://github.com/cargo-bins/cargo-binstall) —
-recommended and fastest if you already have it; downloads the prebuilt
-release binary from GitHub without compiling anything locally:
+### Install script (recommended)
+
+Install the latest release without a Rust toolchain:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/seapagan/keyhold/main/install.sh | sh
+# or
+wget -qO- https://raw.githubusercontent.com/seapagan/keyhold/main/install.sh | sh
+```
+
+The installer supports Linux x86_64 and ARM64/aarch64. Releases provide GNU
+and static musl binaries. GNU builds require glibc 2.28 or newer; the installer
+selects GNU on compatible hosts, musl on musl hosts, and static musl on older
+glibc hosts. Set `KEYHOLD_LIBC=gnu` or `KEYHOLD_LIBC=musl` to override this
+selection.
+
+The installer verifies the archive's SHA-256 checksum, executes the downloaded
+binary to confirm its version, then replaces an existing installation with an
+atomic rename. It installs to `$XDG_BIN_HOME` when set, otherwise to
+`~/.local/bin`. Set `KEYHOLD_INSTALL_DIR` to select another directory, or
+`KEYHOLD_VERSION` to select an exact release tag such as `vX.Y.Z`. The
+installer does not modify `PATH`; it warns when the selected directory is not
+already on `PATH`.
+
+### cargo-binstall
+
+[cargo-binstall](https://github.com/cargo-bins/cargo-binstall) normally uses
+the prebuilt release binary on supported platforms and avoids compiling
+locally:
 
 ```sh
 cargo binstall keyhold
 ```
 
-Using Cargo — standard installation from crates.io (compiles from source):
+### cargo install
+
+This builds Keyhold from source and requires Rust 1.88 or newer:
 
 ```sh
 cargo install keyhold
 ```
 
-From source:
+### Prebuilt GitHub releases
+
+[GitHub releases](https://github.com/seapagan/keyhold/releases) provide four
+Linux archives:
+
+- `x86_64-unknown-linux-gnu`
+- `x86_64-unknown-linux-musl`
+- `aarch64-unknown-linux-gnu`
+- `aarch64-unknown-linux-musl`
+
+Choose GNU on systems with glibc 2.28 or newer. The musl archive is statically
+linked and works on musl systems; you may also use it on a glibc system. Each
+archive contains `keyhold`, `README.md`, and `LICENSE.txt`. Its matching
+`.sha256` file is a separate release asset. Verify both downloaded files before
+extracting the archive:
+
+```sh
+sha256sum -c keyhold-vX.Y.Z-x86_64-unknown-linux-gnu.tar.gz.sha256
+```
+
+Extract the archive, then place `keyhold` in a directory on `PATH`. For a
+per-user installation:
+
+```sh
+mkdir -p ~/.local/bin
+install -m 755 keyhold ~/.local/bin/keyhold
+```
+
+Another directory already on `PATH` is equally valid.
+
+GitHub also records build provenance for each archive. Verify it with GitHub
+CLI:
+
+```sh
+gh attestation verify \
+  keyhold-vX.Y.Z-x86_64-unknown-linux-gnu.tar.gz \
+  --repo seapagan/keyhold
+```
+
+GitHub release immutability is enabled for Keyhold: published releases, tags,
+and assets cannot be modified after publication. These are the normal Keyhold
+release-verification commands:
+
+```sh
+gh release verify vX.Y.Z -R seapagan/keyhold
+# or verify one asset
+gh release verify-asset \
+  vX.Y.Z \
+  keyhold-vX.Y.Z-x86_64-unknown-linux-gnu.tar.gz \
+  -R seapagan/keyhold
+```
+
+The `.sha256` sidecar confirms that the downloaded archive matches the archive
+published with the release, protecting against corruption or inconsistent
+download bytes. Because the checksum and archive come from the same release
+source, checksum verification alone is not independent provenance or
+authenticity. The `gh attestation verify` command above verifies build
+provenance by tying the archive digest to the GitHub Actions build identity,
+repository, and source revision. These checks do not prove that the software
+is bug-free or safe.
+
+### Build from source
 
 ```sh
 git clone https://github.com/seapagan/keyhold
 cd keyhold
-cargo install --path .
+cargo build --release --locked
 ```
 
-Or build and run in place:
-
-```sh
-cargo build --release
-./target/release/keyhold --help
-```
+The resulting executable is `target/release/keyhold`.
 
 ## Usage
 
@@ -418,7 +502,8 @@ not re-prompt).
 
 ```sh
 cargo make verify        # full local gate: fmt, check, clippy, tests, docs,
-                         # release build, package, MSRV, actionlint, zizmor
+                         # release build, package, MSRV, ShellCheck,
+                         # installer tests, actionlint, zizmor
 cargo make test          # tests only (cargo nextest)
 cargo make coverage-html # HTML coverage report in target/llvm-cov/html
 cargo make msrv          # check against the minimum supported Rust

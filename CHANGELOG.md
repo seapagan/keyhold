@@ -5,6 +5,15 @@ project since the first release, with the latest changes at the top.
 
 This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v0.3.1](https://github.com/seapagan/keyhold/releases/tag/v0.3.1) (September 26, 2026)
+
+> [!IMPORTANT]
+>
+> This release is identical to release **v0.3.0**, except it includes the missing
+> binary assets.
+
+[`Full Changelog`](https://github.com/seapagan/keyhold/compare/v0.3.0...v0.3.1) | [`Diff`](https://github.com/seapagan/keyhold/compare/v0.3.0...v0.3.1.diff) | [`Patch`](https://github.com/seapagan/keyhold/compare/v0.3.0...v0.3.1.patch)
+
 ## [v0.3.0](https://github.com/seapagan/keyhold/releases/tag/v0.3.0) (September 26, 2026)
 
 > [!IMPORTANT]

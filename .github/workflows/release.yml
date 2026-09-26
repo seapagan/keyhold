@@ -250,3 +250,13 @@ jobs:
 
       - name: Publish release
         run: gh release edit "$TAG_NAME" --draft=false
+
+      - name: Require immutable published release
+        env:
+          GH_REPO: ${{ github.repository }}
+        run: |
+          immutable=$(gh api "repos/$GH_REPO/releases/tags/$TAG_NAME" --jq '.immutable')
+          if [ "$immutable" != true ]; then
+            echo "error: GitHub release immutability must be enabled for this repository" >&2
+            exit 1
+          fi

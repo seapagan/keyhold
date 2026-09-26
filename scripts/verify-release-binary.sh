@@ -39,26 +39,13 @@ case "$libc" in
         version_info=$($readelf --version-info -W "$binary") || \
             die 'readelf could not inspect GLIBC symbol versions'
         versions=$(printf '%s\n' "$version_info" | \
-            grep -Eo 'GLIBC_[0-9]+\.[0-9]+' | sort -u || :)
+            grep -Eo 'GLIBC_[0-9]+(\.[0-9]+)+' | sort -Vu || :)
         test -n "$versions" || die 'no GLIBC symbol versions found'
-        max_major=0
-        max_minor=0
-        for version in $versions; do
-            numbers=${version#GLIBC_}
-            major=${numbers%%.*}
-            minor=${numbers#*.}
-            if test "$major" -gt "$max_major" || {
-                test "$major" -eq "$max_major" && test "$minor" -gt "$max_minor"
-            }; then
-                max_major=$major
-                max_minor=$minor
-            fi
-        done
-        printf 'maximum GLIBC requirement: %s.%s\n' "$max_major" "$max_minor"
-        if test "$max_major" -gt 2 || {
-            test "$max_major" -eq 2 && test "$max_minor" -gt 28
-        }; then
-            die "GLIBC requirement $max_major.$max_minor is newer than 2.28"
+        max_version=$(printf '%s\n' "$versions" | sed 's/^GLIBC_//' | sort -V | tail -n 1)
+        printf 'maximum GLIBC requirement: %s\n' "$max_version"
+        newest=$(printf '%s\n' "$max_version" '2.28' | sort -V | tail -n 1)
+        if test "$newest" != '2.28'; then
+            die "GLIBC requirement $max_version is newer than 2.28"
         fi
         ;;
     musl)
@@ -68,7 +55,14 @@ case "$libc" in
         if printf '%s\n' "$dynamic" | grep -Eq '\(NEEDED\)'; then
             die 'static musl ELF must not contain NEEDED dependencies'
         fi
-        printf 'static musl ELF verified\n'
+        notes=$($readelf -nW "$binary") || die 'readelf could not inspect ELF notes'
+        if printf '%s\n' "$notes" | grep -Fq 'NT_GNU_ABI_TAG'; then
+            die 'static ELF carries a GNU/glibc ABI note, not musl'
+        fi
+        symbols=$($readelf -sW "$binary") || die 'readelf could not inspect ELF symbols'
+        printf '%s\n' "$symbols" | grep -Eq '[[:space:]]__init_libc$' || \
+            die 'static ELF does not contain the musl __init_libc symbol'
+        printf 'static musl ELF verified: no PT_INTERP, no NEEDED entries, musl __init_libc present\n'
         ;;
     *) die "unsupported libc family: $libc" ;;
 esac

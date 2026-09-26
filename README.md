@@ -52,7 +52,7 @@ The installer verifies the archive's SHA-256 checksum, executes the downloaded
 binary to confirm its version, then replaces an existing installation with an
 atomic rename. It installs to `$XDG_BIN_HOME` when set, otherwise to
 `~/.local/bin`. Set `KEYHOLD_INSTALL_DIR` to select another directory, or
-`KEYHOLD_VERSION` to select an exact release tag such as `v0.3.0`. The
+`KEYHOLD_VERSION` to select an exact release tag such as `vX.Y.Z`. The
 installer does not modify `PATH`; it warns when the selected directory is not
 already on `PATH`.
 
@@ -104,13 +104,20 @@ install -m 755 keyhold ~/.local/bin/keyhold
 
 Another directory already on `PATH` is equally valid.
 
-GitHub also records build provenance for each archive. With GitHub CLI:
+GitHub also records build provenance for each archive. Verify it with GitHub
+CLI:
 
 ```sh
 gh attestation verify \
   keyhold-vX.Y.Z-x86_64-unknown-linux-gnu.tar.gz \
   --repo seapagan/keyhold
+```
 
+GitHub release immutability is enabled for Keyhold: published releases, tags,
+and assets cannot be modified after publication. These are the normal Keyhold
+release-verification commands:
+
+```sh
 gh release verify vX.Y.Z -R seapagan/keyhold
 # or verify one asset
 gh release verify-asset \
@@ -119,10 +126,14 @@ gh release verify-asset \
   -R seapagan/keyhold
 ```
 
-SHA-256 confirms that an archive matches the published checksum asset. Build
-provenance ties its digest to the GitHub Actions build identity, repository,
-and source revision. Immutable-release verification covers the published tag
-and assets. These checks do not prove that the software is bug-free or safe.
+The `.sha256` sidecar confirms that the downloaded archive matches the archive
+published with the release, protecting against corruption or inconsistent
+download bytes. Because the checksum and archive come from the same release
+source, checksum verification alone is not independent provenance or
+authenticity. The `gh attestation verify` command above verifies build
+provenance by tying the archive digest to the GitHub Actions build identity,
+repository, and source revision. These checks do not prove that the software
+is bug-free or safe.
 
 ### Build from source
 

@@ -1,6 +1,6 @@
 [package]
 name = "keyhold"
-version = "0.3.0"
+version = "0.3.1"
 edition = "2024"
 rust-version = "1.88"
 description = "Temporarily keep a GPG private key cached in gpg-agent while you explicitly allow it"

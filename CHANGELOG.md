@@ -7,6 +7,11 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [v0.3.0](https://github.com/seapagan/keyhold/releases/tag/v0.3.0) (September 26, 2026)
 
+> [!IMPORTANT]
+>
+> This release was published before the automated binary-asset workflow completed,
+> so it contains no installer binary assets. Use **v0.3.1** or later for binary installation.
+
 ### New Features
 
 - Feat: add Linux release installer ([#4](https://github.com/seapagan/keyhold/pull/4)) by [seapagan](https://github.com/seapagan)
@@ -29,8 +34,6 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 Initial release of `keyhold`.
 
-See the README for installation, usage, configuration, and implementation
-details.
-
+See the README for installation, usage, configuration, and implementation details.
 ---
 *This changelog was generated using [github-changelog-md](http://changelog.seapagan.net/) by [Seapagan](https://github.com/seapagan)*

@@ -6,7 +6,7 @@ die() {
     exit 1
 }
 
-test "$#" -eq 3 || die 'usage: verify-release-binary.sh <gnu|musl> <x86_64|aarch64> <binary>'
+test "$#" -eq 3 || die 'usage: verify-release-binary.sh <gnu|musl|static> <x86_64|aarch64> <binary>'
 
 libc=$1
 arch=$2
@@ -48,12 +48,16 @@ case "$libc" in
             die "GLIBC requirement $max_version is newer than 2.28"
         fi
         ;;
-    musl)
+    musl|static)
         if printf '%s\n' "$program" | grep -Eq '(^|[[:space:]])INTERP([[:space:]]|$)'; then
             die 'static musl ELF must not contain PT_INTERP'
         fi
         if printf '%s\n' "$dynamic" | grep -Eq '\(NEEDED\)'; then
             die 'static musl ELF must not contain NEEDED dependencies'
+        fi
+        if test "$libc" = static; then
+            printf 'static ELF verified: no PT_INTERP, no NEEDED entries\n'
+            exit 0
         fi
         notes=$($readelf -nW "$binary") || die 'readelf could not inspect ELF notes'
         if printf '%s\n' "$notes" | grep -Fq 'NT_GNU_ABI_TAG'; then

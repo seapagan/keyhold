@@ -120,11 +120,33 @@ jobs:
               cargo build --release --locked --target "$TARGET"
             '
 
-      - name: Verify ELF compatibility
+      - name: Verify unstripped ELF compatibility
         env:
           ARCH: ${{ matrix.arch }}
           LIBC: ${{ matrix.libc }}
         run: scripts/verify-release-binary.sh "$LIBC" "$ARCH" "target/$TARGET/release/keyhold"
+
+      - name: Strip release binary
+        run: |
+          binary="target/$TARGET/release/keyhold"
+          stat --format='size before stripping: %s bytes' "$binary"
+          docker run --rm \
+            --volume "$GITHUB_WORKSPACE:/work" \
+            --workdir /work \
+            "$BUILD_IMAGE" \
+            strip --strip-all "$binary"
+          stat --format='size after stripping: %s bytes' "$binary"
+
+      - name: Verify stripped ELF compatibility
+        env:
+          ARCH: ${{ matrix.arch }}
+          LIBC: ${{ matrix.libc }}
+        run: |
+          mode=$LIBC
+          if [ "$LIBC" = musl ]; then
+            mode=static
+          fi
+          scripts/verify-release-binary.sh "$mode" "$ARCH" "target/$TARGET/release/keyhold"
 
       - name: Smoke-test version output
         run: |

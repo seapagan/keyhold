@@ -166,4 +166,25 @@ assert_fails_with 'musl ELF with NEEDED dependencies was accepted' \
     'must not contain NEEDED dependencies' \
     ./scripts/verify-release-binary.sh musl x86_64 "$root/keyhold"
 
-printf 'Release verification tests passed: 14 cases.\n'
+write_elf_fixture 'Advanced Micro Devices X86-64' '' '' ''
+assert_passes 'valid static ELF was rejected after stripping' \
+    ./scripts/verify-release-binary.sh static x86_64 "$root/keyhold"
+
+write_elf_fixture 'Advanced Micro Devices X86-64' \
+    '  INTERP         0x0000000000000350' '' ''
+assert_fails_with 'static ELF with an interpreter was accepted after stripping' \
+    'must not contain PT_INTERP' \
+    ./scripts/verify-release-binary.sh static x86_64 "$root/keyhold"
+
+write_elf_fixture 'Advanced Micro Devices X86-64' '' \
+    ' 0x0000000000000001 (NEEDED) Shared library: [libz.so.1]' ''
+assert_fails_with 'static ELF with NEEDED dependencies was accepted after stripping' \
+    'must not contain NEEDED dependencies' \
+    ./scripts/verify-release-binary.sh static x86_64 "$root/keyhold"
+
+write_elf_fixture 'AArch64' '' '' ''
+assert_fails_with 'wrong static ELF architecture was accepted after stripping' \
+    'expected x86_64 ELF' \
+    ./scripts/verify-release-binary.sh static x86_64 "$root/keyhold"
+
+printf 'Release verification tests passed: 18 cases.\n'

@@ -228,38 +228,35 @@ jobs:
         env:
           GH_REPO: ${{ github.repository }}
         run: |
-          release_json="$RUNNER_TEMP/release.json"
-          release_error="$RUNNER_TEMP/release-error"
-          if gh release view "$TAG_NAME" \
-            --repo "$GH_REPO" \
-            --json isDraft,isImmutable,databaseId \
-            > "$release_json" 2> "$release_error"
+          owner=${GH_REPO%%/*}
+          name=${GH_REPO#*/}
+          if ! response=$(gh api graphql \
+            -F owner="$owner" \
+            -F name="$name" \
+            -F tag="$TAG_NAME" \
+            -f query="query(\$owner: String!, \$name: String!, \$tag: String!) {
+              repository(owner: \$owner, name: \$name) {
+                release(tagName: \$tag) { isDraft immutable }
+              }
+            }")
           then
-            draft=$(jq -r .isDraft "$release_json")
-            immutable=$(jq -r .isImmutable "$release_json")
-            database_id=$(jq -r .databaseId "$release_json")
+            echo "error: could not determine whether release $TAG_NAME exists" >&2
+            exit 1
+          fi
+          release=$(printf '%s' "$response" | jq -c '.data.repository.release')
+          if [ "$release" != null ]; then
+            draft=$(printf '%s' "$release" | jq -r .isDraft)
+            immutable=$(printf '%s' "$release" | jq -r .immutable)
             if [ "$draft" != true ] || [ "$immutable" = true ]; then
               echo "error: release $TAG_NAME is already published and cannot be changed" >&2
               exit 1
             fi
-            case "$database_id" in
-              ''|null|*[!0-9]*)
-                echo "error: release $TAG_NAME lookup returned an invalid database ID" >&2
-                exit 1
-                ;;
-            esac
           else
-            if grep -Fxq 'release not found' "$release_error"; then
-              gh release create "$TAG_NAME" \
-                --verify-tag \
-                --draft \
-                --title "$TAG_NAME" \
-                --generate-notes
-            else
-              cat "$release_error" >&2
-              echo "error: could not determine whether release $TAG_NAME exists" >&2
-              exit 1
-            fi
+            gh release create "$TAG_NAME" \
+              --verify-tag \
+              --draft \
+              --title "$TAG_NAME" \
+              --generate-notes
           fi
 
       - name: Attest release archives

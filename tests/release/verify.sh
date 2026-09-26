@@ -3,6 +3,7 @@ set -eu
 
 root=$(mktemp -d)
 trap 'rm -rf "$root"' 0 1 2 3 15
+passes=0
 
 fail() {
     printf 'FAIL: %s\n' "$1" >&2
@@ -16,6 +17,7 @@ assert_passes() {
         cat "$root/output" >&2
         fail "$description"
     }
+    passes=$((passes + 1))
 }
 
 assert_fails_with() {
@@ -29,6 +31,7 @@ assert_fails_with() {
         cat "$root/output" >&2
         fail "$description did not report: $expected"
     }
+    passes=$((passes + 1))
 }
 
 fixture=$root/readelf
@@ -90,7 +93,12 @@ assert_passes 'three-component GLIBC version was rejected' \
 grep -Fq 'maximum GLIBC requirement: 2.2.5' "$root/output" || \
     fail 'GNU verification truncated a three-component GLIBC version'
 
-printf '  Type: DYN (Position-Independent Executable file)\n  Machine: AArch64\n' >"$fixture/header"
+write_elf_fixture 'AArch64' \
+    '  INTERP         0x0000000000000238' \
+    ' 0x0000000000000001 (NEEDED) Shared library: [libc.so.6]' \
+    'Name: GLIBC_2.17  Name: GLIBC_2.28'
+printf '  Type: DYN (Position-Independent Executable file)\n  Machine: AArch64\n' \
+    >"$fixture/header"
 assert_passes 'valid ELF header with compact spacing was rejected' \
     ./scripts/verify-release-binary.sh gnu aarch64 "$root/keyhold"
 
@@ -101,6 +109,12 @@ assert_passes 'valid static musl ELF was rejected' \
     ./scripts/verify-release-binary.sh musl x86_64 "$root/keyhold"
 grep -Fq 'static musl ELF verified: no PT_INTERP, no NEEDED entries, musl __init_libc present' \
     "$root/output" || fail 'musl verification did not report all established properties'
+
+write_elf_fixture 'AArch64' '' '' ''
+printf '  6714: 0000000000342ca4   413 FUNC    LOCAL  DEFAULT    9 __init_libc\n' \
+    >"$fixture/symbols"
+assert_passes 'valid aarch64 static musl ELF was rejected' \
+    ./scripts/verify-release-binary.sh musl aarch64 "$root/keyhold"
 
 write_elf_fixture 'Advanced Micro Devices X86-64' '' '' ''
 printf '  GNU                  0x00000010 NT_GNU_ABI_TAG (ABI version tag)\n' \
@@ -170,6 +184,10 @@ write_elf_fixture 'Advanced Micro Devices X86-64' '' '' ''
 assert_passes 'valid static ELF was rejected after stripping' \
     ./scripts/verify-release-binary.sh static x86_64 "$root/keyhold"
 
+write_elf_fixture 'AArch64' '' '' ''
+assert_passes 'valid aarch64 static ELF was rejected after stripping' \
+    ./scripts/verify-release-binary.sh static aarch64 "$root/keyhold"
+
 write_elf_fixture 'Advanced Micro Devices X86-64' \
     '  INTERP         0x0000000000000350' '' ''
 assert_fails_with 'static ELF with an interpreter was accepted after stripping' \
@@ -187,4 +205,4 @@ assert_fails_with 'wrong static ELF architecture was accepted after stripping' \
     'expected x86_64 ELF' \
     ./scripts/verify-release-binary.sh static x86_64 "$root/keyhold"
 
-printf 'Release verification tests passed: 18 cases.\n'
+printf 'Release verification tests passed: %s cases.\n' "$passes"

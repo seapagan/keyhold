@@ -175,6 +175,15 @@ main() {
     architecture=$(detect_arch)
     libc=$(select_libc)
     target="$architecture-unknown-linux-$libc"
+    if test -n "${KEYHOLD_INSTALL_DIR:-}"; then
+        install_dir=$KEYHOLD_INSTALL_DIR
+    elif test -n "${XDG_BIN_HOME:-}"; then
+        install_dir=$XDG_BIN_HOME
+    elif test -n "${HOME:-}"; then
+        install_dir=$HOME/.local/bin
+    else
+        die 'no install directory could be determined; set KEYHOLD_INSTALL_DIR'
+    fi
     explicit_version=0
     if test -n "${KEYHOLD_VERSION:-}"; then explicit_version=1; fi
 
@@ -186,7 +195,6 @@ main() {
     fetch_and_verify_release "$version" "$target" "$explicit_version"
     validate_candidate "$version"
 
-    install_dir=${KEYHOLD_INSTALL_DIR:-${XDG_BIN_HOME:-$HOME/.local/bin}}
     replace_candidate "$install_dir"
 
     printf 'Installed keyhold %s to %s.\n' "$version" "$install_dir"

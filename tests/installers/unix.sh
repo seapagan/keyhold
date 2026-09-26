@@ -513,6 +513,12 @@ reset_env; XDG_BIN_HOME=$root/'xdg bin'; KEYHOLD_INSTALL_DIR=; export XDG_BIN_HO
 run_install || fail 'XDG install directory failed'; test -x "$XDG_BIN_HOME/keyhold" || fail 'XDG directory was ignored'; pass
 reset_env; HOME=$root/'default home'; KEYHOLD_INSTALL_DIR=; export HOME KEYHOLD_INSTALL_DIR
 run_install || fail 'default install directory failed'; test -x "$HOME/.local/bin/keyhold" || fail 'default directory was ignored'; pass
+reset_env
+unset KEYHOLD_INSTALL_DIR XDG_BIN_HOME HOME
+assert_fails 'missing install directory inputs succeeded'
+assert_output 'no install directory could be determined; set KEYHOLD_INSTALL_DIR'
+test ! -s "$TEST_DOWNLOAD_LOG" || fail 'missing install directory inputs attempted a release download'
+pass
 
 reset_env
 archive=keyhold-v0.2.0-x86_64-unknown-linux-gnu.tar.gz

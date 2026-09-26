@@ -96,13 +96,25 @@ cleanup() {
 resolve_version() {
     version=${KEYHOLD_VERSION:-}
     if test -z "$version"; then
-        download \
-            'https://api.github.com/repos/seapagan/keyhold/releases/latest' \
-            "$tmp_dir/latest.json"
-        version=$(sed -n \
-            's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
-            "$tmp_dir/latest.json" | head -n 1)
-        test -n "$version" || die 'latest release tag was not found'
+        latest_url=https://github.com/seapagan/keyhold/releases/latest
+        if command -v curl >/dev/null 2>&1; then
+            release_url=$(curl -fsSL -o /dev/null -w '%{url_effective}\n' "$latest_url") || \
+                die 'could not resolve latest release redirect'
+        elif command -v wget >/dev/null 2>&1; then
+            headers=$tmp_dir/latest.headers
+            wget -q --spider --server-response "$latest_url" 2>"$headers" || \
+                die 'could not resolve latest release redirect'
+            release_url=$(awk '
+                tolower($1) == "location:" { url = $2 }
+                END { sub(/\r$/, "", url); print url }
+            ' "$headers")
+        else
+            die 'curl or wget is required'
+        fi
+        version=$(printf '%s\n' "$release_url" | sed -n \
+            's#^https://github\.com/seapagan/keyhold/releases/tag/\(v[0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\)$#\1#p')
+        test -n "$version" || \
+            die 'latest release redirect did not resolve to a usable release tag'
     fi
     printf '%s\n' "$version"
 }

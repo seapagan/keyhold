@@ -90,6 +90,7 @@ destination=
 while test "$#" -gt 0; do
     case "$1" in
         -o) destination=$2; shift 2 ;;
+        -w) shift 2 ;;
         -*) shift ;;
         *) url=$1; shift ;;
     esac
@@ -97,7 +98,7 @@ done
 printf '%s\n' "$url" >>"$TEST_DOWNLOAD_LOG"
 printf 'curl\n' >>"$TEST_DOWNLOADER_LOG"
 case "$url" in
-    */releases/latest) cp "$TEST_API" "$destination" ;;
+    */releases/latest) printf '%s\n' "$TEST_LATEST_URL" ;;
     */releases/download/*)
         name=${url##*/}
         cp "$TEST_RELEASE_DIR/$name" "$destination"
@@ -120,7 +121,7 @@ done
 printf '%s\n' "$url" >>"$TEST_DOWNLOAD_LOG"
 printf 'wget\n' >>"$TEST_DOWNLOADER_LOG"
 case "$url" in
-    */releases/latest) cp "$TEST_API" "$destination" ;;
+    */releases/latest) printf '  Location: %s\n' "$TEST_LATEST_URL" >&2 ;;
     */releases/download/*)
         name=${url##*/}
         cp "$TEST_RELEASE_DIR/$name" "$destination"
@@ -199,9 +200,7 @@ for target in $targets; do
     (cd "$release_dir" && "$REAL_SHA256SUM" "$archive" >"$archive.sha256")
 done
 "$REAL_TAR" -czf "$release_dir/missing.tar.gz" -C "$root/empty" .
-printf '{"tag_name": "v0.2.0"}\n' >"$root/latest.json"
-
-TEST_API=$root/latest.json
+TEST_LATEST_URL=https://github.com/seapagan/keyhold/releases/tag/v0.2.0
 TEST_RELEASE_DIR=$release_dir
 TEST_DOWNLOAD_LOG=$root/downloads.log
 TEST_DOWNLOADER_LOG=$root/downloaders.log
@@ -211,7 +210,7 @@ TEST_MKTEMP_COUNTER=$root/mktemp-counter
 TEST_MKTEMP_LAST=$root/mktemp-last
 TEST_STAGE_COUNTER=$root/stage-counter
 TEST_STAGE_LAST=$root/stage-last
-export TEST_API TEST_RELEASE_DIR TEST_DOWNLOAD_LOG TEST_DOWNLOADER_LOG
+export TEST_LATEST_URL TEST_RELEASE_DIR TEST_DOWNLOAD_LOG TEST_DOWNLOADER_LOG
 export TEST_EVENT_LOG TEST_TMP_PARENT TEST_MKTEMP_COUNTER TEST_MKTEMP_LAST
 export TEST_STAGE_COUNTER TEST_STAGE_LAST
 
@@ -241,6 +240,7 @@ reset_env() {
     TEST_GLIBC_VERSION=2.28
     TEST_CANDIDATE_VERSION=0.2.0
     TEST_CANDIDATE_EXIT=0
+    TEST_LATEST_URL=https://github.com/seapagan/keyhold/releases/tag/v0.2.0
     TEST_INSTALL_FAIL=0
     TEST_INSTALL_SIGNAL=0
     TEST_MOVE_FAIL=0
@@ -251,7 +251,7 @@ reset_env() {
     rm -rf "$KEYHOLD_INSTALL_DIR"
     export KEYHOLD_VERSION KEYHOLD_INSTALL_DIR KEYHOLD_LIBC XDG_BIN_HOME HOME
     export TEST_OS TEST_ARCH TEST_BIN TEST_GETCONF_KIND TEST_LDD_KIND
-    export TEST_GLIBC_VERSION TEST_CANDIDATE_VERSION TEST_CANDIDATE_EXIT
+    export TEST_GLIBC_VERSION TEST_CANDIDATE_VERSION TEST_CANDIDATE_EXIT TEST_LATEST_URL
     export TEST_INSTALL_FAIL TEST_INSTALL_SIGNAL TEST_MOVE_FAIL TEST_STAGE_FAIL
 }
 
@@ -432,10 +432,20 @@ run_install || fail 'replacement of existing binary failed'
 test "$("$KEYHOLD_INSTALL_DIR/keyhold" --version)" = 'keyhold 0.2.0' || fail 'existing binary was not replaced'; pass
 
 reset_env; KEYHOLD_VERSION=; export KEYHOLD_VERSION
-run_install || fail 'latest-release lookup failed'; grep -Fq '/releases/latest' "$TEST_DOWNLOAD_LOG" || fail 'latest endpoint was not used'; pass
+run_install || fail 'latest-release lookup failed'
+grep -Fxq 'https://github.com/seapagan/keyhold/releases/latest' "$TEST_DOWNLOAD_LOG" || fail 'GitHub latest-release redirect was not used'
+if grep -Fq 'api.github.com' "$TEST_DOWNLOAD_LOG"; then fail 'latest lookup used api.github.com'; fi
+assert_target x86_64-unknown-linux-gnu; pass
 reset_env; KEYHOLD_VERSION=v0.2.0; export KEYHOLD_VERSION
 run_install || fail 'explicit version failed'
 if grep -Fq '/releases/latest' "$TEST_DOWNLOAD_LOG"; then fail 'explicit version queried latest release'; fi
+pass
+
+reset_env; KEYHOLD_VERSION=; TEST_LATEST_URL=https://github.com/seapagan/keyhold/releases/tag/not-a-version
+export KEYHOLD_VERSION TEST_LATEST_URL
+assert_fails 'malformed latest-release redirect succeeded'
+assert_output 'latest release redirect did not resolve to a usable release tag'
+if grep -Fq '/releases/download/' "$TEST_DOWNLOAD_LOG"; then fail 'malformed latest redirect attempted an asset download'; fi
 pass
 
 for install_state in existing fresh; do
@@ -501,9 +511,11 @@ done
 mv "$root/current-checksum" "$release_dir/$current_archive.sha256"
 
 reset_env
-run_install || fail 'curl path failed'; grep -Fxq curl "$TEST_DOWNLOADER_LOG" || fail 'curl was not preferred'; pass
+KEYHOLD_VERSION=; export KEYHOLD_VERSION
+run_install || fail 'curl latest-resolution path failed'; grep -Fxq curl "$TEST_DOWNLOADER_LOG" || fail 'curl was not preferred'; pass
 reset_env; TEST_BIN=$wget_bin; export TEST_BIN
-run_install || fail 'wget fallback failed'; grep -Fxq wget "$TEST_DOWNLOADER_LOG" || fail 'wget did not run'; pass
+KEYHOLD_VERSION=; export KEYHOLD_VERSION
+run_install || fail 'wget latest-resolution fallback failed'; grep -Fxq wget "$TEST_DOWNLOADER_LOG" || fail 'wget did not run'; pass
 reset_env; TEST_BIN=$no_download_bin; export TEST_BIN
 assert_fails 'missing downloader succeeded'; assert_output 'curl or wget is required'; assert_tmp_cleaned; pass
 

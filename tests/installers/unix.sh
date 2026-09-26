@@ -193,14 +193,24 @@ chmod +x "$root/archive/keyhold"
 printf 'release readme\n' >"$root/archive/README.md"
 printf 'release licence\n' >"$root/archive/LICENSE.txt"
 
+# Synthetic versions used only by this test harness.
+# They deliberately do not correspond to real Keyhold releases.
+# All release assets and GitHub responses below are mocked locally; changing
+# the actual Keyhold release version must not require changing these fixtures.
+TEST_RELEASE_VERSION=99.88.77
+TEST_RELEASE_TAG=v$TEST_RELEASE_VERSION
+
+TEST_OLD_VERSION=98.77.66
+TEST_OLD_TAG=v$TEST_OLD_VERSION
+
 targets='x86_64-unknown-linux-gnu x86_64-unknown-linux-musl aarch64-unknown-linux-gnu aarch64-unknown-linux-musl'
 for target in $targets; do
-    archive="keyhold-v0.2.0-$target.tar.gz"
+    archive="keyhold-$TEST_RELEASE_TAG-$target.tar.gz"
     "$REAL_TAR" -czf "$release_dir/$archive" -C "$root/archive" keyhold README.md LICENSE.txt
     (cd "$release_dir" && "$REAL_SHA256SUM" "$archive" >"$archive.sha256")
 done
 "$REAL_TAR" -czf "$release_dir/missing.tar.gz" -C "$root/empty" .
-TEST_LATEST_URL=https://github.com/seapagan/keyhold/releases/tag/v0.2.0
+TEST_LATEST_URL=https://github.com/seapagan/keyhold/releases/tag/$TEST_RELEASE_TAG
 TEST_RELEASE_DIR=$release_dir
 TEST_DOWNLOAD_LOG=$root/downloads.log
 TEST_DOWNLOADER_LOG=$root/downloaders.log
@@ -227,7 +237,7 @@ fail() {
 pass() { passes=$((passes + 1)); }
 
 reset_env() {
-    KEYHOLD_VERSION=v0.2.0
+    KEYHOLD_VERSION=$TEST_RELEASE_TAG
     KEYHOLD_INSTALL_DIR=$root/install
     KEYHOLD_LIBC=
     XDG_BIN_HOME=
@@ -238,9 +248,9 @@ reset_env() {
     TEST_GETCONF_KIND=glibc
     TEST_LDD_KIND=glibc
     TEST_GLIBC_VERSION=2.28
-    TEST_CANDIDATE_VERSION=0.2.0
+    TEST_CANDIDATE_VERSION=$TEST_RELEASE_VERSION
     TEST_CANDIDATE_EXIT=0
-    TEST_LATEST_URL=https://github.com/seapagan/keyhold/releases/tag/v0.2.0
+    TEST_LATEST_URL=https://github.com/seapagan/keyhold/releases/tag/$TEST_RELEASE_TAG
     TEST_INSTALL_FAIL=0
     TEST_INSTALL_SIGNAL=0
     TEST_MOVE_FAIL=0
@@ -271,12 +281,12 @@ assert_no_output() {
 }
 
 assert_downloaded() {
-    grep -Fxq "https://github.com/seapagan/keyhold/releases/download/v0.2.0/$1" "$TEST_DOWNLOAD_LOG" || fail "asset was not downloaded: $1"
+    grep -Fxq "https://github.com/seapagan/keyhold/releases/download/$TEST_RELEASE_TAG/$1" "$TEST_DOWNLOAD_LOG" || fail "asset was not downloaded: $1"
 }
 
 assert_target() {
-    assert_downloaded "keyhold-v0.2.0-$1.tar.gz"
-    assert_downloaded "keyhold-v0.2.0-$1.tar.gz.sha256"
+    assert_downloaded "keyhold-$TEST_RELEASE_TAG-$1.tar.gz"
+    assert_downloaded "keyhold-$TEST_RELEASE_TAG-$1.tar.gz.sha256"
 }
 
 assert_old_binary() {
@@ -356,7 +366,7 @@ run_install || fail 'valid checksum failed'; grep -Fxq sha256sum "$TEST_EVENT_LO
 
 for mode in bad malformed wrong-name external-file; do
     reset_env
-    archive=keyhold-v0.2.0-x86_64-unknown-linux-gnu.tar.gz
+    archive=keyhold-$TEST_RELEASE_TAG-x86_64-unknown-linux-gnu.tar.gz
     sidecar=$release_dir/$archive.sha256
     backup=$root/sidecar-backup
     cp "$sidecar" "$backup"
@@ -374,7 +384,7 @@ for mode in bad malformed wrong-name external-file; do
 done
 
 reset_env
-archive=keyhold-v0.2.0-x86_64-unknown-linux-gnu.tar.gz
+archive=keyhold-$TEST_RELEASE_TAG-x86_64-unknown-linux-gnu.tar.gz
 sidecar=$release_dir/$archive.sha256
 backup=$root/sidecar-backup
 cp "$sidecar" "$backup"
@@ -389,13 +399,13 @@ assert_fails 'missing sha256sum succeeded'; assert_output 'sha256sum is required
 reset_env; TEST_CANDIDATE_EXIT=1; mkdir -p "$KEYHOLD_INSTALL_DIR"; printf 'old keyhold\n' >"$KEYHOLD_INSTALL_DIR/keyhold"; export TEST_CANDIDATE_EXIT
 assert_fails 'candidate non-zero exit succeeded'; assert_old_binary; pass
 reset_env; TEST_CANDIDATE_VERSION=9.9.9; export TEST_CANDIDATE_VERSION
-assert_fails 'wrong candidate version succeeded'; assert_output 'reported version does not match v0.2.0'; assert_no_binary; pass
+assert_fails 'wrong candidate version succeeded'; assert_output "reported version does not match $TEST_RELEASE_TAG"; assert_no_binary; pass
 
 reset_env
 bad_archive=$root/bad-archive; mkdir "$bad_archive"
 printf '#!/missing/interpreter\n' >"$bad_archive/keyhold"; chmod +x "$bad_archive/keyhold"
 cp "$root/archive/README.md" "$root/archive/LICENSE.txt" "$bad_archive/"
-archive=keyhold-v0.2.0-x86_64-unknown-linux-gnu.tar.gz
+archive=keyhold-$TEST_RELEASE_TAG-x86_64-unknown-linux-gnu.tar.gz
 "$REAL_TAR" -czf "$release_dir/$archive" -C "$bad_archive" keyhold README.md LICENSE.txt
 (cd "$release_dir" && "$REAL_SHA256SUM" "$archive" >"$archive.sha256")
 assert_fails 'unexecutable candidate succeeded'; assert_output 'candidate failed --version validation'; assert_no_binary
@@ -405,7 +415,7 @@ assert_fails 'unexecutable candidate succeeded'; assert_output 'candidate failed
 reset_env; KEYHOLD_INSTALL_DIR=$root/success-bin; export KEYHOLD_INSTALL_DIR
 run_install || fail 'successful replacement failed'
 test -x "$KEYHOLD_INSTALL_DIR/keyhold" || fail 'installed binary is not executable'
-test "$("$KEYHOLD_INSTALL_DIR/keyhold" --version)" = 'keyhold 0.2.0' || fail 'installed candidate is wrong'
+test "$("$KEYHOLD_INSTALL_DIR/keyhold" --version)" = "keyhold $TEST_RELEASE_VERSION" || fail 'installed candidate is wrong'
 test ! -e "$KEYHOLD_INSTALL_DIR/README.md" || fail 'README was installed'
 test ! -e "$KEYHOLD_INSTALL_DIR/LICENSE.txt" || fail 'license was installed'; pass
 
@@ -429,14 +439,14 @@ pass
 reset_env
 mkdir -p "$KEYHOLD_INSTALL_DIR"; printf 'old keyhold\n' >"$KEYHOLD_INSTALL_DIR/keyhold"
 run_install || fail 'replacement of existing binary failed'
-test "$("$KEYHOLD_INSTALL_DIR/keyhold" --version)" = 'keyhold 0.2.0' || fail 'existing binary was not replaced'; pass
+test "$("$KEYHOLD_INSTALL_DIR/keyhold" --version)" = "keyhold $TEST_RELEASE_VERSION" || fail 'existing binary was not replaced'; pass
 
 reset_env; KEYHOLD_VERSION=; export KEYHOLD_VERSION
 run_install || fail 'latest-release lookup failed'
 grep -Fxq 'https://github.com/seapagan/keyhold/releases/latest' "$TEST_DOWNLOAD_LOG" || fail 'GitHub latest-release redirect was not used'
 if grep -Fq 'api.github.com' "$TEST_DOWNLOAD_LOG"; then fail 'latest lookup used api.github.com'; fi
 assert_target x86_64-unknown-linux-gnu; pass
-reset_env; KEYHOLD_VERSION=v0.2.0; export KEYHOLD_VERSION
+reset_env; KEYHOLD_VERSION=$TEST_RELEASE_TAG; export KEYHOLD_VERSION
 run_install || fail 'explicit version failed'
 if grep -Fq '/releases/latest' "$TEST_DOWNLOAD_LOG"; then fail 'explicit version queried latest release'; fi
 pass
@@ -450,36 +460,36 @@ pass
 
 for install_state in existing fresh; do
     reset_env
-    KEYHOLD_VERSION=v0.1.0; export KEYHOLD_VERSION
+    KEYHOLD_VERSION=$TEST_OLD_TAG; export KEYHOLD_VERSION
     if test "$install_state" = existing; then
         mkdir -p "$KEYHOLD_INSTALL_DIR"; printf 'old keyhold\n' >"$KEYHOLD_INSTALL_DIR/keyhold"
     fi
     assert_fails "explicit old version with missing archive succeeded ($install_state)"
-    assert_output 'could not download required release asset: keyhold-v0.1.0-x86_64-unknown-linux-gnu.tar.gz'
+    assert_output "could not download required release asset: keyhold-$TEST_OLD_TAG-x86_64-unknown-linux-gnu.tar.gz"
     assert_output 'If this is an older release, it may predate the current GNU/musl artifact layout.'
-    assert_output 'https://github.com/seapagan/keyhold/releases/tag/v0.1.0'
+    assert_output "https://github.com/seapagan/keyhold/releases/tag/$TEST_OLD_TAG"
     if test "$install_state" = existing; then assert_old_binary; else assert_no_binary; fi
     pass
 done
 
-old_archive=keyhold-v0.1.0-x86_64-unknown-linux-gnu.tar.gz
-cp "$release_dir/keyhold-v0.2.0-x86_64-unknown-linux-gnu.tar.gz" "$release_dir/$old_archive"
+old_archive=keyhold-$TEST_OLD_TAG-x86_64-unknown-linux-gnu.tar.gz
+cp "$release_dir/keyhold-$TEST_RELEASE_TAG-x86_64-unknown-linux-gnu.tar.gz" "$release_dir/$old_archive"
 for install_state in existing fresh; do
     reset_env
-    KEYHOLD_VERSION=v0.1.0; export KEYHOLD_VERSION
+    KEYHOLD_VERSION=$TEST_OLD_TAG; export KEYHOLD_VERSION
     if test "$install_state" = existing; then
         mkdir -p "$KEYHOLD_INSTALL_DIR"; printf 'old keyhold\n' >"$KEYHOLD_INSTALL_DIR/keyhold"
     fi
     assert_fails "explicit old version with missing checksum succeeded ($install_state)"
     assert_output "could not download required checksum asset: $old_archive.sha256"
     assert_output 'If this is an older release, it may predate checksum-backed installer support.'
-    assert_output 'https://github.com/seapagan/keyhold/releases/tag/v0.1.0'
+    assert_output "https://github.com/seapagan/keyhold/releases/tag/$TEST_OLD_TAG"
     if test "$install_state" = existing; then assert_old_binary; else assert_no_binary; fi
     pass
 done
 rm "$release_dir/$old_archive"
 
-current_archive=keyhold-v0.2.0-x86_64-unknown-linux-gnu.tar.gz
+current_archive=keyhold-$TEST_RELEASE_TAG-x86_64-unknown-linux-gnu.tar.gz
 mv "$release_dir/$current_archive" "$root/current-archive"
 for install_state in existing fresh; do
     reset_env
@@ -533,7 +543,7 @@ test ! -s "$TEST_DOWNLOAD_LOG" || fail 'missing install directory inputs attempt
 pass
 
 reset_env
-archive=keyhold-v0.2.0-x86_64-unknown-linux-gnu.tar.gz
+archive=keyhold-$TEST_RELEASE_TAG-x86_64-unknown-linux-gnu.tar.gz
 cp "$release_dir/missing.tar.gz" "$release_dir/$archive"
 (cd "$release_dir" && "$REAL_SHA256SUM" "$archive" >"$archive.sha256")
 assert_fails 'archive without keyhold succeeded'; assert_output 'release archive is missing keyhold'; assert_no_binary

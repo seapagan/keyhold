@@ -150,7 +150,12 @@ pub fn request_on_stream(
     stream: &UnixStream,
     req: &Request,
 ) -> Result<Response> {
-    stream.set_read_timeout(Some(IO_TIMEOUT))?;
+    // Lock may wait for an in-flight renewal, then run bounded agent I/O.
+    let timeout = match req {
+        Request::Lock { .. } => Duration::from_secs(120),
+        _ => IO_TIMEOUT,
+    };
+    stream.set_read_timeout(Some(timeout))?;
     stream.set_write_timeout(Some(IO_TIMEOUT))?;
 
     let payload =
@@ -264,6 +269,21 @@ mod tests {
         ));
         let json = serde_json::to_string(&Request::Off).unwrap();
         assert_eq!(json, "{\"cmd\":\"off\"}");
+    }
+
+    #[test]
+    fn lock_ipc_contains_only_command_and_credential_policy() {
+        for clear_credential in [false, true] {
+            let request = Request::Lock { clear_credential };
+            let json = serde_json::to_value(&request).unwrap();
+            assert_eq!(
+                json,
+                serde_json::json!({"cmd": "lock", "clear_credential": clear_credential})
+            );
+            assert!(
+                matches!(serde_json::from_value::<Request>(json).unwrap(), Request::Lock { clear_credential: actual } if actual == clear_credential)
+            );
+        }
     }
 
     #[test]

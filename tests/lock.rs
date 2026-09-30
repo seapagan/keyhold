@@ -43,7 +43,20 @@ impl Fixture {
     }
 
     fn request_lock(&self, clear: bool) -> serde_json::Value {
-        ipc_at(self.daemon.sock(), &lock_request(clear)).unwrap()
+        let response =
+            ipc_at(self.daemon.sock(), &lock_request(clear)).unwrap();
+        for text in [
+            response.to_string(),
+            self.tools.gpg_log(),
+            self.tools.ca_log(),
+            self.store.operations().join("\n"),
+        ] {
+            assert!(
+                !text.contains(common::FAKE_PASSPHRASE),
+                "secret leaked into metadata or diagnostics"
+            );
+        }
+        response
     }
 
     fn assert_off(&self) {
@@ -71,6 +84,113 @@ impl Fixture {
         let sock = self.daemon.sock().to_path_buf();
         thread::spawn(move || ipc_at(&sock, &lock_request(clear)).unwrap())
     }
+
+    fn assert_cli_status(&self, env: &common::TestEnv) {
+        let output = self.cli(env, &["status"]);
+        let text = String::from_utf8_lossy(&output.stdout);
+        assert!(text.contains("Daemon       running"));
+        assert!(text.contains("Hold         off"));
+        assert!(text.contains("Key state    locked"));
+        // The CLI deliberately has no Secret Service; the daemon's injected
+        // store and retained provenance are checked separately above.
+        assert_eq!(
+            status_at(self.daemon.sock()).unwrap()["credential_mode"],
+            "session"
+        );
+    }
+
+    fn cli(
+        &self,
+        env: &common::TestEnv,
+        args: &[&str],
+    ) -> std::process::Output {
+        env.keyhold(args)
+            .env(
+                "XDG_RUNTIME_DIR",
+                self.daemon.sock().parent().unwrap().parent().unwrap(),
+            )
+            .env("KEYHOLD_TEST_ROOT", &self.tools.root)
+            .output()
+            .unwrap()
+    }
+}
+
+#[test]
+fn cli_lock_credential_policy_obeys_explicit_overrides_and_config() {
+    for (config, flag, cleared) in [
+        (None, None, false),
+        (Some(false), None, false),
+        (Some(true), None, true),
+        (Some(false), Some("-c"), true),
+        (Some(false), Some("--clear"), true),
+        (Some(true), Some("-k"), false),
+        (Some(true), Some("--keep-credential"), false),
+    ] {
+        let fixture = Fixture::stored();
+        let env = common::TestEnv::new();
+        if let Some(policy) = config {
+            std::fs::create_dir_all(env.config.path().join("keyhold"))
+                .unwrap();
+            std::fs::write(
+                env.config.path().join("keyhold/config.toml"),
+                format!("clear_secret_on_lock = {policy}\n"),
+            )
+            .unwrap();
+        }
+        let mut args = vec!["lock"];
+        args.extend(flag);
+        let output = fixture.cli(&env, &args);
+        assert!(
+            output.status.success(),
+            "lock failed for {config:?}, {flag:?}"
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout)
+                .contains("GPG key locked.")
+        );
+        assert!(output.stderr.is_empty());
+        assert_eq!(fixture.store.contains_key(SUB2_GRIP), !cleared);
+        fixture.assert_off();
+        fixture.assert_cli_status(&env);
+        let activation = stored_activation(
+            &fixture.tools.gpg,
+            &fixture.store,
+            None,
+            60_000,
+            None,
+        );
+        if cleared {
+            assert!(
+                activation
+                    .unwrap_err()
+                    .to_string()
+                    .contains("unexpected prompt")
+            );
+        } else {
+            assert!(activation.is_ok());
+        }
+    }
+}
+
+#[test]
+fn cli_lock_reports_unprotected_keys_and_cleanup_errors_truthfully() {
+    let fixture = Fixture::stored();
+    let env = common::TestEnv::new();
+    fixture.tools.set_key_protection("C");
+    let output = fixture.cli(&env, &["lock", "-c"]);
+    assert!(output.status.success());
+    let text = String::from_utf8_lossy(&output.stdout);
+    assert!(text.contains("not passphrase-protected"));
+    assert!(!text.contains("GPG key locked"));
+    assert!(!fixture.store.contains_key(SUB2_GRIP));
+    fixture.assert_off();
+    fixture.tools.set_key_protection("P");
+    fixture.tools.marker("fail-clear");
+    let output = fixture.cli(&env, &["lock"]);
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("ERR 67109139"));
+    fixture.assert_off();
 }
 
 #[test]

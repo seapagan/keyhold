@@ -51,6 +51,10 @@ fn run(command: Command) -> Result<()> {
             interval,
         ),
         Command::Off => off(),
+        Command::Lock {
+            clear,
+            keep_credential,
+        } => lock_key(clear, keep_credential),
         Command::Status => status(),
         Command::Credential { action } => match action {
             CredentialAction::Clear => credential_clear(),
@@ -202,6 +206,25 @@ fn off() -> Result<()> {
         }
         Err(e) => Err(e),
     }
+}
+
+fn lock_key(clear: bool, keep_credential: bool) -> Result<()> {
+    let config = config::load()?;
+    let clear_credential =
+        clear || (config.clear_secret_on_lock && !keep_credential);
+    let response = ipc::request(&Request::Lock { clear_credential })
+        .map_err(|e| match e {
+            Error::DaemonNotRunning => Error::Message(
+                "no managed/resolved GPG key available to lock: daemon is not running".into(),
+            ),
+            other => other,
+        })?;
+    check(response.clone())?;
+    let result = response
+        .lock_result
+        .ok_or_else(|| Error::Ipc("daemon returned no lock outcome".into()))?;
+    presentation::key_locked(result, clear_credential);
+    Ok(())
 }
 
 fn status() -> Result<()> {
@@ -540,6 +563,15 @@ mod tests {
         );
         assert_eq!(row.as_deref(), Some("session stored"));
         assert_eq!(calls.get(), 1);
+    }
+
+    #[test]
+    fn stopped_stored_status_reports_missing_credential() {
+        let row = credential_row_with(
+            &status(false, CredentialMode::Session),
+            |_| Ok(false),
+        );
+        assert_eq!(row.as_deref(), Some("missing"));
     }
 
     #[test]

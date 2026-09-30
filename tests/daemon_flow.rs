@@ -104,6 +104,69 @@ fn off_disables_and_is_idempotent() {
 }
 
 #[test]
+fn lock_without_a_managed_key_fails_without_starting_or_guessing() {
+    let env = TestEnv::new();
+    for running in [false, true] {
+        if running {
+            env.succeed(&["daemon", "-b"]);
+        }
+        let output = env.fail(&["lock"]);
+        assert!(output.stdout.is_empty());
+        assert!(
+            String::from_utf8_lossy(&output.stderr)
+                .contains("no managed/resolved GPG key")
+        );
+        assert!(env.gpg_log().is_empty());
+        assert!(env.ca_log().is_empty());
+        assert!(env.status().contains(if running {
+            "Daemon       running"
+        } else {
+            "Daemon       stopped"
+        }));
+    }
+}
+
+#[test]
+fn ordinary_lock_after_off_preserves_identity_and_locks_only_managed_key() {
+    let env = TestEnv::new();
+    env.rich_gpg();
+    env.set_key_cached(true);
+    env.succeed(&["on", "--for", "1h"]);
+    env.succeed(&["off"]);
+    // New key-selection settings must not redirect lock's retained target.
+    fs::create_dir_all(env.config.path().join("keyhold")).unwrap();
+    fs::write(
+        env.config.path().join("keyhold/config.toml"),
+        "key = \"different-key\"\n",
+    )
+    .unwrap();
+    assert_eq!(env.stdout(&["lock"]), "GPG key locked.\n");
+    let status = env.status();
+    for row in [
+        "Daemon       running",
+        "Hold         off",
+        "Key          default",
+        "Key state    locked",
+        "Credential   not in use",
+    ] {
+        assert!(status.contains(row), "missing {row}");
+    }
+    let clears: Vec<_> = env
+        .ca_log()
+        .lines()
+        .filter(|line| line.starts_with("CLEAR_PASSPHRASE"))
+        .map(str::to_owned)
+        .collect();
+    assert_eq!(
+        clears,
+        [format!(
+            "CLEAR_PASSPHRASE --mode=normal {} /bye",
+            common::SUB2_GRIP
+        )]
+    );
+}
+
+#[test]
 fn timed_hold_expires_by_itself() {
     let env = TestEnv::new();
     env.succeed(&["on", "--for", "1s", "--interval", "200ms"]);

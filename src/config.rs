@@ -13,7 +13,7 @@ use crate::{
     error::{Error, Result},
 };
 
-/// Effective settings for `keyhold on` after merging file and defaults.
+/// Effective settings for Keyhold after merging file and defaults.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {
     /// Key selector passed to `gpg --local-user`; `None` uses GPG's default key.
@@ -30,6 +30,9 @@ pub struct Config {
     /// Delete keyhold's Secret Service session items on clean daemon
     /// shutdown.
     pub clear_secret_on_daemon_stop: bool,
+    /// Delete the managed key's session credential on `keyhold lock`
+    /// unless the CLI explicitly overrides this policy. Defaults to false.
+    pub clear_secret_on_lock: bool,
     /// Clear the most recently resolved signing key's GPG cache entry
     /// on clean daemon shutdown (the resolved key is retained across
     /// `off` and expiry so teardown can still target it).
@@ -44,6 +47,7 @@ impl Default for Config {
             interval: DEFAULT_INTERVAL,
             store_passphrase: false,
             clear_secret_on_daemon_stop: false,
+            clear_secret_on_lock: false,
             lock_key_on_daemon_stop: false,
         }
     }
@@ -86,6 +90,7 @@ struct ConfigFile {
     interval: Option<String>,
     store_passphrase: Option<bool>,
     clear_secret_on_daemon_stop: Option<bool>,
+    clear_secret_on_lock: Option<bool>,
     lock_key_on_daemon_stop: Option<bool>,
 }
 
@@ -147,6 +152,7 @@ pub fn load_from(dir: &Path) -> Result<Config> {
         git_key,
         interval,
         store_passphrase: file.store_passphrase.unwrap_or(false),
+        clear_secret_on_lock: file.clear_secret_on_lock.unwrap_or(false),
         clear_secret_on_daemon_stop: file
             .clear_secret_on_daemon_stop
             .unwrap_or(false),
@@ -180,6 +186,33 @@ mod tests {
     fn missing_file_yields_defaults() {
         let dir = tmp();
         assert_eq!(load_from(dir.path()).unwrap(), Config::default());
+        assert!(!load_from(dir.path()).unwrap().clear_secret_on_lock);
+    }
+
+    #[test]
+    fn lock_policy_accepts_only_booleans_and_defaults_to_false() {
+        let dir = tmp();
+        fs::create_dir_all(dir.path().join("keyhold")).unwrap();
+        let path = dir.path().join("keyhold/config.toml");
+        for (raw, expected) in [
+            ("", false),
+            ("clear_secret_on_lock = false", false),
+            ("clear_secret_on_lock = true", true),
+        ] {
+            fs::write(&path, raw).unwrap();
+            assert_eq!(
+                load_from(dir.path()).unwrap().clear_secret_on_lock,
+                expected
+            );
+        }
+        for value in ["\"true\"", "1", "[]", "tru"] {
+            fs::write(&path, format!("clear_secret_on_lock = {value}"))
+                .unwrap();
+            assert!(matches!(
+                load_from(dir.path()),
+                Err(Error::Config { .. })
+            ));
+        }
     }
 
     #[test]

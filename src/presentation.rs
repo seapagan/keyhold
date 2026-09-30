@@ -16,7 +16,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use colored_text::{Colorize, RenderTarget};
 
-use crate::state::{KeySource, StatusData};
+use crate::{
+    ipc::LockResult,
+    state::{KeySource, StatusData},
+};
 
 /// Print the success line for a timed hold.
 pub fn enabled_for(duration: &str) {
@@ -31,6 +34,23 @@ pub fn enabled_indefinitely() {
 /// Print the confirmation for `keyhold off`.
 pub fn disabled() {
     println!("Keyhold {}.", "disabled".yellow());
+}
+
+/// Print a successful managed-key lock, distinguishing unprotected keys.
+pub fn key_locked(result: LockResult, cleared_credential: bool) {
+    match result {
+        LockResult::Locked => println!("GPG key {}.", "locked".green()),
+        LockResult::Unprotected => println!(
+            "Managed GPG key is {}; no passphrase cache entry to lock. Hold disabled.",
+            "not passphrase-protected".yellow(),
+        ),
+    }
+    if cleared_credential {
+        println!(
+            "Managed key's stored Keyhold session credential {}.",
+            "cleared".green()
+        );
+    }
 }
 
 /// Print an informational warning with a `warning:` prefix (yellow when

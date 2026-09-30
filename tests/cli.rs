@@ -4,12 +4,66 @@ mod common;
 
 use common::TestEnv;
 
+use clap::Parser;
+use keyhold::cli::Cli;
+
+#[test]
+fn lock_accepts_only_its_credential_flags() {
+    for flag in [
+        None,
+        Some("-c"),
+        Some("--clear"),
+        Some("-k"),
+        Some("--keep-credential"),
+    ] {
+        let mut args = vec!["keyhold", "lock"];
+        args.extend(flag);
+        assert!(Cli::try_parse_from(&args).is_ok(), "{args:?}");
+    }
+    for extra in [
+        "--key",
+        "--git-key",
+        "--for",
+        "--interval",
+        "-s",
+        "--no-store-passphrase",
+        "unexpected",
+    ] {
+        assert!(Cli::try_parse_from(["keyhold", "lock", extra]).is_err());
+    }
+}
+
+#[test]
+fn lock_clear_and_keep_flags_conflict_in_every_spelling() {
+    for clear in ["-c", "--clear"] {
+        for keep in ["-k", "--keep-credential"] {
+            let err = Cli::try_parse_from(["keyhold", "lock", clear, keep])
+                .unwrap_err();
+            assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+        }
+    }
+}
+
+#[test]
+fn lock_help_distinguishes_stored_credential_from_gpg_cache() {
+    let env = TestEnv::new();
+    let output = env.stdout(&["lock", "--help"]);
+    for needle in [
+        "-c, --clear",
+        "-k, --keep-credential",
+        "stored Keyhold session credential",
+        "clear_secret_on_lock",
+    ] {
+        assert!(output.contains(needle), "help missing {needle}");
+    }
+}
+
 #[test]
 fn help_lists_commands_and_options() {
     let env = TestEnv::new();
     let out = env.succeed(&["--help"]);
     let text = String::from_utf8_lossy(&out.stdout);
-    for needle in ["on", "off", "status", "daemon", "Usage:"] {
+    for needle in ["on", "off", "lock", "status", "daemon", "Usage:"] {
         assert!(text.contains(needle), "help missing {needle}:\n{text}");
     }
     // Clap's generated `help` subcommand is disabled: `--help` is the
@@ -33,7 +87,7 @@ fn subcommand_help_is_available() {
 #[test]
 fn subcommand_help_works_for_every_subcommand() {
     let env = TestEnv::new();
-    for subcommand in ["on", "off", "status", "daemon"] {
+    for subcommand in ["on", "off", "lock", "status", "daemon"] {
         let out = env.succeed(&[subcommand, "--help"]);
         let text = String::from_utf8_lossy(&out.stdout);
         assert!(

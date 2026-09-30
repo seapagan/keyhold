@@ -13,7 +13,9 @@ keyhold has two operating modes with deliberately different guarantees.
 - keyhold **never sees, stores, or transmits your GPG passphrase**:
   unlocking is delegated entirely to GnuPG and pinentry.
 - Loopback passphrase handling is never used.
-- No Secret Service access happens at all.
+- Ordinary holds never access Secret Service. Explicit credential deletion
+  commands (`credential clear`, `lock --clear`, or configured cleanup) may
+  delete stored credentials without reading passphrases.
 
 ### Session credential mode (explicit opt-in)
 
@@ -55,6 +57,24 @@ trade is unacceptable, keep using ordinary mode and raise GnuPG's
 - The keepalive operation is a detached signature of empty input written
   to `/dev/null`; nothing is persisted.
 - GnuPG configuration files are never modified by either mode.
+
+### Explicit locking
+
+`keyhold lock` disables the hold and removes the retained managed keygrip's
+live GPG-agent passphrase cache entry, leaving the daemon running. It waits
+for in-flight stored-mode renewal under the same per-key transaction lock;
+stale renewal work then observes the disabled hold and aborts. It preserves
+the stored Keyhold session credential by default, allowing Keyhold to
+restore access when you explicitly run `keyhold on -s` again.
+
+`keyhold lock --clear` also deletes that key's stored session credential,
+removing Keyhold's unattended recovery ability for it. Neither operation
+flushes unrelated keys or restarts GPG-agent. Cleanup errors leave the hold
+off and preserve completed cleanup; Keyhold reports failure. Unprotected
+keys have no passphrase cache entry to lock.
+
+These commands cannot undo secret theft or prevent same-user malware in an
+unlocked desktop session from driving GPG or accessing the session keyring.
 
 ## Attack surface considerations
 

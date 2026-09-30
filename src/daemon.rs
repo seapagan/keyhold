@@ -544,7 +544,13 @@ fn apply(
         };
     }
     match request {
-        Request::Ping => (Response::ok(), false),
+        Request::Ping => (
+            Response {
+                supports_lock: Some(true),
+                ..Response::ok()
+            },
+            false,
+        ),
         Request::Lock { clear_credential } => {
             drop(shared);
             let response = match lock_key(pair, services, clear_credential) {

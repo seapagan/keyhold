@@ -102,6 +102,10 @@ pub struct Response {
     /// Outcome only for a successful [`Request::Lock`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lock_result: Option<LockResult>,
+    /// Whether this daemon implements [`Request::Lock`] (Ping only).
+    /// Missing on legacy daemons; package versions alone do not identify IPC.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supports_lock: Option<bool>,
 }
 
 impl Response {
@@ -112,6 +116,7 @@ impl Response {
             error: None,
             status: None,
             lock_result: None,
+            supports_lock: None,
         }
     }
 
@@ -122,6 +127,7 @@ impl Response {
             error: Some(reason.into()),
             status: None,
             lock_result: None,
+            supports_lock: None,
         }
     }
 
@@ -132,6 +138,7 @@ impl Response {
             error: None,
             status: Some(status),
             lock_result: None,
+            supports_lock: None,
         }
     }
 }

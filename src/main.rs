@@ -212,13 +212,20 @@ fn lock_key(clear: bool, keep_credential: bool) -> Result<()> {
     let config = config::load()?;
     let clear_credential =
         clear || (config.clear_secret_on_lock && !keep_credential);
-    let response = ipc::request(&Request::Lock { clear_credential })
+    let capability = ipc::request(&Request::Ping)
         .map_err(|e| match e {
             Error::DaemonNotRunning => Error::Message(
                 "no managed/resolved GPG key available to lock: daemon is not running".into(),
             ),
             other => other,
         })?;
+    check(capability.clone())?;
+    if capability.supports_lock != Some(true) {
+        return Err(Error::Daemon(
+            "running daemon does not support lock; restart it using this Keyhold executable, then activate the intended key before locking".into(),
+        ));
+    }
+    let response = ipc::request(&Request::Lock { clear_credential })?;
     check(response.clone())?;
     let result = response
         .lock_result

@@ -126,6 +126,60 @@ fn lock_without_a_managed_key_fails_without_starting_or_guessing() {
     }
 }
 
+fn lock_against_peer(reply: &'static str) -> (std::process::Output, String) {
+    let env = TestEnv::new();
+    fs::create_dir_all(env.sock().parent().unwrap()).unwrap();
+    let listener = std::os::unix::net::UnixListener::bind(env.sock()).unwrap();
+    let peer = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        stream.set_read_timeout(Some(5 * SECS)).unwrap();
+        let mut request = Vec::new();
+        let mut byte = [0];
+        while stream.read_exact(&mut byte).is_ok() && byte[0] != b'\n' {
+            request.push(byte[0]);
+        }
+        stream.write_all(reply.as_bytes()).unwrap();
+        String::from_utf8(request).unwrap()
+    });
+    let output = env.keyhold(&["lock"]).output().unwrap();
+    assert!(env.gpg_log().is_empty());
+    assert!(env.ca_log().is_empty());
+    (output, peer.join().unwrap())
+}
+
+#[test]
+fn lock_detects_legacy_daemon_before_sending_a_mutating_request() {
+    let (output, request) = lock_against_peer("{\"ok\":true}\n");
+    assert_eq!(request, "{\"cmd\":\"ping\"}");
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    let error = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        error.contains("running daemon does not support lock"),
+        "{error}"
+    );
+    assert!(error.contains("restart"), "{error}");
+    assert!(error.contains("activate the intended key"), "{error}");
+}
+
+#[test]
+fn lock_capability_probe_preserves_protocol_and_daemon_failures() {
+    for (reply, expected) in [
+        ("not JSON\n", "malformed daemon response"),
+        (
+            "{\"ok\":false,\"error\":\"daemon is shutting down\"}\n",
+            "daemon is shutting down",
+        ),
+    ] {
+        let (output, request) = lock_against_peer(reply);
+        assert_eq!(request, "{\"cmd\":\"ping\"}");
+        assert!(!output.status.success());
+        let error = String::from_utf8_lossy(&output.stderr);
+        assert!(error.contains(expected), "{error}");
+        assert!(!error.contains("does not support lock"));
+    }
+}
+
 #[test]
 fn ordinary_lock_after_off_preserves_identity_and_locks_only_managed_key() {
     let env = TestEnv::new();

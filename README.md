@@ -267,6 +267,12 @@ Cleanup failures return an error and leave the hold off, without rolling
 back successful cleanup. Status retains the key identity and shows whether
 the credential is still `session stored` or `missing`.
 
+A daemon already running before a rebuild or upgrade keeps its old code.
+If it lacks lock support, Keyhold reports that before sending a lock
+request. Restart with the updated executable, then activate the intended
+key again before locking. Restarting discards retained key metadata and
+runs your configured daemon-stop cleanup policies.
+
 ### What `on` does
 
 1. Loads configuration and resolves the key.

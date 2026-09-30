@@ -260,7 +260,9 @@ resolved managed key exists, it fails without starting a daemon or guessing
 a key. An unprotected key has no passphrase cache entry to lock; Keyhold
 reports that and still applies the requested credential policy.
 
-Lock waits for any in-flight stored-mode renewal before clearing the cache.
+Lock waits for any in-flight foreground activation and stored-mode renewal
+before clearing the cache. An overlapping `on` is rejected; retry it after
+lock completes if you intend to restore access.
 Success means the hold is off and the managed passphrase cache entry is
 absent; with `--clear`, its stored session credential is also absent.
 Cleanup failures return an error and leave the hold off, without rolling

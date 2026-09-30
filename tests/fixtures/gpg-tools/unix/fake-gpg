@@ -53,6 +53,11 @@ if [ -e "$root/fail-all" ]; then
   exit 2
 fi
 
+if [ "$background" != 1 ] && [ "$loopback" != 1 ] && [ -p "$root/foreground-entered" ]; then
+  printf 'entered\n' > "$root/foreground-entered"
+  IFS= read -r _ < "$root/foreground-release"
+fi
+
 locked=$root/lock
 if [ -e "$root/daemon-tools" ]; then
   locked=$root/locked

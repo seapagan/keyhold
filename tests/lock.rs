@@ -104,15 +104,99 @@ impl Fixture {
         env: &common::TestEnv,
         args: &[&str],
     ) -> std::process::Output {
-        env.keyhold(args)
+        self.command(env, args).output().unwrap()
+    }
+
+    fn command(
+        &self,
+        env: &common::TestEnv,
+        args: &[&str],
+    ) -> std::process::Command {
+        let mut command = env.keyhold(args);
+        command
             .env(
                 "XDG_RUNTIME_DIR",
                 self.daemon.sock().parent().unwrap().parent().unwrap(),
             )
-            .env("KEYHOLD_TEST_ROOT", &self.tools.root)
-            .output()
-            .unwrap()
+            .env("KEYHOLD_TEST_ROOT", &self.tools.root);
+        command
     }
+
+    fn spawn_cli(
+        &self,
+        env: &common::TestEnv,
+        args: &[&str],
+    ) -> common::CliChild {
+        common::CliChild(
+            self.command(env, args)
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .unwrap(),
+        )
+    }
+}
+
+#[test]
+fn ordinary_cli_activation_during_lock_cannot_recreate_its_cleared_cache() {
+    let fixture = Fixture::stored();
+    let env = common::TestEnv::new();
+    let clear = common::ToolGate::new(&fixture.tools.root, "clear");
+    let mut locking = fixture.spawn_cli(&env, &["lock"]);
+    clear.wait_until_entered();
+    assert!(!fixture.tools.gpg.key_state(SUB2_GRIP).unwrap().cached);
+    let foregrounds = fixture.tools.gpg_log();
+    let on = fixture.cli(&env, &["on", "--for", "1h"]);
+    assert!(!on.status.success());
+    assert!(
+        String::from_utf8_lossy(&on.stderr).contains("lock is in progress")
+    );
+    clear.release();
+    assert!(locking.output().status.success());
+    fixture.assert_off();
+    assert!(!fixture.tools.gpg.key_state(SUB2_GRIP).unwrap().cached);
+    assert_eq!(
+        fixture.tools.gpg_log(),
+        foregrounds,
+        "rejected activation touched GPG"
+    );
+}
+
+#[test]
+fn cli_lock_drains_in_flight_ordinary_activation_before_clearing_cache() {
+    let fixture = Fixture::stored();
+    let env = common::TestEnv::new();
+    let foreground = common::ToolGate::new(&fixture.tools.root, "foreground");
+    let clear = common::ToolGate::new(&fixture.tools.root, "clear");
+    let mut activating = fixture.spawn_cli(&env, &["on", "--for", "1h"]);
+    foreground.wait_until_entered();
+    let mut locking = fixture.spawn_cli(&env, &["lock", "--clear"]);
+    assert!(common::wait_until(Duration::from_secs(5), || {
+        status_at(fixture.daemon.sock()).unwrap()["hold_on"] == false
+    }));
+    let foregrounds = fixture.tools.gpg_log();
+    let later = fixture.cli(&env, &["on", "--for", "1h"]);
+    assert!(!later.status.success());
+    assert!(
+        String::from_utf8_lossy(&later.stderr).contains("lock is in progress")
+    );
+    assert_eq!(fixture.tools.gpg_log(), foregrounds);
+    foreground.release();
+    let rejected = activating.output();
+    assert!(!rejected.status.success());
+    assert!(
+        String::from_utf8_lossy(&rejected.stderr)
+            .contains("lock is in progress")
+    );
+    clear.wait_until_entered();
+    assert!(!fixture.tools.gpg.key_state(SUB2_GRIP).unwrap().cached);
+    assert!(!fixture.store.contains_key(SUB2_GRIP));
+    assert!(locking.0.try_wait().unwrap().is_none());
+    clear.release();
+    assert!(locking.output().status.success());
+    fixture.assert_off();
+    assert!(!fixture.tools.gpg.key_state(SUB2_GRIP).unwrap().cached);
+    assert!(!fixture.store.contains_key(SUB2_GRIP));
 }
 
 #[test]

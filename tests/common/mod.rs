@@ -38,6 +38,102 @@ use std::{
     time::{Duration, Instant},
 };
 
+/// FIFO gates stop immutable subprocess fixtures at an exact I/O boundary.
+pub struct ToolGate {
+    entered: std::sync::mpsc::Receiver<()>,
+    entry: fs::File,
+    release: fs::File,
+}
+
+impl ToolGate {
+    pub fn new(root: &std::path::Path, name: &str) -> Self {
+        let entry = root.join(format!("{name}-entered"));
+        let release = root.join(format!("{name}-release"));
+        assert!(
+            Command::new("mkfifo")
+                .args([&entry, &release])
+                .status()
+                .unwrap()
+                .success()
+        );
+        let entry = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(entry)
+            .unwrap();
+        let release = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(release)
+            .unwrap();
+        let (sender, entered) = std::sync::mpsc::channel();
+        let mut reader = entry.try_clone().unwrap();
+        thread::spawn(move || {
+            let mut byte = [0];
+            if reader.read_exact(&mut byte).is_ok() {
+                let _ = sender.send(());
+            }
+        });
+        Self {
+            entered,
+            entry,
+            release,
+        }
+    }
+
+    pub fn wait_until_entered(&self) {
+        self.entered
+            .recv_timeout(Duration::from_secs(5))
+            .expect("tool did not enter gate");
+    }
+
+    pub fn release(mut self) {
+        self.release.write_all(b"release\n").unwrap();
+    }
+}
+
+impl Drop for ToolGate {
+    fn drop(&mut self) {
+        let _ = self.release.write_all(b"release\n");
+        let _ = self.entry.write_all(b"abort\n");
+    }
+}
+
+/// Kill a gated CLI child on assertion failure rather than leaking it.
+pub struct CliChild(pub std::process::Child);
+
+impl CliChild {
+    pub fn output(&mut self) -> Output {
+        wait_with_kill(&mut self.0, Duration::from_secs(5));
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        self.0
+            .stdout
+            .take()
+            .unwrap()
+            .read_to_end(&mut stdout)
+            .unwrap();
+        self.0
+            .stderr
+            .take()
+            .unwrap()
+            .read_to_end(&mut stderr)
+            .unwrap();
+        Output {
+            status: self.0.wait().unwrap(),
+            stdout,
+            stderr,
+        }
+    }
+}
+
+impl Drop for CliChild {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
 use tempfile::TempDir;
 
 /// Fingerprints/keygrips of the default fake key hierarchy: a primary

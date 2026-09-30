@@ -149,17 +149,20 @@ fn lock_against_peer(reply: &'static str) -> (std::process::Output, String) {
 
 #[test]
 fn lock_detects_legacy_daemon_before_sending_a_mutating_request() {
-    let (output, request) = lock_against_peer("{\"ok\":true}\n");
-    assert_eq!(request, "{\"cmd\":\"ping\"}");
-    assert!(!output.status.success());
-    assert!(output.stdout.is_empty());
-    let error = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        error.contains("running daemon does not support lock"),
-        "{error}"
-    );
-    assert!(error.contains("restart"), "{error}");
-    assert!(error.contains("activate the intended key"), "{error}");
+    for reply in ["{\"ok\":true}\n", "{\"ok\":true,\"supports_lock\":true}\n"]
+    {
+        let (output, request) = lock_against_peer(reply);
+        assert_eq!(request, "{\"cmd\":\"ping\"}");
+        assert!(!output.status.success());
+        assert!(output.stdout.is_empty());
+        let error = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            error.contains("running daemon does not support lock"),
+            "{error}"
+        );
+        assert!(error.contains("restart"), "{error}");
+        assert!(error.contains("activate the intended key"), "{error}");
+    }
 }
 
 #[test]

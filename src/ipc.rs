@@ -106,6 +106,9 @@ pub struct Response {
     /// Missing on legacy daemons; package versions alone do not identify IPC.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub supports_lock: Option<bool>,
+    /// Whether foreground activation must abort before touching GPG (Ping).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lock_in_progress: Option<bool>,
 }
 
 impl Response {
@@ -117,6 +120,7 @@ impl Response {
             status: None,
             lock_result: None,
             supports_lock: None,
+            lock_in_progress: None,
         }
     }
 
@@ -128,6 +132,7 @@ impl Response {
             status: None,
             lock_result: None,
             supports_lock: None,
+            lock_in_progress: None,
         }
     }
 
@@ -139,6 +144,7 @@ impl Response {
             status: Some(status),
             lock_result: None,
             supports_lock: None,
+            lock_in_progress: None,
         }
     }
 }

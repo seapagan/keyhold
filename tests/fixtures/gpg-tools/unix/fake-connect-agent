@@ -47,6 +47,10 @@ case "$cmd" in
     else
       touch "$root/locked-$grip"
     fi
+    if [ -p "$root/clear-entered" ]; then
+      printf 'entered\n' > "$root/clear-entered"
+      IFS= read -r _ < "$root/clear-release"
+    fi
     echo OK
     exit 0
     ;;

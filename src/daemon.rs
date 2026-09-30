@@ -155,6 +155,23 @@ pub fn ensure_running() -> Result<bool> {
     Err(Error::DaemonStart)
 }
 
+/// Keep foreground activation alive through handoff so lock can drain it
+/// before clearing the retained key. Shared ownership permits concurrent
+/// activations; an exclusive lock in progress rejects new work immediately.
+/// This uses runtime files only, never Secret Service or passphrase material.
+pub fn guard_activation() -> Result<fs::File> {
+    let paths = paths()?;
+    ensure_private_dir(&paths.dir)?;
+    let guard = crate::credential::open_lock(&paths.dir, "activation.lock")?;
+    fs4::FileExt::try_lock_shared(&guard).map_err(|e| match e {
+        fs4::TryLockError::WouldBlock => Error::Daemon(
+            "managed key lock is in progress; the hold was NOT enabled".into(),
+        ),
+        fs4::TryLockError::Error(e) => e.into(),
+    })?;
+    Ok(guard)
+}
+
 /// Start a detached daemon: `setsid` + exec of `keyhold daemon` with all
 /// standard streams pointed at `/dev/null`, so it survives the invoking
 /// terminal and never touches a TTY. This is the one detached-start path,
@@ -261,7 +278,11 @@ where
     F: Fn() -> Result<ShutdownPolicies>,
 {
     let listener = bind(paths)?;
-    let services = Arc::new(Services { gpg, store });
+    let services = Arc::new(Services {
+        gpg,
+        store,
+        runtime_dir: paths.dir.clone(),
+    });
     let pair: Pair = Arc::new((
         Mutex::new(Shared {
             hold: Hold::default(),
@@ -422,6 +443,7 @@ fn bind(paths: &Paths) -> Result<UnixListener> {
 struct Services {
     gpg: Gpg,
     store: Arc<dyn CredentialStore>,
+    runtime_dir: PathBuf,
 }
 
 type Pair = Arc<(Mutex<Shared>, Condvar)>;
@@ -547,6 +569,7 @@ fn apply(
         Request::Ping => (
             Response {
                 supports_lock: Some(true),
+                lock_in_progress: Some(shared.locking),
                 ..Response::ok()
             },
             false,
@@ -703,6 +726,15 @@ fn lock_key(
         keygrip
     };
     let _operation = LockOperation(pair);
+    // Foreground activation does not necessarily know a keygrip yet. Drain
+    // its shared runtime guard before the key-specific credential guard;
+    // activations already admitted still hand off while locking is true and
+    // are rejected, then release their guard before this clear can proceed.
+    let activation = crate::credential::open_lock(
+        &services.runtime_dir,
+        "activation.lock",
+    )?;
+    fs4::FileExt::lock(&activation)?;
     let _transaction = services.store.lock_transaction(&keygrip)?;
     // Try both cleanups even if one fails; never roll back safer state.
     let credential = if clear {
@@ -993,6 +1025,7 @@ mod tests {
         let services = Services {
             gpg: Gpg::with_tools(PathBuf::new(), None, None),
             store: Arc::new(crate::credential::SessionCredentialStore),
+            runtime_dir: PathBuf::new(),
         };
         super::apply(request, pair, &services)
     }

@@ -111,6 +111,15 @@ fn on(
 
     daemon::ensure_running()?;
 
+    let _activation = daemon::guard_activation()?;
+    let admission = ipc::request(&Request::Ping)?;
+    check(admission.clone())?;
+    if admission.lock_in_progress == Some(true) {
+        return Err(Error::Daemon(
+            "managed key lock is in progress; the hold was NOT enabled".into(),
+        ));
+    }
+
     // The activation flow performs the foreground key use (and, in
     // stored mode, the credential/epoch dance) before anything is
     // enabled; on failure the hold is not enabled.
@@ -220,7 +229,9 @@ fn lock_key(clear: bool, keep_credential: bool) -> Result<()> {
             other => other,
         })?;
     check(capability.clone())?;
-    if capability.supports_lock != Some(true) {
+    if capability.supports_lock != Some(true)
+        || capability.lock_in_progress.is_none()
+    {
         return Err(Error::Daemon(
             "running daemon does not support lock; restart it using this Keyhold executable, then activate the intended key before locking".into(),
         ));

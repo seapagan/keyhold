@@ -12,7 +12,7 @@ root=$KEYHOLD_TEST_ROOT
 echo "$*" >> "$root/ca.log"
 cmd=$1
 
-if [ -e "$root/hang-ca" ]; then
+if [ -e "$root/hang-ca" ] || { [ -e "$root/hang-clear" ] && [ "${cmd%% *}" = CLEAR_PASSPHRASE ]; }; then
   i=0
   while [ "$i" -lt 3000 ]; do
     echo b >> "$root/beats"
@@ -37,8 +37,15 @@ case "$cmd" in
       echo 'ERR 67109139 Unknown IPC command <GPG Agent>'
       exit 0
     fi
-    if [ -e "$root/daemon-tools" ]; then
-      touch "$root/locked"
+    grip=${cmd##* }
+    if [ "$grip" = F097020B875D80D64C742456496ECA8F47CED17F ]; then
+      if [ -e "$root/daemon-tools" ]; then
+        touch "$root/locked"
+      else
+        rm -f "$root/key-cached"
+      fi
+    else
+      touch "$root/locked-$grip"
     fi
     echo OK
     exit 0
@@ -59,7 +66,11 @@ case "$cmd" in
     [ -f "$root/prot" ] && prot=$(cat "$root/prot")
     cached=-
     if [ -e "$root/daemon-tools" ]; then
-      [ ! -e "$root/locked" ] && cached=1
+      if [ "$grip" = F097020B875D80D64C742456496ECA8F47CED17F ]; then
+        [ ! -e "$root/locked" ] && cached=1
+      else
+        [ ! -e "$root/locked-$grip" ] && cached=1
+      fi
     else
       [ -e "$root/key-cached" ] && cached=1
     fi

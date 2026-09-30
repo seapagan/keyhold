@@ -67,10 +67,25 @@ pub enum Request {
         cache_started_at_ms: Option<u64>,
     },
     Off,
+    /// Disable the hold and clear only the retained managed key.
+    Lock {
+        /// Also delete this key's stored session credential.
+        clear_credential: bool,
+    },
     /// Request a status snapshot.
     Status,
     /// Ask the daemon to exit.
     Shutdown,
+}
+
+/// Successful cache-lock outcome for the managed key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LockResult {
+    /// The managed passphrase cache entry was cleared.
+    Locked,
+    /// The managed key has no passphrase cache entry to lock.
+    Unprotected,
 }
 
 /// A daemon response.
@@ -84,6 +99,9 @@ pub struct Response {
     /// Status snapshot (only for [`Request::Status`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status: Option<StatusData>,
+    /// Outcome only for a successful [`Request::Lock`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lock_result: Option<LockResult>,
 }
 
 impl Response {
@@ -93,6 +111,7 @@ impl Response {
             ok: true,
             error: None,
             status: None,
+            lock_result: None,
         }
     }
 
@@ -102,6 +121,7 @@ impl Response {
             ok: false,
             error: Some(reason.into()),
             status: None,
+            lock_result: None,
         }
     }
 
@@ -111,6 +131,7 @@ impl Response {
             ok: true,
             error: None,
             status: Some(status),
+            lock_result: None,
         }
     }
 }

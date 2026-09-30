@@ -524,6 +524,9 @@ struct FakeState {
     fail_delete: bool,
     ops: Vec<String>,
     clear_gate: Option<std::sync::Arc<ClearGate>>,
+    load_gate: Option<Arc<ClearGate>>,
+    delete_gate: Option<Arc<ClearGate>>,
+    transaction_gate: Option<Arc<ClearGate>>,
 }
 
 #[derive(Default)]
@@ -589,7 +592,7 @@ impl ClearGateHandle {
     pub fn wait_until_entered(&self) {
         self.entered
             .recv_timeout(Duration::from_secs(5))
-            .expect("clear_all was not entered");
+            .expect("gated store operation was not entered");
     }
 
     pub fn release(mut self) {
@@ -604,6 +607,32 @@ impl Drop for ClearGateHandle {
         if let Some(release) = self.release.take() {
             let _ = release.send(());
         }
+    }
+}
+
+fn operation_gate() -> (Arc<ClearGate>, ClearGateHandle) {
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    (
+        Arc::new(ClearGate {
+            entered: entered_tx,
+            release: Mutex::new(release_rx),
+        }),
+        ClearGateHandle {
+            entered: entered_rx,
+            release: Some(release_tx),
+        },
+    )
+}
+
+fn wait_at_gate(gate: Option<Arc<ClearGate>>) {
+    if let Some(gate) = gate {
+        gate.entered.send(()).unwrap();
+        gate.release
+            .lock()
+            .unwrap()
+            .recv_timeout(Duration::from_secs(30))
+            .unwrap();
     }
 }
 
@@ -665,6 +694,24 @@ impl FakeStore {
         }
     }
 
+    pub fn block_next_load(&self) -> ClearGateHandle {
+        let (gate, handle) = operation_gate();
+        self.state().load_gate = Some(gate);
+        handle
+    }
+
+    pub fn block_next_delete(&self) -> ClearGateHandle {
+        let (gate, handle) = operation_gate();
+        self.state().delete_gate = Some(gate);
+        handle
+    }
+
+    pub fn block_next_transaction(&self) -> ClearGateHandle {
+        let (gate, handle) = operation_gate();
+        self.state().transaction_gate = Some(gate);
+        handle
+    }
+
     pub fn observe_next_lock_contention(
         &self,
     ) -> std::sync::mpsc::Receiver<String> {
@@ -695,6 +742,8 @@ impl CredentialStore for FakeStore {
         &self,
         keygrip: &str,
     ) -> keyhold::error::Result<Box<dyn CredentialTransactionGuard>> {
+        let gate = self.state().transaction_gate.take();
+        wait_at_gate(gate);
         let mut state = self
             .locks
             .state
@@ -743,6 +792,8 @@ impl CredentialStore for FakeStore {
         &self,
         keygrip: &str,
     ) -> keyhold::error::Result<Option<Zeroizing<Vec<u8>>>> {
+        let gate = self.state().load_gate.take();
+        wait_at_gate(gate);
         let mut state = self.state();
         state.ops.push(format!("load:{keygrip}"));
         if state.fail_load {
@@ -783,6 +834,8 @@ impl CredentialStore for FakeStore {
     }
 
     fn delete(&self, keygrip: &str) -> keyhold::error::Result<bool> {
+        let gate = self.state().delete_gate.take();
+        wait_at_gate(gate);
         let mut state = self.state();
         state.ops.push(format!("delete:{keygrip}"));
         if state.fail_delete {

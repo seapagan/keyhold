@@ -28,8 +28,8 @@ use crate::{
     config::ShutdownPolicies,
     credential::CredentialStore,
     error::{Error, Result},
-    gpg::{Gpg, PingMode, SigningTarget},
-    ipc::{self, Request, Response},
+    gpg::{Gpg, KeyProtection, PingMode, SigningTarget},
+    ipc::{self, LockResult, Request, Response},
     state::{Action, Activation, CachePlan, CredentialMode, Hold},
 };
 use signal_hook::{
@@ -268,6 +268,7 @@ where
             stopping: false,
             shutdown: false,
             active_connections: 0,
+            locking: false,
         }),
         Condvar::new(),
     ));
@@ -294,9 +295,10 @@ where
         })?;
 
     let accept_pair = Arc::clone(&pair);
+    let accept_services = Arc::clone(&services);
     let accept_join = thread::Builder::new()
         .name("keyhold-accept".into())
-        .spawn(move || accept_loop(listener, accept_pair))?;
+        .spawn(move || accept_loop(listener, accept_pair, accept_services))?;
 
     scheduler(&pair, &services);
 
@@ -434,6 +436,8 @@ struct Shared {
     shutdown: bool,
     /// Handlers for connections accepted while admission was still open.
     active_connections: usize,
+    /// A lock operation is draining renewal and clearing the managed key.
+    locking: bool,
 }
 
 fn lock(pair: &Pair) -> MutexGuard<'_, Shared> {
@@ -442,7 +446,7 @@ fn lock(pair: &Pair) -> MutexGuard<'_, Shared> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-fn accept_loop(listener: UnixListener, pair: Pair) {
+fn accept_loop(listener: UnixListener, pair: Pair, services: Arc<Services>) {
     loop {
         match listener.accept() {
             Ok((stream, _)) => {
@@ -457,11 +461,12 @@ fn accept_loop(listener: UnixListener, pair: Pair) {
                     }
                 };
                 let pair = Arc::clone(&pair);
+                let services = Arc::clone(&services);
                 if let Err(e) = thread::Builder::new()
                     .name("keyhold-conn".into())
                     .spawn(move || {
                         let _guard = guard;
-                        handle(stream, pair);
+                        handle(stream, pair, &services);
                     })
                 {
                     eprintln!(
@@ -498,13 +503,13 @@ impl Drop for ActiveConnection {
     }
 }
 
-fn handle(stream: UnixStream, pair: Pair) {
+fn handle(stream: UnixStream, pair: Pair, services: &Services) {
     let _ = stream.set_read_timeout(Some(REQUEST_TIMEOUT));
     let _ = stream.set_write_timeout(Some(REQUEST_TIMEOUT));
     let (response, shutdown) = match ipc::read_request(&stream) {
         // Client disconnected without sending anything: nothing to do.
         Ok(None) => return,
-        Ok(Some(request)) => apply(request, &pair),
+        Ok(Some(request)) => apply(request, &pair, services),
         Err(e) => (Response::err(e.to_string()), false),
     };
     // A shutdown request may only take effect once its acknowledgement has
@@ -526,7 +531,11 @@ fn handle(stream: UnixStream, pair: Pair) {
 
 /// Apply one request, returning the response to send and whether the daemon
 /// should shut down once that response has been acknowledged.
-fn apply(request: Request, pair: &Pair) -> (Response, bool) {
+fn apply(
+    request: Request,
+    pair: &Pair,
+    services: &Services,
+) -> (Response, bool) {
     let mut shared = lock(pair);
     if shared.stopping {
         return match request {
@@ -536,6 +545,17 @@ fn apply(request: Request, pair: &Pair) -> (Response, bool) {
     }
     match request {
         Request::Ping => (Response::ok(), false),
+        Request::Lock { clear_credential } => {
+            drop(shared);
+            let response = match lock_key(pair, services, clear_credential) {
+                Ok(result) => Response {
+                    lock_result: Some(result),
+                    ..Response::ok()
+                },
+                Err(e) => Response::err(e.to_string()),
+            };
+            (response, false)
+        }
         Request::On {
             key,
             key_source,
@@ -549,6 +569,12 @@ fn apply(request: Request, pair: &Pair) -> (Response, bool) {
             max_cache_ttl_ms,
             cache_started_at_ms,
         } => {
+            if shared.locking {
+                return (
+                    Response::err("managed key lock is in progress"),
+                    false,
+                );
+            }
             if interval_ms == 0 {
                 return (
                     Response::err("interval must be greater than zero"),
@@ -639,6 +665,79 @@ fn apply(request: Request, pair: &Pair) -> (Response, bool) {
             shared.stopping = true;
             (Response::ok(), true)
         }
+    }
+}
+
+/// Disable before waiting for the per-key transaction. Earlier renewals finish
+/// before the clear; queued renewals recheck the disabled hold and abort.
+fn lock_key(
+    pair: &Pair,
+    services: &Services,
+    clear: bool,
+) -> Result<LockResult> {
+    let keygrip = {
+        let mut shared = lock(pair);
+        if shared.stopping {
+            return Err(Error::Daemon("daemon is shutting down".into()));
+        }
+        if shared.locking {
+            return Err(Error::Daemon(
+                "managed key lock is in progress".into(),
+            ));
+        }
+        shared.hold.turn_off();
+        shared.hold.clear_error();
+        pair.1.notify_all();
+        let keygrip = shared.hold.keygrip.clone().ok_or_else(|| {
+            Error::Message(
+                "no managed/resolved GPG key available to lock".into(),
+            )
+        })?;
+        shared.locking = true;
+        keygrip
+    };
+    let _operation = LockOperation(pair);
+    let _transaction = services.store.lock_transaction(&keygrip)?;
+    // Try both cleanups even if one fails; never roll back safer state.
+    let credential = if clear {
+        services.store.delete(&keygrip).map(|_| ())
+    } else {
+        Ok(())
+    };
+    let cache = clear_managed_cache(&services.gpg, &keygrip);
+    match (credential, cache) {
+        (Ok(()), result) => result,
+        (Err(e), Ok(_)) => Err(Error::Message(format!(
+            "managed GPG cache cleanup completed, but session credential deletion failed: {e}"
+        ))),
+        (Err(e), Err(cache)) => Err(Error::Message(format!(
+            "session credential deletion failed: {e}; managed GPG cache cleanup failed: {cache}"
+        ))),
+    }
+}
+
+struct LockOperation<'a>(&'a Pair);
+
+impl Drop for LockOperation<'_> {
+    fn drop(&mut self) {
+        lock(self.0).locking = false;
+        self.0.1.notify_all();
+    }
+}
+
+fn clear_managed_cache(gpg: &Gpg, keygrip: &str) -> Result<LockResult> {
+    // Query only the retained keygrip; never resolve a new selector.
+    let protection = gpg.key_state(keygrip).map(|state| state.protection);
+    if matches!(protection, Ok(KeyProtection::Clear)) {
+        return Ok(LockResult::Unprotected);
+    }
+    gpg.clear_passphrase(keygrip)?;
+    match protection? {
+        KeyProtection::Passphrase => Ok(LockResult::Locked),
+        _ => Err(Error::Message(
+            "managed GPG cache entry cleared, but key protection is unknown"
+                .into(),
+        )),
     }
 }
 
@@ -884,6 +983,14 @@ fn apply_renewal_result(pair: &Pair, generation: u64, result: Result<()>) {
 mod tests {
     use super::*;
 
+    fn apply(request: Request, pair: &Pair) -> (Response, bool) {
+        let services = Services {
+            gpg: Gpg::with_tools(PathBuf::new(), None, None),
+            store: Arc::new(crate::credential::SessionCredentialStore),
+        };
+        super::apply(request, pair, &services)
+    }
+
     fn test_paths(base: &Path) -> Paths {
         let dir = base.join("keyhold");
         Paths {
@@ -977,6 +1084,7 @@ mod tests {
                 stopping: false,
                 shutdown: false,
                 active_connections: 0,
+                locking: false,
             }),
             Condvar::new(),
         ))

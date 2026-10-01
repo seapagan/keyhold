@@ -5,6 +5,19 @@ project since the first release, with the latest changes at the top.
 
 This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased](https://github.com/seapagan/keyhold/tree/HEAD)
+
+These are the changes that have been merged to the repository since the last
+release.
+
+Everything in this section will be included in the next official release.
+
+### New Features
+
+- Feat: add managed key lock command ([#7](https://github.com/seapagan/keyhold/pull/7)) by [seapagan](https://github.com/seapagan)
+
+[`Full Changelog`](https://github.com/seapagan/keyhold/compare/v0.3.1...HEAD) | [`Diff`](https://github.com/seapagan/keyhold/compare/v0.3.1...HEAD.diff) | [`Patch`](https://github.com/seapagan/keyhold/compare/v0.3.1...HEAD.patch)
+
 ## [v0.3.1](https://github.com/seapagan/keyhold/releases/tag/v0.3.1) (September 26, 2026)
 
 > [!IMPORTANT]
@@ -43,6 +56,9 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 Initial release of `keyhold`.
 
-See the README for installation, usage, configuration, and implementation details.
+See the README for installation, usage, configuration, and implementation
+details
+
 ---
+
 *This changelog was generated using [github-changelog-md](http://changelog.seapagan.net/) by [Seapagan](https://github.com/seapagan)*

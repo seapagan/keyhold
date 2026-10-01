@@ -28,8 +28,8 @@ use crate::{
     config::ShutdownPolicies,
     credential::CredentialStore,
     error::{Error, Result},
-    gpg::{Gpg, PingMode, SigningTarget},
-    ipc::{self, Request, Response},
+    gpg::{Gpg, KeyProtection, PingMode, SigningTarget},
+    ipc::{self, LockResult, Request, Response},
     state::{Action, Activation, CachePlan, CredentialMode, Hold},
 };
 use signal_hook::{
@@ -155,6 +155,23 @@ pub fn ensure_running() -> Result<bool> {
     Err(Error::DaemonStart)
 }
 
+/// Keep foreground activation alive through handoff so lock can drain it
+/// before clearing the retained key. Shared ownership permits concurrent
+/// activations; an exclusive lock in progress rejects new work immediately.
+/// This uses runtime files only, never Secret Service or passphrase material.
+pub fn guard_activation() -> Result<fs::File> {
+    let paths = paths()?;
+    ensure_private_dir(&paths.dir)?;
+    let guard = crate::credential::open_lock(&paths.dir, "activation.lock")?;
+    fs4::FileExt::try_lock_shared(&guard).map_err(|e| match e {
+        fs4::TryLockError::WouldBlock => Error::Daemon(
+            "managed key lock is in progress; the hold was NOT enabled".into(),
+        ),
+        fs4::TryLockError::Error(e) => e.into(),
+    })?;
+    Ok(guard)
+}
+
 /// Start a detached daemon: `setsid` + exec of `keyhold daemon` with all
 /// standard streams pointed at `/dev/null`, so it survives the invoking
 /// terminal and never touches a TTY. This is the one detached-start path,
@@ -261,13 +278,18 @@ where
     F: Fn() -> Result<ShutdownPolicies>,
 {
     let listener = bind(paths)?;
-    let services = Arc::new(Services { gpg, store });
+    let services = Arc::new(Services {
+        gpg,
+        store,
+        runtime_dir: paths.dir.clone(),
+    });
     let pair: Pair = Arc::new((
         Mutex::new(Shared {
             hold: Hold::default(),
             stopping: false,
             shutdown: false,
             active_connections: 0,
+            locking: false,
         }),
         Condvar::new(),
     ));
@@ -294,9 +316,10 @@ where
         })?;
 
     let accept_pair = Arc::clone(&pair);
+    let accept_services = Arc::clone(&services);
     let accept_join = thread::Builder::new()
         .name("keyhold-accept".into())
-        .spawn(move || accept_loop(listener, accept_pair))?;
+        .spawn(move || accept_loop(listener, accept_pair, accept_services))?;
 
     scheduler(&pair, &services);
 
@@ -420,6 +443,7 @@ fn bind(paths: &Paths) -> Result<UnixListener> {
 struct Services {
     gpg: Gpg,
     store: Arc<dyn CredentialStore>,
+    runtime_dir: PathBuf,
 }
 
 type Pair = Arc<(Mutex<Shared>, Condvar)>;
@@ -434,6 +458,8 @@ struct Shared {
     shutdown: bool,
     /// Handlers for connections accepted while admission was still open.
     active_connections: usize,
+    /// A lock operation is draining renewal and clearing the managed key.
+    locking: bool,
 }
 
 fn lock(pair: &Pair) -> MutexGuard<'_, Shared> {
@@ -442,7 +468,7 @@ fn lock(pair: &Pair) -> MutexGuard<'_, Shared> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-fn accept_loop(listener: UnixListener, pair: Pair) {
+fn accept_loop(listener: UnixListener, pair: Pair, services: Arc<Services>) {
     loop {
         match listener.accept() {
             Ok((stream, _)) => {
@@ -457,11 +483,12 @@ fn accept_loop(listener: UnixListener, pair: Pair) {
                     }
                 };
                 let pair = Arc::clone(&pair);
+                let services = Arc::clone(&services);
                 if let Err(e) = thread::Builder::new()
                     .name("keyhold-conn".into())
                     .spawn(move || {
                         let _guard = guard;
-                        handle(stream, pair);
+                        handle(stream, pair, &services);
                     })
                 {
                     eprintln!(
@@ -498,13 +525,13 @@ impl Drop for ActiveConnection {
     }
 }
 
-fn handle(stream: UnixStream, pair: Pair) {
+fn handle(stream: UnixStream, pair: Pair, services: &Services) {
     let _ = stream.set_read_timeout(Some(REQUEST_TIMEOUT));
     let _ = stream.set_write_timeout(Some(REQUEST_TIMEOUT));
     let (response, shutdown) = match ipc::read_request(&stream) {
         // Client disconnected without sending anything: nothing to do.
         Ok(None) => return,
-        Ok(Some(request)) => apply(request, &pair),
+        Ok(Some(request)) => apply(request, &pair, services),
         Err(e) => (Response::err(e.to_string()), false),
     };
     // A shutdown request may only take effect once its acknowledgement has
@@ -526,7 +553,11 @@ fn handle(stream: UnixStream, pair: Pair) {
 
 /// Apply one request, returning the response to send and whether the daemon
 /// should shut down once that response has been acknowledged.
-fn apply(request: Request, pair: &Pair) -> (Response, bool) {
+fn apply(
+    request: Request,
+    pair: &Pair,
+    services: &Services,
+) -> (Response, bool) {
     let mut shared = lock(pair);
     if shared.stopping {
         return match request {
@@ -535,94 +566,34 @@ fn apply(request: Request, pair: &Pair) -> (Response, bool) {
         };
     }
     match request {
-        Request::Ping => (Response::ok(), false),
-        Request::On {
-            key,
-            key_source,
-            interval_ms,
-            hold_ms,
-            activated_at_ms,
-            fingerprint,
-            keygrip,
-            credential_mode,
-            default_cache_ttl_ms,
-            max_cache_ttl_ms,
-            cache_started_at_ms,
-        } => {
-            if interval_ms == 0 {
-                return (
-                    Response::err("interval must be greater than zero"),
-                    false,
-                );
-            }
-            // The client sends the wall-clock moment of the successful
-            // foreground key use; it becomes the hold's first recorded ping.
-            // IPC values are untrusted: timestamps that cannot be
-            // represented, or timings that cannot be scheduled, are normal
-            // protocol errors — never a panic.
-            let Some(activated) =
-                UNIX_EPOCH.checked_add(Duration::from_millis(activated_at_ms))
-            else {
-                return (
-                    Response::err("activation timestamp is out of range"),
-                    false,
-                );
-            };
-            // Session mode promises proactive renewal: it is only valid
-            // with the full metadata needed to schedule it.
-            if credential_mode == CredentialMode::Session
-                && (keygrip.as_deref().is_none_or(str::is_empty)
-                    || max_cache_ttl_ms.is_none()
-                    || cache_started_at_ms.is_none())
-            {
-                return (
-                    Response::err(
-                        "session mode requires a keygrip, max cache TTL \
-                         and a known cache epoch",
-                    ),
-                    false,
-                );
-            }
-            let cache = match (credential_mode, max_cache_ttl_ms) {
-                // Without a TTL there is nothing to track; an ordinary
-                // hold may legitimately arrive with no cache metadata.
-                (_, None) => None,
-                (_, Some(max_ms)) => {
-                    let started = cache_started_at_ms.and_then(|ms| {
-                        UNIX_EPOCH.checked_add(Duration::from_millis(ms))
-                    });
-                    Some(CachePlan {
-                        mode: credential_mode,
-                        default_ttl: Duration::from_millis(
-                            default_cache_ttl_ms.unwrap_or(max_ms),
-                        ),
-                        max_ttl: Duration::from_millis(max_ms),
-                        started_wall: started,
-                    })
-                }
-            };
-            let target = fingerprint.map(|fingerprint| SigningTarget {
-                fingerprint,
-                keygrip: keygrip.clone(),
-            });
-            match shared.hold.turn_on(
-                key,
-                key_source,
-                Duration::from_millis(interval_ms),
-                hold_ms.map(Duration::from_millis),
-                Instant::now(),
-                activated,
-                Activation {
-                    target: target.as_ref(),
-                    cache,
+        Request::Ping => (
+            Response {
+                supports_lock: Some(true),
+                lock_in_progress: Some(shared.locking),
+                ..Response::ok()
+            },
+            false,
+        ),
+        Request::Lock { clear_credential } => {
+            drop(shared);
+            let response = match lock_key(pair, services, clear_credential) {
+                Ok(result) => Response {
+                    lock_result: Some(result),
+                    ..Response::ok()
                 },
-            ) {
+                Err(e) => Response::err(e.to_string()),
+            };
+            (response, false)
+        }
+        request @ Request::On { .. } => {
+            let response = match apply_on(request, &mut shared) {
                 Ok(()) => {
                     pair.1.notify_all();
-                    (Response::ok(), false)
+                    Response::ok()
                 }
-                Err(reason) => (Response::err(reason), false),
-            }
+                Err(reason) => Response::err(reason),
+            };
+            (response, false)
         }
         Request::Off => {
             shared.hold.turn_off();
@@ -640,6 +611,165 @@ fn apply(request: Request, pair: &Pair) -> (Response, bool) {
             (Response::ok(), true)
         }
     }
+}
+
+/// Validate and enable a hold under the dispatcher's existing state lock.
+fn apply_on(
+    request: Request,
+    shared: &mut Shared,
+) -> Result<(), &'static str> {
+    let Request::On {
+        key,
+        key_source,
+        interval_ms,
+        hold_ms,
+        activated_at_ms,
+        fingerprint,
+        keygrip,
+        credential_mode,
+        default_cache_ttl_ms,
+        max_cache_ttl_ms,
+        cache_started_at_ms,
+    } = request
+    else {
+        unreachable!("apply_on only receives On requests");
+    };
+    if shared.locking {
+        return Err("managed key lock is in progress");
+    }
+    if interval_ms == 0 {
+        return Err("interval must be greater than zero");
+    }
+    // Preserve validation order for untrusted activation metadata.
+    let activated = UNIX_EPOCH
+        .checked_add(Duration::from_millis(activated_at_ms))
+        .ok_or("activation timestamp is out of range")?;
+    let cache = activation_cache(
+        credential_mode,
+        keygrip.as_deref(),
+        default_cache_ttl_ms,
+        max_cache_ttl_ms,
+        cache_started_at_ms,
+    )?;
+    let target = fingerprint.map(|fingerprint| SigningTarget {
+        fingerprint,
+        keygrip: keygrip.clone(),
+    });
+    shared.hold.turn_on(
+        key,
+        key_source,
+        Duration::from_millis(interval_ms),
+        hold_ms.map(Duration::from_millis),
+        Instant::now(),
+        activated,
+        Activation {
+            target: target.as_ref(),
+            cache,
+        },
+    )
+}
+
+/// Session renewal requires a resolved key and a complete cache epoch.
+fn activation_cache(
+    mode: CredentialMode,
+    keygrip: Option<&str>,
+    default_ttl_ms: Option<u64>,
+    max_ttl_ms: Option<u64>,
+    started_at_ms: Option<u64>,
+) -> Result<Option<CachePlan>, &'static str> {
+    if mode == CredentialMode::Session
+        && (keygrip.is_none_or(str::is_empty)
+            || max_ttl_ms.is_none()
+            || started_at_ms.is_none())
+    {
+        return Err("session mode requires a keygrip, max cache TTL \
+             and a known cache epoch");
+    }
+    // Ordinary holds may legitimately arrive without cache metadata.
+    Ok(max_ttl_ms.map(|max_ms| CachePlan {
+        mode,
+        default_ttl: Duration::from_millis(default_ttl_ms.unwrap_or(max_ms)),
+        max_ttl: Duration::from_millis(max_ms),
+        started_wall: started_at_ms
+            .and_then(|ms| UNIX_EPOCH.checked_add(Duration::from_millis(ms))),
+    }))
+}
+
+/// Disable before waiting for the per-key transaction. Earlier renewals finish
+/// before the clear; queued renewals recheck the disabled hold and abort.
+fn lock_key(
+    pair: &Pair,
+    services: &Services,
+    clear: bool,
+) -> Result<LockResult> {
+    let keygrip = {
+        let mut shared = lock(pair);
+        if shared.stopping {
+            return Err(Error::Daemon("daemon is shutting down".into()));
+        }
+        if shared.locking {
+            return Err(Error::Daemon(
+                "managed key lock is in progress".into(),
+            ));
+        }
+        shared.hold.turn_off();
+        shared.hold.clear_error();
+        pair.1.notify_all();
+        let keygrip = shared.hold.keygrip.clone().ok_or_else(|| {
+            Error::Message(
+                "the hold was disabled, but no managed/resolved GPG key is available to lock"
+                    .into(),
+            )
+        })?;
+        shared.locking = true;
+        keygrip
+    };
+    let _operation = LockOperation(pair);
+    // Foreground activation does not necessarily know a keygrip yet. Drain
+    // its shared runtime guard before the key-specific credential guard;
+    // activations already admitted still hand off while locking is true and
+    // are rejected, then release their guard before this clear can proceed.
+    let activation = crate::credential::open_lock(
+        &services.runtime_dir,
+        "activation.lock",
+    )?;
+    fs4::FileExt::lock(&activation)?;
+    let _transaction = services.store.lock_transaction(&keygrip)?;
+    // Try both cleanups even if one fails; never roll back safer state.
+    let credential = if clear {
+        services.store.delete(&keygrip).map(|_| ())
+    } else {
+        Ok(())
+    };
+    let cache = clear_managed_cache(&services.gpg, &keygrip);
+    match (credential, cache) {
+        (Ok(()), result) => result,
+        (Err(e), Ok(_)) => Err(Error::Message(format!(
+            "managed GPG cache cleanup completed, but session credential deletion failed: {e}"
+        ))),
+        (Err(e), Err(cache)) => Err(Error::Message(format!(
+            "session credential deletion failed: {e}; managed GPG cache cleanup failed: {cache}"
+        ))),
+    }
+}
+
+struct LockOperation<'a>(&'a Pair);
+
+impl Drop for LockOperation<'_> {
+    fn drop(&mut self) {
+        lock(self.0).locking = false;
+        self.0.1.notify_all();
+    }
+}
+
+fn clear_managed_cache(gpg: &Gpg, keygrip: &str) -> Result<LockResult> {
+    // Query only the retained keygrip; never resolve a new selector.
+    let protection = gpg.key_state(keygrip).map(|state| state.protection);
+    if matches!(protection, Ok(KeyProtection::Clear)) {
+        return Ok(LockResult::Unprotected);
+    }
+    gpg.clear_passphrase(keygrip)?;
+    Ok(LockResult::Locked)
 }
 
 /// The keepalive scheduler.
@@ -884,6 +1014,15 @@ fn apply_renewal_result(pair: &Pair, generation: u64, result: Result<()>) {
 mod tests {
     use super::*;
 
+    fn apply(request: Request, pair: &Pair) -> (Response, bool) {
+        let services = Services {
+            gpg: Gpg::with_tools(PathBuf::new(), None, None),
+            store: Arc::new(crate::credential::SessionCredentialStore),
+            runtime_dir: PathBuf::new(),
+        };
+        super::apply(request, pair, &services)
+    }
+
     fn test_paths(base: &Path) -> Paths {
         let dir = base.join("keyhold");
         Paths {
@@ -977,6 +1116,7 @@ mod tests {
                 stopping: false,
                 shutdown: false,
                 active_connections: 0,
+                locking: false,
             }),
             Condvar::new(),
         ))

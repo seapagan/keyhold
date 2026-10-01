@@ -67,10 +67,25 @@ pub enum Request {
         cache_started_at_ms: Option<u64>,
     },
     Off,
+    /// Disable the hold and clear only the retained managed key.
+    Lock {
+        /// Also delete this key's stored session credential.
+        clear_credential: bool,
+    },
     /// Request a status snapshot.
     Status,
     /// Ask the daemon to exit.
     Shutdown,
+}
+
+/// Successful cache-lock outcome for the managed key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LockResult {
+    /// The managed passphrase cache entry was cleared.
+    Locked,
+    /// The managed key has no passphrase cache entry to lock.
+    Unprotected,
 }
 
 /// A daemon response.
@@ -84,6 +99,16 @@ pub struct Response {
     /// Status snapshot (only for [`Request::Status`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status: Option<StatusData>,
+    /// Outcome only for a successful [`Request::Lock`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lock_result: Option<LockResult>,
+    /// Whether this daemon implements [`Request::Lock`] (Ping only).
+    /// Missing on legacy daemons; package versions alone do not identify IPC.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supports_lock: Option<bool>,
+    /// Whether foreground activation must abort before touching GPG (Ping).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lock_in_progress: Option<bool>,
 }
 
 impl Response {
@@ -93,6 +118,9 @@ impl Response {
             ok: true,
             error: None,
             status: None,
+            lock_result: None,
+            supports_lock: None,
+            lock_in_progress: None,
         }
     }
 
@@ -102,6 +130,9 @@ impl Response {
             ok: false,
             error: Some(reason.into()),
             status: None,
+            lock_result: None,
+            supports_lock: None,
+            lock_in_progress: None,
         }
     }
 
@@ -111,6 +142,9 @@ impl Response {
             ok: true,
             error: None,
             status: Some(status),
+            lock_result: None,
+            supports_lock: None,
+            lock_in_progress: None,
         }
     }
 }
@@ -129,7 +163,12 @@ pub fn request_on_stream(
     stream: &UnixStream,
     req: &Request,
 ) -> Result<Response> {
-    stream.set_read_timeout(Some(IO_TIMEOUT))?;
+    // Lock may wait for an in-flight renewal, then run bounded agent I/O.
+    let timeout = match req {
+        Request::Lock { .. } => Duration::from_secs(120),
+        _ => IO_TIMEOUT,
+    };
+    stream.set_read_timeout(Some(timeout))?;
     stream.set_write_timeout(Some(IO_TIMEOUT))?;
 
     let payload =
@@ -243,6 +282,21 @@ mod tests {
         ));
         let json = serde_json::to_string(&Request::Off).unwrap();
         assert_eq!(json, "{\"cmd\":\"off\"}");
+    }
+
+    #[test]
+    fn lock_ipc_contains_only_command_and_credential_policy() {
+        for clear_credential in [false, true] {
+            let request = Request::Lock { clear_credential };
+            let json = serde_json::to_value(&request).unwrap();
+            assert_eq!(
+                json,
+                serde_json::json!({"cmd": "lock", "clear_credential": clear_credential})
+            );
+            assert!(
+                matches!(serde_json::from_value::<Request>(json).unwrap(), Request::Lock { clear_credential: actual } if actual == clear_credential)
+            );
+        }
     }
 
     #[test]

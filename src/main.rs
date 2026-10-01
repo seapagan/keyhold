@@ -51,6 +51,10 @@ fn run(command: Command) -> Result<()> {
             interval,
         ),
         Command::Off => off(),
+        Command::Lock {
+            clear,
+            keep_credential,
+        } => lock_key(clear, keep_credential),
         Command::Status => status(),
         Command::Credential { action } => match action {
             CredentialAction::Clear => credential_clear(),
@@ -106,6 +110,15 @@ fn on(
     let gpg = Gpg::detect()?;
 
     daemon::ensure_running()?;
+
+    let _activation = daemon::guard_activation()?;
+    let admission = ipc::request(&Request::Ping)?;
+    check(admission.clone())?;
+    if admission.lock_in_progress == Some(true) {
+        return Err(Error::Daemon(
+            "managed key lock is in progress; the hold was NOT enabled".into(),
+        ));
+    }
 
     // The activation flow performs the foreground key use (and, in
     // stored mode, the credential/epoch dance) before anything is
@@ -202,6 +215,39 @@ fn off() -> Result<()> {
         }
         Err(e) => Err(e),
     }
+}
+
+fn lock_key(clear: bool, keep_credential: bool) -> Result<()> {
+    let config = config::load()?;
+    let clear_credential =
+        clear || (config.clear_secret_on_lock && !keep_credential);
+    require_lock_capability()?;
+    let response = ipc::request(&Request::Lock { clear_credential })?;
+    check(response.clone())?;
+    let result = response
+        .lock_result
+        .ok_or_else(|| Error::Ipc("daemon returned no lock outcome".into()))?;
+    presentation::key_locked(result, clear_credential);
+    Ok(())
+}
+
+fn require_lock_capability() -> Result<()> {
+    let capability = ipc::request(&Request::Ping)
+        .map_err(|e| match e {
+            Error::DaemonNotRunning => Error::Message(
+                "no managed/resolved GPG key available to lock: daemon is not running".into(),
+            ),
+            other => other,
+        })?;
+    check(capability.clone())?;
+    if capability.supports_lock != Some(true)
+        || capability.lock_in_progress.is_none()
+    {
+        return Err(Error::Daemon(
+            "running daemon does not support lock; restart it using this Keyhold executable, then activate the intended key before locking".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn status() -> Result<()> {
@@ -540,6 +586,15 @@ mod tests {
         );
         assert_eq!(row.as_deref(), Some("session stored"));
         assert_eq!(calls.get(), 1);
+    }
+
+    #[test]
+    fn stopped_stored_status_reports_missing_credential() {
+        let row = credential_row_with(
+            &status(false, CredentialMode::Session),
+            |_| Ok(false),
+        );
+        assert_eq!(row.as_deref(), Some("missing"));
     }
 
     #[test]

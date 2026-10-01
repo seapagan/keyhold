@@ -104,6 +104,133 @@ fn off_disables_and_is_idempotent() {
 }
 
 #[test]
+fn lock_without_a_managed_key_fails_without_starting_or_guessing() {
+    let env = TestEnv::new();
+    for running in [false, true] {
+        if running {
+            env.succeed(&["daemon", "-b"]);
+        }
+        let output = env.fail(&["lock"]);
+        assert!(output.stdout.is_empty());
+        assert!(
+            String::from_utf8_lossy(&output.stderr)
+                .contains("no managed/resolved GPG key")
+        );
+        if running {
+            assert!(
+                String::from_utf8_lossy(&output.stderr)
+                    .contains("the hold was disabled")
+            );
+            assert!(env.status().contains("Hold         off"));
+        }
+        assert!(env.gpg_log().is_empty());
+        assert!(env.ca_log().is_empty());
+        assert!(env.status().contains(if running {
+            "Daemon       running"
+        } else {
+            "Daemon       stopped"
+        }));
+    }
+}
+
+fn lock_against_peer(reply: &'static str) -> (std::process::Output, String) {
+    let env = TestEnv::new();
+    fs::create_dir_all(env.sock().parent().unwrap()).unwrap();
+    let listener = std::os::unix::net::UnixListener::bind(env.sock()).unwrap();
+    let peer = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        stream.set_read_timeout(Some(5 * SECS)).unwrap();
+        let mut request = Vec::new();
+        let mut byte = [0];
+        while stream.read_exact(&mut byte).is_ok() && byte[0] != b'\n' {
+            request.push(byte[0]);
+        }
+        stream.write_all(reply.as_bytes()).unwrap();
+        String::from_utf8(request).unwrap()
+    });
+    let output = env.keyhold(&["lock"]).output().unwrap();
+    assert!(env.gpg_log().is_empty());
+    assert!(env.ca_log().is_empty());
+    (output, peer.join().unwrap())
+}
+
+#[test]
+fn lock_detects_legacy_daemon_before_sending_a_mutating_request() {
+    for reply in ["{\"ok\":true}\n", "{\"ok\":true,\"supports_lock\":true}\n"]
+    {
+        let (output, request) = lock_against_peer(reply);
+        assert_eq!(request, "{\"cmd\":\"ping\"}");
+        assert!(!output.status.success());
+        assert!(output.stdout.is_empty());
+        let error = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            error.contains("running daemon does not support lock"),
+            "{error}"
+        );
+        assert!(error.contains("restart"), "{error}");
+        assert!(error.contains("activate the intended key"), "{error}");
+    }
+}
+
+#[test]
+fn lock_capability_probe_preserves_protocol_and_daemon_failures() {
+    for (reply, expected) in [
+        ("not JSON\n", "malformed daemon response"),
+        (
+            "{\"ok\":false,\"error\":\"daemon is shutting down\"}\n",
+            "daemon is shutting down",
+        ),
+    ] {
+        let (output, request) = lock_against_peer(reply);
+        assert_eq!(request, "{\"cmd\":\"ping\"}");
+        assert!(!output.status.success());
+        let error = String::from_utf8_lossy(&output.stderr);
+        assert!(error.contains(expected), "{error}");
+        assert!(!error.contains("does not support lock"));
+    }
+}
+
+#[test]
+fn ordinary_lock_after_off_preserves_identity_and_locks_only_managed_key() {
+    let env = TestEnv::new();
+    env.rich_gpg();
+    env.set_key_cached(true);
+    env.succeed(&["on", "--for", "1h"]);
+    env.succeed(&["off"]);
+    // New key-selection settings must not redirect lock's retained target.
+    fs::create_dir_all(env.config.path().join("keyhold")).unwrap();
+    fs::write(
+        env.config.path().join("keyhold/config.toml"),
+        "key = \"different-key\"\n",
+    )
+    .unwrap();
+    assert_eq!(env.stdout(&["lock"]), "GPG key locked.\n");
+    let status = env.status();
+    for row in [
+        "Daemon       running",
+        "Hold         off",
+        "Key          default",
+        "Key state    locked",
+        "Credential   not in use",
+    ] {
+        assert!(status.contains(row), "missing {row}");
+    }
+    let clears: Vec<_> = env
+        .ca_log()
+        .lines()
+        .filter(|line| line.starts_with("CLEAR_PASSPHRASE"))
+        .map(str::to_owned)
+        .collect();
+    assert_eq!(
+        clears,
+        [format!(
+            "CLEAR_PASSPHRASE --mode=normal {} /bye",
+            common::SUB2_GRIP
+        )]
+    );
+}
+
+#[test]
 fn timed_hold_expires_by_itself() {
     let env = TestEnv::new();
     env.succeed(&["on", "--for", "1s", "--interval", "200ms"]);

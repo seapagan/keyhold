@@ -77,6 +77,15 @@ pub enum Command {
     },
     /// Disable the hold; the GPG cache is left to expire naturally
     Off,
+    /// Disable the hold and immediately lock the managed GPG key
+    Lock {
+        /// Also delete the managed key's stored Keyhold session credential
+        #[arg(short = 'c', long, conflicts_with = "keep_credential")]
+        clear: bool,
+        /// Keep the stored session credential, overriding clear_secret_on_lock = true
+        #[arg(short = 'k', long)]
+        keep_credential: bool,
+    },
     /// Show whether the daemon and hold are active
     Status,
     /// Manage the stored session credential

@@ -142,7 +142,7 @@ impl CredentialStoreBarrier {
     }
 }
 
-fn open_lock(dir: &Path, name: &str) -> Result<File> {
+pub(crate) fn open_lock(dir: &Path, name: &str) -> Result<File> {
     Ok(OpenOptions::new()
         .read(true)
         .write(true)

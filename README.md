@@ -156,6 +156,9 @@ keyhold on --key <key-id> --for 2h
 keyhold on --interval 5m      # custom ping interval
 keyhold on -s --for 4h        # session credential mode (see below)
 keyhold off                   # stop holding; cache expires naturally
+keyhold lock                  # stop holding and clear the managed GPG cache entry
+keyhold lock -c               # also delete this key's stored session credential
+keyhold lock -k               # keep its credential, overriding the lock config
 keyhold status                # what is happening right now
 keyhold credential clear      # erase stored session credentials
 keyhold daemon -b             # start the daemon detached; no hold, no GPG use
@@ -228,6 +231,50 @@ alone and does not query Secret Service. A retained stored-mode hold may
 still query its explicitly opted-in session credential after `off` or
 expiry.
 
+### Lock the managed key
+
+`keyhold off` disables the hold while leaving the GPG-agent cache and any
+stored Keyhold session credential unchanged. `keyhold lock` disables the
+hold and clears the managed signing key's GPG-agent passphrase cache entry
+immediately. Both commands leave the daemon running.
+
+Normal `lock` preserves the stored session credential, so a later
+`keyhold on -s` can reuse it without prompting. For walking away, use:
+
+```sh
+keyhold lock -c                # or --clear
+```
+
+`-c` / `--clear` also deletes only the managed key's stored Keyhold session
+credential. Without another valid credential source, a later stored-mode
+activation needs a fresh passphrase.
+`-k` / `--keep-credential` explicitly keeps that credential. The two flags
+conflict. With neither flag, `clear_secret_on_lock` chooses the policy;
+it defaults to `false`. `--clear` overrides a false policy, and
+`--keep-credential` overrides a true policy.
+
+Lock uses the exact keygrip the daemon retained from activation, including
+after `off`, timed expiry or a hold failure. It never selects a new default
+or Git signing key, restarts GPG-agent, or flushes unrelated keys. If no
+resolved managed key exists, it fails without starting a daemon or guessing
+a key. An unprotected key has no passphrase cache entry to lock; Keyhold
+reports that and still applies the requested credential policy.
+
+Lock waits for any in-flight foreground activation and stored-mode renewal
+before clearing the cache. An overlapping `on` is rejected; retry it after
+lock completes if you intend to restore access.
+Success means the hold is off and the managed passphrase cache entry is
+absent; with `--clear`, its stored session credential is also absent.
+Cleanup failures return an error and leave the hold off, without rolling
+back successful cleanup. Status retains the key identity and shows whether
+the credential is still `session stored` or `missing`.
+
+A daemon already running before a rebuild or upgrade keeps its old code.
+If it lacks lock support, Keyhold reports that before sending a lock
+request. Restart with the updated executable, then activate the intended
+key again before locking. Restarting discards retained key metadata and
+runs your configured daemon-stop cleanup policies.
+
 ### What `on` does
 
 1. Loads configuration and resolves the key.
@@ -299,6 +346,8 @@ git_key = true             # optional; use Git's user.signingkey by default
 interval = "5m"            # optional; default 5m
 store_passphrase = false   # optional; default false — opt in to session
                            # credential mode for `keyhold on` (see below)
+clear_secret_on_lock = false         # optional; also delete the managed key's
+                                     # stored session credential on `lock`
 clear_secret_on_daemon_stop = false  # optional; delete keyhold's Secret
                                      # Service session items on clean daemon
                                      # shutdown
@@ -317,6 +366,10 @@ required. In particular `--store-passphrase` / `-s` beats
 `store_passphrase = true`; storage is never the implicit default. Unknown
 keys, non-positive intervals, and conflicting key-selection settings are
 rejected with an error naming the file.
+
+For `lock`, explicit `--clear` / `--keep-credential` overrides
+`clear_secret_on_lock`. This setting is independent of both daemon-stop
+cleanup settings.
 
 ## How the GnuPG TTL interaction works
 

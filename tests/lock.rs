@@ -502,6 +502,12 @@ fn no_resolved_key_disables_hold_and_never_guesses_or_touches_store() {
                 .unwrap()
                 .contains("no managed/resolved GPG key")
         );
+        assert!(
+            response["error"]
+                .as_str()
+                .unwrap()
+                .contains("the hold was disabled")
+        );
         assert_eq!(status_at(daemon.sock()).unwrap()["hold_on"], false);
         assert!(tools.gpg_log().is_empty());
         assert!(tools.ca_log().is_empty());
@@ -551,18 +557,54 @@ fn lock_uses_retained_key_after_off_expiry_and_failure() {
 }
 
 #[test]
-fn unknown_key_protection_clears_cache_but_does_not_claim_lock_success() {
+fn unknown_key_protection_locks_cached_and_already_uncached_keys() {
+    for cached in [true, false] {
+        let fixture = Fixture::stored();
+        fixture.tools.set_key_protection("-");
+        if !cached {
+            fixture.tools.drop_cache();
+        }
+        let clears = fixture.tools.clears();
+        let response = fixture.request_lock(false);
+        assert_eq!(response["ok"], true, "{response}");
+        assert_eq!(response["lock_result"], "locked");
+        assert_eq!(fixture.tools.clears(), clears + 1);
+        assert!(!fixture.tools.gpg.key_state(SUB2_GRIP).unwrap().cached);
+        assert!(fixture.tools.gpg.key_state(SUB_GRIP).unwrap().cached);
+        assert!(fixture.store.contains_key(SUB2_GRIP));
+        fixture.assert_off();
+    }
+}
+
+#[test]
+fn protection_query_failure_does_not_override_successful_cache_clear() {
+    let fixture = Fixture::stored();
+    fixture.tools.marker("fail-keyinfo");
+    let response = fixture.request_lock(false);
+    assert_eq!(response["ok"], true, "{response}");
+    assert_eq!(response["lock_result"], "locked");
+    fixture.tools.unmark("fail-keyinfo");
+    assert!(!fixture.tools.gpg.key_state(SUB2_GRIP).unwrap().cached);
+    assert!(fixture.tools.gpg.key_state(SUB_GRIP).unwrap().cached);
+    assert!(fixture.store.contains_key(SUB2_GRIP));
+    fixture.assert_off();
+}
+
+#[test]
+fn unknown_key_protection_does_not_hide_cache_clear_failure() {
     let fixture = Fixture::stored();
     fixture.tools.set_key_protection("-");
+    fixture.tools.marker("fail-clear");
     let response = fixture.request_lock(false);
     assert_eq!(response["ok"], false);
     assert!(
         response["error"]
             .as_str()
             .unwrap()
-            .contains("protection is unknown")
+            .contains("CLEAR_PASSPHRASE: agent returned ERR 67109139")
     );
-    assert!(!fixture.tools.gpg.key_state(SUB2_GRIP).unwrap().cached);
+    assert!(response.get("lock_result").is_none());
+    assert!(fixture.tools.gpg.key_state(SUB2_GRIP).unwrap().cached);
     fixture.assert_off();
 }
 

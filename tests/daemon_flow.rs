@@ -116,6 +116,13 @@ fn lock_without_a_managed_key_fails_without_starting_or_guessing() {
             String::from_utf8_lossy(&output.stderr)
                 .contains("no managed/resolved GPG key")
         );
+        if running {
+            assert!(
+                String::from_utf8_lossy(&output.stderr)
+                    .contains("the hold was disabled")
+            );
+            assert!(env.status().contains("Hold         off"));
+        }
         assert!(env.gpg_log().is_empty());
         assert!(env.ca_log().is_empty());
         assert!(env.status().contains(if running {

@@ -717,7 +717,8 @@ fn lock_key(
         pair.1.notify_all();
         let keygrip = shared.hold.keygrip.clone().ok_or_else(|| {
             Error::Message(
-                "no managed/resolved GPG key available to lock".into(),
+                "the hold was disabled, but no managed/resolved GPG key is available to lock"
+                    .into(),
             )
         })?;
         shared.locking = true;
@@ -732,6 +733,13 @@ fn lock_key(
         &services.runtime_dir,
         "activation.lock",
     )?;
+    // TODO: This exclusive lock can wait indefinitely behind foreground
+    // activation/pinentry, retaining a daemon connection and locking=true,
+    // and delaying shutdown. The client's IPC timeout does not cancel this
+    // operation. Provide bounded/cancellable activation draining without
+    // weakening successful lock postconditions: hold off, exact managed cache
+    // absent, --clear credential absent, and no overlapping activation able
+    // to re-unlock the key after success.
     fs4::FileExt::lock(&activation)?;
     let _transaction = services.store.lock_transaction(&keygrip)?;
     // Try both cleanups even if one fails; never roll back safer state.
@@ -768,13 +776,7 @@ fn clear_managed_cache(gpg: &Gpg, keygrip: &str) -> Result<LockResult> {
         return Ok(LockResult::Unprotected);
     }
     gpg.clear_passphrase(keygrip)?;
-    match protection? {
-        KeyProtection::Passphrase => Ok(LockResult::Locked),
-        _ => Err(Error::Message(
-            "managed GPG cache entry cleared, but key protection is unknown"
-                .into(),
-        )),
-    }
+    Ok(LockResult::Locked)
 }
 
 /// The keepalive scheduler.

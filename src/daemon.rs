@@ -733,13 +733,6 @@ fn lock_key(
         &services.runtime_dir,
         "activation.lock",
     )?;
-    // TODO: This exclusive lock can wait indefinitely behind foreground
-    // activation/pinentry, retaining a daemon connection and locking=true,
-    // and delaying shutdown. The client's IPC timeout does not cancel this
-    // operation. Provide bounded/cancellable activation draining without
-    // weakening successful lock postconditions: hold off, exact managed cache
-    // absent, --clear credential absent, and no overlapping activation able
-    // to re-unlock the key after success.
     fs4::FileExt::lock(&activation)?;
     let _transaction = services.store.lock_transaction(&keygrip)?;
     // Try both cleanups even if one fails; never roll back safer state.

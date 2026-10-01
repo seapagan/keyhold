@@ -221,6 +221,17 @@ fn lock_key(clear: bool, keep_credential: bool) -> Result<()> {
     let config = config::load()?;
     let clear_credential =
         clear || (config.clear_secret_on_lock && !keep_credential);
+    require_lock_capability()?;
+    let response = ipc::request(&Request::Lock { clear_credential })?;
+    check(response.clone())?;
+    let result = response
+        .lock_result
+        .ok_or_else(|| Error::Ipc("daemon returned no lock outcome".into()))?;
+    presentation::key_locked(result, clear_credential);
+    Ok(())
+}
+
+fn require_lock_capability() -> Result<()> {
     let capability = ipc::request(&Request::Ping)
         .map_err(|e| match e {
             Error::DaemonNotRunning => Error::Message(
@@ -236,12 +247,6 @@ fn lock_key(clear: bool, keep_credential: bool) -> Result<()> {
             "running daemon does not support lock; restart it using this Keyhold executable, then activate the intended key before locking".into(),
         ));
     }
-    let response = ipc::request(&Request::Lock { clear_credential })?;
-    check(response.clone())?;
-    let result = response
-        .lock_result
-        .ok_or_else(|| Error::Ipc("daemon returned no lock outcome".into()))?;
-    presentation::key_locked(result, clear_credential);
     Ok(())
 }
 

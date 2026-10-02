@@ -50,6 +50,28 @@ Notes:
 
 [actionlint-install]: https://github.com/rhysd/actionlint/releases
 
+### Optional Python support tooling
+
+Python 3.10+ is required for the Python support tasks. Lizard must be exactly
+version 1.23.0 to preserve the checker's parser compatibility. Ruff and mypy
+are optional local support tools. For example, install them with uv:
+
+```sh
+uv tool install 'lizard==1.23.0'
+uv tool install ruff
+uv tool install mypy
+```
+
+Run `cargo make complexity` for the Rust and Python complexity report,
+including tests. Findings are advisory and do not fail verification.
+Malformed output, invalid configuration, version mismatches, and other
+failures that prevent a trustworthy report still fail the task.
+
+`cargo make verify` includes `python-format`, `python-lint`, `python-type`,
+`python-test`, and `complexity`. Tasks skip when their optional prerequisites
+are unavailable; failures after a task starts remain failures. Python tooling
+is not required to run unrelated Rust tasks.
+
 ## Before opening a PR
 
 Run the full local gate:

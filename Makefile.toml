@@ -1,10 +1,53 @@
 [env]
 MSRV_VERSION = "1.88"
+COMPLEXITY_LIZARD_VERSION = { value = "1.23.0", condition = { env_not_set = ["COMPLEXITY_LIZARD_VERSION"] } }
+COMPLEXITY_MAX_CCN = { value = "10", condition = { env_not_set = ["COMPLEXITY_MAX_CCN"] } }
+COMPLEXITY_MAX_FUNCTION_NLOC = { value = "50", condition = { env_not_set = ["COMPLEXITY_MAX_FUNCTION_NLOC"] } }
+COMPLEXITY_MAX_PARAMETERS = { value = "8", condition = { env_not_set = ["COMPLEXITY_MAX_PARAMETERS"] } }
+COMPLEXITY_MAX_FILE_NLOC = { value = "500", condition = { env_not_set = ["COMPLEXITY_MAX_FILE_NLOC"] } }
 
 [tasks.format]
 description = "Check Rust formatting"
 command = "cargo"
 args = ["fmt", "--all", "--", "--check"]
+
+[tasks.python-format]
+description = "Check Python support-code formatting"
+condition_script = ["ruff --version"]
+command = "ruff"
+args = ["format", "--check", "."]
+
+[tasks.python-lint]
+description = "Lint Python support code"
+condition_script = ["ruff --version"]
+command = "ruff"
+args = ["check", "."]
+
+[tasks.python-type]
+description = "Type-check Python support code strictly"
+condition_script = ["mypy --version"]
+command = "mypy"
+args = ["--strict", "--exclude-gitignore", "."]
+
+[tasks.python-test]
+description = "Test Python support code"
+condition_script = ['python3 -c "import sys; raise SystemExit(sys.version_info < (3, 10))"']
+command = "python3"
+args = ["-B", "-m", "unittest", "discover", "-s", "tests", "-p", "test_*.py"]
+
+[tasks.python-test.windows]
+condition_script = ['python -c "import sys; raise SystemExit(sys.version_info < (3, 10))"']
+command = "python"
+
+[tasks.complexity]
+description = "Report Codacy-aligned Rust and Python complexity findings without failing verification"
+condition_script = ['python3 -c "import sys; raise SystemExit(sys.version_info < (3, 10))" && lizard --version']
+command = "python3"
+args = ["scripts/check_complexity.py"]
+
+[tasks.complexity.windows]
+condition_script = ['python -c "import sys; raise SystemExit(sys.version_info < (3, 10))" && lizard --version']
+command = "python"
 
 [tasks.check]
 description = "Check all targets and features"
@@ -155,6 +198,11 @@ args = ["${@}"]
 description = "Run the full local verification gate"
 dependencies = [
   "format",
+  "python-format",
+  "python-lint",
+  "python-type",
+  "python-test",
+  "complexity",
   "check",
   "clippy",
   "test",

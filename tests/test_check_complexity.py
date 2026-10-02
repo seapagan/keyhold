@@ -147,6 +147,7 @@ class ComplexityCheckerTests(unittest.TestCase):
                 CHECKER._run(["git", "init", "-q", "--initial-branch=main"])
                 CHECKER._run(["git", "config", "user.email", "test@example.com"])
                 CHECKER._run(["git", "config", "user.name", "Test User"])
+                CHECKER._run(["git", "config", "commit.gpgsign", "false"])
                 source = root / "conflicted.rs"
                 source.write_text("fn value() -> i32 { 0 }\n")
                 CHECKER._run(["git", "add", "conflicted.rs"])

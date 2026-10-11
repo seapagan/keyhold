@@ -70,10 +70,7 @@ impl Terminal {
         }
         let (_, current) = cursor::position().map_err(|e| Error::Message(format!("status watch requires an interactive terminal supporting cursor queries: {e}")))?;
         let rows = REGION_ROWS.min(height);
-        let mut reserve = Vec::new();
-        for _ in 1..rows {
-            reserve.extend_from_slice(b"\r\n");
-        }
+        let reserve = b"\r\n".repeat(usize::from(rows - 1));
         guard.output.write_all(&reserve)?;
         guard.output.flush()?;
         let bottom = current.saturating_add(rows - 1).min(height - 1);

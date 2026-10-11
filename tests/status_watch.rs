@@ -97,8 +97,10 @@ fn config_watch_precedence_preserves_one_shot_output() {
     configure(&env, "interval = \"5m\"\n[status]\ninterval = 0.5\n");
     assert_eq!(env.stdout(&["status"]), stopped);
     configure(&env, "[status]\nwatch = true\ninterval = \"500ms\"\n");
-    let out = env.fail(&["status"]);
-    assert!(String::from_utf8_lossy(&out.stderr).contains("interactive"));
+    assert_eq!(
+        env.stdout(&["status"]),
+        keyhold::presentation::format_status_stopped()
+    );
     assert_eq!(env.stdout(&["status", "--no-watch"]), stopped);
     configure(&env, "[status]\nwatch = false\ninterval = 2\n");
     assert_eq!(env.stdout(&["status"]), stopped);
@@ -109,8 +111,10 @@ fn config_watch_precedence_preserves_one_shot_output() {
 fn dotted_status_watch_defaults_control_dispatch() {
     let env = TestEnv::new();
     configure(&env, "'status' . \"watch\" = true # enabled");
-    let out = env.fail(&["status"]);
-    assert!(String::from_utf8_lossy(&out.stderr).contains("interactive"));
+    assert_eq!(
+        env.stdout(&["status"]),
+        keyhold::presentation::format_status_stopped()
+    );
     configure(&env, "status.watch = false");
     let out = env.succeed(&["status"]);
     assert_eq!(
@@ -123,7 +127,6 @@ fn dotted_status_watch_defaults_control_dispatch() {
 fn invalid_status_config_fails_before_terminal_setup() {
     let env = TestEnv::new();
     for raw in [
-        "unknown = true",
         "[status]\nunknown = true",
         "[status]\nwatch = 1",
         "[status]\ninterval = 0",
@@ -232,40 +235,43 @@ fn no_watch_bypasses_invalid_configuration() {
             keyhold::presentation::format_status_stopped(),
             "{raw}"
         );
-        for args in [
-            ["status", "--watch"].as_slice(),
-            &["status", "--interval", "0.5"],
-        ] {
-            let out = env.fail(args);
-            assert!(
-                String::from_utf8_lossy(&out.stderr)
-                    .contains("invalid configuration file"),
-                "{raw}"
-            );
-        }
+    }
+}
+
+#[test]
+fn explicit_watch_rejects_malformed_toml() {
+    let env = TestEnv::new();
+    configure(&env, "status.watch = true\nbroken [");
+    for args in [
+        ["status", "--watch"].as_slice(),
+        &["status", "--interval", "0.5"],
+    ] {
+        let out = env.fail(args);
+        assert!(
+            String::from_utf8_lossy(&out.stderr)
+                .contains("invalid configuration file")
+        );
     }
 }
 
 #[test]
 fn status_config_detection_uses_toml_keys() {
     let env = TestEnv::new();
+    configure(&env, "['status'] # enabled\nwatch = 1");
+    let out = env.fail(&["status"]);
+    assert!(
+        String::from_utf8_lossy(&out.stderr)
+            .contains("invalid configuration file")
+    );
     for raw in [
         "status.watch = true\ninterval = \"bad\"",
         " \"status\" . 'watch' = true # enabled\nunknown = true",
-        "['status'] # enabled\nwatch = 1",
         "[status]\nwatch = true\nbroken [",
         "status.watch = true\nbroken [",
         "nonsense [",
-    ] {
-        configure(&env, raw);
-        let out = env.fail(&["status"]);
-        assert!(
-            String::from_utf8_lossy(&out.stderr)
-                .contains("invalid configuration file"),
-            "{raw}"
-        );
-    }
-    for raw in [
+        "key = 123\n[status]\nwatch = false",
+        "key = \"ABCD\"\ngit_key = true\n[status]\nwatch = false",
+        "interval = \"bad\"\n[status]\nwatch = false",
         "interval = \"bad\" # status.watch = true",
         "# [status]\n# status.watch = true\nunknown = true",
         "key = \"status.watch = true [status]\"\ngit_key = true",
@@ -296,6 +302,7 @@ fn refresh_interval_boundaries_are_duration_based() {
     }
     for text in [
         "0.249999999",
+        "0.2499999999",
         "0",
         "-0.5",
         "NaN",
@@ -319,38 +326,36 @@ fn no_watch_preserves_status_query_errors() {
     let listener = UnixListener::bind(env.sock()).unwrap();
     listener.set_nonblocking(true).unwrap();
     let server = thread::spawn(move || {
-        for index in 0..2 {
-            let deadline = std::time::Instant::now() + Duration::from_secs(3);
-            let mut stream = loop {
-                match listener.accept() {
-                    Ok((stream, _)) => break stream,
-                    Err(error)
-                        if error.kind() == std::io::ErrorKind::WouldBlock =>
-                    {
-                        assert!(std::time::Instant::now() < deadline);
-                        thread::sleep(Duration::from_millis(10));
-                    }
-                    Err(error) => panic!("{error}"),
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        let mut stream = loop {
+            match listener.accept() {
+                Ok((stream, _)) => break stream,
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::WouldBlock =>
+                {
+                    assert!(std::time::Instant::now() < deadline);
+                    thread::sleep(Duration::from_millis(10));
                 }
-            };
-            if index == 1 {
-                stream
-                    .set_read_timeout(Some(Duration::from_secs(3)))
-                    .unwrap();
-                assert!(matches!(
-                    keyhold::ipc::read_request(&stream).unwrap().unwrap(),
-                    keyhold::ipc::Request::Status
-                ));
-                writeln!(
-                    stream,
-                    "{}",
-                    serde_json::to_string(&keyhold::ipc::Response::err(
-                        "status unavailable"
-                    ))
-                    .unwrap()
-                )
-                .unwrap();
+                Err(error) => panic!("{error}"),
             }
+        };
+        {
+            stream
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            assert!(matches!(
+                keyhold::ipc::read_request(&stream).unwrap().unwrap(),
+                keyhold::ipc::Request::Status
+            ));
+            writeln!(
+                stream,
+                "{}",
+                serde_json::to_string(&keyhold::ipc::Response::err(
+                    "status unavailable"
+                ))
+                .unwrap()
+            )
+            .unwrap();
         }
     });
     let out = env.fail(&["status", "--no-watch"]);

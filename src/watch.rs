@@ -20,6 +20,8 @@ use keyhold::{
 #[path = "watch_terminal.rs"]
 mod terminal;
 
+pub(super) use terminal::require_interactive;
+
 struct Attempt {
     result: Result<Option<String>>,
     finished: Instant,

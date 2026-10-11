@@ -422,14 +422,16 @@ cleanup settings.
 
 `[status]` is optional. Its `interval` accepts TOML integers, fractional
 seconds, or quoted durations; setting that interval alone does not enable
-watch. `watch = true` enables watching for bare `keyhold status`.
+watch. `watch = true` enables watching for bare `keyhold status` on an
+interactive terminal; redirected stdin or stdout keeps one-shot output.
 `--no-watch` forces one-shot, `--watch` explicitly enables watch, and a
 CLI `--interval` overrides the configured refresh interval and enables
 watch. Unknown keys are rejected both at the root and inside `[status]`.
 The root `interval = "5m"` remains the GPG keepalive interval.
-Legacy malformed configuration without a `[status]` section still leaves
-one-shot status usable. An explicit watch request validates the complete
-config; invalid new status settings are reported before terminal setup.
+Bare status tolerates malformed TOML and ignores unrelated application
+settings. Explicit watch requests reject malformed TOML; invalid status
+settings are reported before terminal setup. `--no-watch` bypasses config
+entirely. Other commands retain complete configuration validation.
 
 ## How the GnuPG TTL interaction works
 

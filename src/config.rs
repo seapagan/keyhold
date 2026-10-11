@@ -227,29 +227,40 @@ pub fn load() -> Result<Config> {
     load_from(&config_dir()?)
 }
 
-/// Load status settings, preserving legacy one-shot independence from config.
-/// Explicit watch options always validate the complete configuration.
+/// Load only status settings; bare status tolerates unreadable or malformed TOML.
+/// Explicit watch requests still report configuration read/parse errors.
 pub fn load_status(explicit_watch: bool) -> Result<StatusConfig> {
-    let loaded = load();
-    if loaded.is_ok() || explicit_watch {
-        return loaded.map(|config| config.status);
-    }
-    let has_status = config_dir()
-        .ok()
-        .and_then(|dir| {
-            fs::read_to_string(dir.join("keyhold/config.toml")).ok()
-        })
-        .is_some_and(|raw| match toml::from_str::<toml::Table>(&raw) {
-            Ok(table) => table.contains_key("status"),
-            // Malformed TOML cannot reliably establish that status is absent.
-            // Require --no-watch rather than guessing from text.
-            Err(_) => true,
-        });
-    if has_status {
-        loaded.map(|config| config.status)
-    } else {
-        Ok(StatusConfig::default())
-    }
+    let loaded = (|| {
+        let path = config_dir()?.join("keyhold/config.toml");
+        let parse = || -> std::result::Result<Option<toml::Value>, String> {
+            let raw = match fs::read_to_string(&path) {
+                Ok(raw) => raw,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                    return Ok(None);
+                }
+                Err(e) => return Err(e.to_string()),
+            };
+            let mut table: toml::Table =
+                toml::from_str(&raw).map_err(|e| e.to_string())?;
+            Ok(table.remove("status"))
+        };
+        parse()
+            .map(|status| (path.clone(), status))
+            .map_err(|reason| Error::Config { path, reason })
+    })();
+    let (path, status) = match loaded {
+        Ok(loaded) => loaded,
+        Err(_) if !explicit_watch => return Ok(StatusConfig::default()),
+        Err(e) => return Err(e),
+    };
+    status.map_or(Ok(StatusConfig::default()), |value| {
+        value
+            .try_into()
+            .map_err(|e: toml::de::Error| Error::Config {
+                path,
+                reason: e.to_string(),
+            })
+    })
 }
 
 /// The current shutdown policies from the user config on disk.

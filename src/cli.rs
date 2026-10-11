@@ -15,21 +15,20 @@ pub fn parse_refresh_interval(value: &str) -> Result<Duration> {
         value: value.to_owned(),
         reason,
     };
-    let duration = if value.chars().all(|c| c.is_ascii_digit() || c == '.') {
-        let seconds: f64 = value
-            .parse()
-            .map_err(|e: std::num::ParseFloatError| invalid(e.to_string()))?;
-        if seconds < 0.25 {
-            return Err(invalid(
-                "status refresh interval must be at least 250ms".into(),
-            ));
-        }
-        Duration::try_from_secs_f64(seconds)
-            .map_err(|e| invalid(e.to_string()))?
-    } else {
-        parse_duration(value)?
-    };
-    if duration < Duration::from_millis(250) {
+    let (duration, seconds) =
+        if value.chars().all(|c| c.is_ascii_digit() || c == '.') {
+            let seconds: f64 =
+                value.parse().map_err(|e: std::num::ParseFloatError| {
+                    invalid(e.to_string())
+                })?;
+            let duration = Duration::try_from_secs_f64(seconds)
+                .map_err(|e| invalid(e.to_string()))?;
+            (duration, seconds)
+        } else {
+            let duration = parse_duration(value)?;
+            (duration, duration.as_secs_f64())
+        };
+    if seconds < 0.25 {
         return Err(invalid(
             "status refresh interval must be at least 250ms".into(),
         ));

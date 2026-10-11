@@ -16,7 +16,7 @@ use unicode_width::UnicodeWidthChar;
 // Heading, all twelve existing rows, and the three-line watch footer.
 const REGION_ROWS: u16 = 18;
 
-pub(super) fn require_interactive() -> Result<()> {
+pub(crate) fn require_interactive() -> Result<()> {
     let usable_term = std::env::var("TERM")
         .is_ok_and(|term| !term.is_empty() && term != "dumb");
     if !io::stdin().is_terminal()
@@ -71,12 +71,12 @@ impl Terminal {
         let (_, current) = cursor::position().map_err(|e| Error::Message(format!("status watch requires an interactive terminal supporting cursor queries: {e}")))?;
         let rows = REGION_ROWS.min(height);
         let mut reserve = Vec::new();
-        for _ in 0..rows {
+        for _ in 1..rows {
             reserve.extend_from_slice(b"\r\n");
         }
         guard.output.write_all(&reserve)?;
         guard.output.flush()?;
-        let bottom = current.saturating_add(rows).min(height - 1);
+        let bottom = current.saturating_add(rows - 1).min(height - 1);
         guard.top = bottom + 1 - rows;
         guard.rows = rows;
         guard.width = width;
@@ -86,6 +86,9 @@ impl Terminal {
 
     pub(super) fn resize(&mut self) -> Result<()> {
         let (width, height) = terminal::size()?;
+        if (width, height) == (self.width, self.height) {
+            return Ok(());
+        }
         self.height = height;
         if height == 0 {
             self.rows = 0;

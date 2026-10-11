@@ -254,11 +254,11 @@ fn require_lock_capability() -> Result<()> {
 }
 
 fn status(options: StatusOptions) -> Result<()> {
-    let settings = config::load_status(
-        options.watch || options.refresh_interval.is_some(),
-    )?
-    .resolve(&options);
-    if settings.watch {
+    let explicit_watch = options.watch || options.refresh_interval.is_some();
+    let settings = config::load_status(explicit_watch)?.resolve(&options);
+    if settings.watch
+        && (explicit_watch || watch::require_interactive().is_ok())
+    {
         return watch::run(settings.interval, || {
             query_status().map(|snapshot| snapshot.map(|s| s.render()))
         });
@@ -298,8 +298,8 @@ fn query_status() -> Result<Option<StatusSnapshot>> {
     match daemon::connect() {
         Err(Error::DaemonNotRunning) => Ok(None),
         Err(e) => Err(e),
-        Ok(_) => {
-            let response = ipc::request(&Request::Status)?;
+        Ok(stream) => {
+            let response = ipc::request_on_stream(&stream, &Request::Status)?;
             check(response.clone())?;
             let data: StatusData = response.status.ok_or_else(|| {
                 Error::Message("daemon returned no status".into())

@@ -5,7 +5,7 @@ mod common;
 use std::{
     fs::File,
     io::{Read, Write},
-    process::{Child, Command},
+    process::{Child, Command, Stdio},
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicU16, Ordering},
@@ -26,48 +26,79 @@ struct PtyWatch {
     output: mpsc::Receiver<Vec<u8>>,
     transcript: String,
     cursor_row: Arc<AtomicU16>,
+    respond: Arc<AtomicBool>,
     stop_reader: Arc<AtomicBool>,
     reader: Option<thread::JoinHandle<()>>,
 }
 
+fn open_terminal() -> (File, File) {
+    let master =
+        pty::openpt(pty::OpenptFlags::RDWR | pty::OpenptFlags::CLOEXEC)
+            .unwrap();
+    pty::grantpt(&master).unwrap();
+    pty::unlockpt(&master).unwrap();
+    let slave = File::from(
+        pty::ioctl_tiocgptpeer(
+            &master,
+            pty::OpenptFlags::RDWR | pty::OpenptFlags::CLOEXEC,
+        )
+        .unwrap(),
+    );
+    termios::tcsetwinsize(
+        &slave,
+        termios::Winsize {
+            ws_row: 30,
+            ws_col: 100,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        },
+    )
+    .unwrap();
+    (File::from(master), slave)
+}
+
 impl PtyWatch {
     fn new(env: &TestEnv, args: &[&str], respond: bool) -> Self {
-        let master =
-            pty::openpt(pty::OpenptFlags::RDWR | pty::OpenptFlags::CLOEXEC)
-                .unwrap();
-        pty::grantpt(&master).unwrap();
-        pty::unlockpt(&master).unwrap();
-        let slave = File::from(
-            pty::ioctl_tiocgptpeer(
-                &master,
-                pty::OpenptFlags::RDWR | pty::OpenptFlags::CLOEXEC,
-            )
-            .unwrap(),
-        );
-        termios::tcsetwinsize(
-            &slave,
-            termios::Winsize {
-                ws_row: 30,
-                ws_col: 100,
-                ws_xpixel: 0,
-                ws_ypixel: 0,
-            },
-        )
-        .unwrap();
+        Self::at_row(env, args, respond, 24, None)
+    }
+
+    fn at_row(
+        env: &TestEnv,
+        args: &[&str],
+        respond: bool,
+        row: u16,
+        redirect_stdin: Option<bool>,
+    ) -> Self {
+        let (master, slave) = open_terminal();
         let original = termios::tcgetattr(&slave).unwrap();
-        let child = env
-            .keyhold(args)
-            .env("TERM", "xterm-256color")
-            .env("NO_COLOR", "1")
-            .stdin(slave.try_clone().unwrap())
-            .stdout(slave.try_clone().unwrap())
-            .stderr(slave.try_clone().unwrap())
-            .spawn()
-            .unwrap();
-        let master = File::from(master);
-        let cursor_row = Arc::new(AtomicU16::new(24));
+        let command = env.keyhold(args);
+        // Crossterm must not read dimensions from the parent shell's /dev/tty.
+        let child =
+            Command::new("setsid")
+                .arg(command.get_program())
+                .args(command.get_args())
+                .envs(command.get_envs().filter_map(|(key, value)| {
+                    value.map(|value| (key, value))
+                }))
+                .env("TERM", "xterm-256color")
+                .env("NO_COLOR", "1")
+                .stdin(if redirect_stdin == Some(true) {
+                    Stdio::null()
+                } else {
+                    slave.try_clone().unwrap().into()
+                })
+                .stdout(if redirect_stdin == Some(false) {
+                    Stdio::piped()
+                } else {
+                    slave.try_clone().unwrap().into()
+                })
+                .stderr(slave.try_clone().unwrap())
+                .spawn()
+                .unwrap();
+        let cursor_row = Arc::new(AtomicU16::new(row));
+        let respond = Arc::new(AtomicBool::new(respond));
         let (output, reader, stop_reader) =
-            read_pty(&master, cursor_row.clone(), respond);
+            read_pty(&master, cursor_row.clone(), respond.clone());
         Self {
             master,
             slave,
@@ -76,6 +107,7 @@ impl PtyWatch {
             output,
             transcript: String::new(),
             cursor_row,
+            respond,
             stop_reader,
             reader: Some(reader),
         }
@@ -126,6 +158,11 @@ impl PtyWatch {
             "{}",
             self.transcript
         );
+        while let Ok(bytes) =
+            self.output.recv_timeout(Duration::from_millis(30))
+        {
+            self.transcript.push_str(&String::from_utf8_lossy(&bytes));
+        }
         let restored = termios::tcgetattr(&self.slave).unwrap();
         assert_eq!(restored.input_modes, self.original.input_modes);
         assert_eq!(restored.output_modes, self.original.output_modes);
@@ -160,7 +197,7 @@ impl PtyWatch {
 fn read_pty(
     master: &File,
     reply_row: Arc<AtomicU16>,
-    respond: bool,
+    respond: Arc<AtomicBool>,
 ) -> (
     mpsc::Receiver<Vec<u8>>,
     thread::JoinHandle<()>,
@@ -190,7 +227,9 @@ fn read_pty(
                 break;
             }
             pending.extend_from_slice(&buf[..count]);
-            if respond && pending.windows(4).any(|w| w == b"\x1b[6n") {
+            if respond.load(Ordering::Relaxed)
+                && pending.windows(4).any(|w| w == b"\x1b[6n")
+            {
                 let height =
                     termios::tcgetwinsize(&reader).unwrap().ws_row.max(1);
                 let row =
@@ -259,7 +298,6 @@ fn sigterm_restores_terminal_during_a_stalled_poll() {
     listener.set_nonblocking(true).unwrap();
     let mut watch = PtyWatch::new(&env, &["status", "-w"], true);
     watch.wait_for("polling; previous snapshot");
-    drop(accept_with_timeout(&listener));
     let status = accept_with_timeout(&listener);
     status
         .set_read_timeout(Some(Duration::from_secs(3)))
@@ -311,8 +349,6 @@ fn conventional_sigint_restores_terminal_during_a_stalled_poll() {
     let (entered, waiting) = mpsc::channel();
     let (release, blocked) = mpsc::channel();
     let server = thread::spawn(move || {
-        let (probe, _) = listener.accept().unwrap();
-        drop(probe);
         let (mut status, _) = listener.accept().unwrap();
         let mut buf = [0; 128];
         let count = status.read(&mut buf).unwrap();
@@ -383,9 +419,6 @@ fn resizing_to_a_narrow_short_terminal_keeps_quit_responsive() {
 }
 
 fn reply_to_status(listener: &std::os::unix::net::UnixListener, reply: &str) {
-    // Existing status first opens a liveness connection, then sends Status.
-    let (probe, _) = listener.accept().unwrap();
-    drop(probe);
     let (mut stream, _) = listener.accept().unwrap();
     stream
         .set_read_timeout(Some(Duration::from_secs(3)))
@@ -459,4 +492,109 @@ fn drawn_rows(
         rows.insert(row, text.to_owned());
     }
     rows
+}
+
+#[test]
+fn watch_exit_returns_prompt_to_the_first_reserved_row() {
+    for (row, expected) in [(2, 2), (24, 13)] {
+        let env = TestEnv::new();
+        let mut watch =
+            PtyWatch::at_row(&env, &["status", "-w"], true, row, None);
+        watch.wait_for("daemon stopped");
+        assert_eq!(watch.transcript.matches("\r\n").count(), 17);
+        let heading = format!("\x1b[{expected};1H\x1b[2KKeyhold status");
+        assert!(watch.transcript.contains(&heading), "{}", watch.transcript);
+        watch.master.write_all(b"q").unwrap();
+        watch.finish(true);
+        assert!(watch.transcript.ends_with(&format!("\x1b[{expected};1H")));
+    }
+}
+
+#[test]
+fn configured_watch_runs_on_an_interactive_terminal() {
+    let env = TestEnv::new();
+    let dir = env.config.path().join("keyhold");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("config.toml"),
+        "interval = \"bad\"\nstatus.watch = true",
+    )
+    .unwrap();
+    let mut watch = PtyWatch::new(&env, &["status"], true);
+    watch.wait_for("daemon stopped");
+    watch.master.write_all(b"q").unwrap();
+    watch.finish(true);
+}
+
+#[test]
+fn unchanged_resize_does_not_block_on_cursor_queries() {
+    let env = TestEnv::new();
+    let mut watch = PtyWatch::new(&env, &["status", "-i", "60"], true);
+    watch.wait_for("daemon stopped");
+    watch.respond.store(false, Ordering::Relaxed);
+    watch.resize(100, 30);
+    watch.master.write_all(b"q").unwrap();
+    watch.finish(true);
+    assert_eq!(watch.transcript.matches("\x1b[6n").count(), 1);
+}
+
+#[test]
+fn failed_resize_cursor_query_restores_terminal() {
+    let env = TestEnv::new();
+    let mut watch = PtyWatch::new(&env, &["status", "-i", "60"], true);
+    watch.wait_for("daemon stopped");
+    watch.respond.store(false, Ordering::Relaxed);
+    watch.resize(18, 8);
+    watch.wait_for("error:");
+    watch.finish(false);
+}
+
+#[test]
+fn watch_observes_external_gpg_cache_changes() {
+    let env = TestEnv::new();
+    env.rich_gpg();
+    env.set_key_cached(true);
+    env.succeed(&["on"]);
+    env.succeed(&["off"]);
+    let mut watch = PtyWatch::new(&env, &["status", "-i", "0.25"], true);
+    watch.wait_for("Key state    unlocked");
+    watch.transcript.clear();
+    env.set_key_cached(false);
+    watch.wait_for("Key state    locked");
+    watch.transcript.clear();
+    env.set_key_cached(true);
+    watch.wait_for("Key state    unlocked");
+    watch.master.write_all(b"q").unwrap();
+    watch.finish(true);
+}
+
+#[test]
+fn redirected_stdin_or_stdout_keeps_configured_watch_one_shot() {
+    for redirect_stdin in [true, false] {
+        let env = TestEnv::new();
+        let dir = env.config.path().join("keyhold");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("config.toml"), "status.watch = true")
+            .unwrap();
+        for args in [
+            ["status"].as_slice(),
+            &["status", "--no-watch"],
+            &["status", "-w"],
+            &["status", "-i", "0.5"],
+        ] {
+            let explicit = args.contains(&"-w") || args.contains(&"-i");
+            let mut watch =
+                PtyWatch::at_row(&env, args, true, 24, Some(redirect_stdin));
+            watch.finish(!explicit);
+            if explicit {
+                assert!(watch.transcript.contains("requires interactive"));
+            } else {
+                if let Some(mut output) = watch.child.stdout.take() {
+                    output.read_to_string(&mut watch.transcript).unwrap();
+                }
+                assert!(watch.transcript.contains("Daemon       stopped"));
+                assert!(!watch.transcript.contains("\x1b[6n"));
+            }
+        }
+    }
 }

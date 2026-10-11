@@ -30,7 +30,7 @@ pub(super) fn require_interactive() -> Result<()> {
 
 pub(super) struct Terminal {
     output: io::Stdout,
-    signal: signal_hook::SigId,
+    signals: Vec<signal_hook::SigId>,
     raw: bool,
     top: u16,
     rows: u16,
@@ -41,13 +41,9 @@ pub(super) struct Terminal {
 
 impl Terminal {
     pub(super) fn acquire(interrupted: Arc<AtomicBool>) -> Result<Self> {
-        let signal = signal_hook::flag::register(
-            signal_hook::consts::SIGINT,
-            interrupted,
-        )?;
         let mut guard = Self {
             output: io::stdout(),
-            signal,
+            signals: Vec::with_capacity(2),
             raw: false,
             top: 0,
             rows: 0,
@@ -55,6 +51,14 @@ impl Terminal {
             height: 0,
             previous: Vec::new(),
         };
+        guard.signals.push(signal_hook::flag::register(
+            signal_hook::consts::SIGINT,
+            interrupted.clone(),
+        )?);
+        guard.signals.push(signal_hook::flag::register(
+            signal_hook::consts::SIGTERM,
+            interrupted,
+        )?);
         // Construct the guard before any fallible terminal operation.
         terminal::enable_raw_mode()?;
         guard.raw = true;
@@ -165,7 +169,9 @@ impl Drop for Terminal {
         if self.raw {
             let _ = terminal::disable_raw_mode();
         }
-        signal_hook::low_level::unregister(self.signal);
+        for signal in self.signals.drain(..) {
+            signal_hook::low_level::unregister(signal);
+        }
         // The cursor remains visible throughout; no visibility state is owned.
     }
 }

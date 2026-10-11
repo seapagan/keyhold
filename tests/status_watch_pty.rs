@@ -133,6 +133,23 @@ impl PtyWatch {
         assert!(!self.transcript.contains("\x1b[?1049h"));
         assert!(!self.transcript.contains("\x1b[?25l"));
     }
+
+    fn assert_raw(&self) {
+        let raw = termios::tcgetattr(&self.slave).unwrap();
+        let cooked = termios::LocalModes::ICANON | termios::LocalModes::ECHO;
+        assert!(self.original.local_modes.contains(cooked));
+        assert!(!raw.local_modes.intersects(cooked));
+    }
+
+    fn sigterm(&self) {
+        assert!(
+            Command::new("kill")
+                .args(["-TERM", &self.child.id().to_string()])
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
 }
 
 fn read_pty(
@@ -182,6 +199,59 @@ fn quit_keys_restore_terminal_without_starting_a_daemon() {
         watch.finish(true);
         assert!(!env.sock().exists());
         assert!(env.gpg_log().is_empty());
+    }
+}
+
+#[test]
+fn sigterm_restores_terminal_while_waiting_for_the_next_refresh() {
+    let env = TestEnv::new();
+    let mut watch = PtyWatch::new(&env, &["status", "-i", "60"], true);
+    watch.wait_for("daemon stopped");
+    watch.assert_raw();
+    watch.sigterm();
+    watch.finish(true);
+}
+
+#[test]
+fn sigterm_restores_terminal_during_a_stalled_poll() {
+    let env = TestEnv::new();
+    std::fs::create_dir_all(env.sock().parent().unwrap()).unwrap();
+    let listener = std::os::unix::net::UnixListener::bind(env.sock()).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let mut watch = PtyWatch::new(&env, &["status", "-w"], true);
+    watch.wait_for("polling; previous snapshot");
+    drop(accept_with_timeout(&listener));
+    let status = accept_with_timeout(&listener);
+    status
+        .set_read_timeout(Some(Duration::from_secs(3)))
+        .unwrap();
+    assert!(matches!(
+        keyhold::ipc::read_request(&status).unwrap().unwrap(),
+        keyhold::ipc::Request::Status
+    ));
+    watch.assert_raw();
+    watch.sigterm();
+    // Keep the connection open without replying until watch has exited.
+    watch.finish(true);
+    drop(status);
+}
+
+fn accept_with_timeout(
+    listener: &std::os::unix::net::UnixListener,
+) -> std::os::unix::net::UnixStream {
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    loop {
+        match listener.accept() {
+            Ok((stream, _)) => return stream,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "IPC accept timed out"
+                );
+                thread::sleep(Duration::from_millis(10));
+            }
+            Err(error) => panic!("IPC accept failed: {error}"),
+        }
     }
 }
 

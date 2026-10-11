@@ -131,11 +131,6 @@ fn label_width() -> usize {
     LABELS.iter().map(|label| label.len()).max().unwrap_or(0) + LABEL_GAP
 }
 
-/// Print one aligned row: plain label, styled value.
-fn row(label: &str, value: impl std::fmt::Display) {
-    println!("{:<width$}{}", label, value, width = label_width());
-}
-
 /// Current wall-clock time in Unix epoch milliseconds (0 if the clock is
 /// before the epoch). Used only for display deltas.
 fn epoch_ms() -> u64 {
@@ -184,10 +179,21 @@ fn ping_delta(ms: u64) -> colored_text::StyledText {
 
 /// Print the status snapshot for a stopped daemon.
 pub fn status_stopped() {
-    println!("{}", "Keyhold status".bold());
-    println!();
-    row("Daemon", "stopped".yellow());
-    row("Hold", "off".yellow());
+    print!("{}", format_status_stopped());
+}
+
+/// Render stopped status with the same layout as one-shot output.
+pub fn format_status_stopped() -> String {
+    format_rows(vec![
+        Row {
+            label: "Daemon",
+            value: "stopped".yellow().to_string(),
+        },
+        Row {
+            label: "Hold",
+            value: "off".yellow().to_string(),
+        },
+    ])
 }
 
 /// Print the aligned two-column status snapshot for a running daemon.
@@ -199,11 +205,29 @@ pub fn print_status(
     key_state: Option<String>,
     credential: Option<String>,
 ) {
-    println!("{}", "Keyhold status".bold());
-    println!();
-    for r in status_rows(data, key_state, credential) {
-        row(r.label, r.value);
+    print!("{}", format_status(data, key_state, credential));
+}
+
+/// Buffer the complete status presentation for one-shot or watch output.
+pub fn format_status(
+    data: &StatusData,
+    key_state: Option<String>,
+    credential: Option<String>,
+) -> String {
+    format_rows(status_rows(data, key_state, credential))
+}
+
+fn format_rows(rows: Vec<Row>) -> String {
+    let mut output = format!("{}\n\n", "Keyhold status".bold());
+    for r in rows {
+        output.push_str(&format!(
+            "{:<width$}{}\n",
+            r.label,
+            r.value,
+            width = label_width()
+        ));
     }
+    output
 }
 
 /// One rendered status row.

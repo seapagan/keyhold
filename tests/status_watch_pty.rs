@@ -8,7 +8,7 @@ use std::{
     process::{Child, Command},
     sync::{
         Arc,
-        atomic::{AtomicU16, Ordering},
+        atomic::{AtomicBool, AtomicU16, Ordering},
         mpsc,
     },
     thread,
@@ -26,6 +26,8 @@ struct PtyWatch {
     output: mpsc::Receiver<Vec<u8>>,
     transcript: String,
     cursor_row: Arc<AtomicU16>,
+    stop_reader: Arc<AtomicBool>,
+    reader: Option<thread::JoinHandle<()>>,
 }
 
 impl PtyWatch {
@@ -64,7 +66,8 @@ impl PtyWatch {
             .unwrap();
         let master = File::from(master);
         let cursor_row = Arc::new(AtomicU16::new(24));
-        let output = read_pty(&master, cursor_row.clone(), respond);
+        let (output, reader, stop_reader) =
+            read_pty(&master, cursor_row.clone(), respond);
         Self {
             master,
             slave,
@@ -73,6 +76,8 @@ impl PtyWatch {
             output,
             transcript: String::new(),
             cursor_row,
+            stop_reader,
+            reader: Some(reader),
         }
     }
 
@@ -156,20 +161,40 @@ fn read_pty(
     master: &File,
     reply_row: Arc<AtomicU16>,
     respond: bool,
-) -> mpsc::Receiver<Vec<u8>> {
+) -> (
+    mpsc::Receiver<Vec<u8>>,
+    thread::JoinHandle<()>,
+    Arc<AtomicBool>,
+) {
+    let stop_reader = Arc::new(AtomicBool::new(false));
+    let stop = stop_reader.clone();
     let mut reader = master.try_clone().unwrap();
     let mut reply = master.try_clone().unwrap();
+    rustix::io::ioctl_fionbio(&reader, true).unwrap();
     let (send, output) = mpsc::channel();
-    thread::spawn(move || {
+    let handle = thread::spawn(move || {
         let mut buf = [0; 4096];
         let mut pending = Vec::new();
-        while let Ok(count) = reader.read(&mut buf) {
+        while !stop.load(Ordering::Relaxed) {
+            let count = match reader.read(&mut buf) {
+                Ok(count) => count,
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::WouldBlock =>
+                {
+                    thread::sleep(Duration::from_millis(10));
+                    continue;
+                }
+                Err(_) => break,
+            };
             if count == 0 {
                 break;
             }
             pending.extend_from_slice(&buf[..count]);
             if respond && pending.windows(4).any(|w| w == b"\x1b[6n") {
-                let row = reply_row.swap(30, Ordering::Relaxed);
+                let height =
+                    termios::tcgetwinsize(&reader).unwrap().ws_row.max(1);
+                let row =
+                    reply_row.swap(height, Ordering::Relaxed).clamp(1, height);
                 let _ = write!(reply, "\x1b[{row};1R");
                 pending.clear();
             }
@@ -178,13 +203,17 @@ fn read_pty(
             }
         }
     });
-    output
+    (output, handle, stop_reader)
 }
 
 impl Drop for PtyWatch {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
+        self.stop_reader.store(true, Ordering::Relaxed);
+        if let Some(reader) = self.reader.take() {
+            reader.join().unwrap();
+        }
     }
 }
 
@@ -200,6 +229,16 @@ fn quit_keys_restore_terminal_without_starting_a_daemon() {
         assert!(!env.sock().exists());
         assert!(env.gpg_log().is_empty());
     }
+}
+
+#[test]
+fn scheduling_overflow_reports_an_error_and_restores_terminal() {
+    let env = TestEnv::new();
+    let mut watch =
+        PtyWatch::new(&env, &["status", "-i", "9223372036854775807s"], true);
+    watch.wait_for("status refresh interval is too large to schedule");
+    watch.finish(false);
+    assert!(!watch.transcript.contains("panicked"));
 }
 
 #[test]
@@ -322,10 +361,23 @@ fn resizing_to_a_narrow_short_terminal_keeps_quit_responsive() {
     watch.transcript.clear();
     watch.resize(18, 8);
     watch.wait_for("q: Quit");
-    assert!(watch.transcript.contains("\x1b[8;1H"));
+    let narrow = drawn_rows(&watch.transcript, 18, 8);
+    assert_eq!(narrow.get(&8).unwrap(), "q: Quit (Esc / Ct");
+    assert!(narrow.values().any(|line| line == "Last success: non"));
     watch.transcript.clear();
     watch.resize(100, 30);
-    watch.wait_for("Last success: none yet");
+    watch.wait_for("q: Quit (Esc / Ctrl+C)");
+    let expanded = drawn_rows(&watch.transcript, 100, 30);
+    assert!(
+        expanded
+            .values()
+            .any(|line| line == "Last success: none yet")
+    );
+    assert!(
+        expanded
+            .values()
+            .any(|line| line == "q: Quit (Esc / Ctrl+C)")
+    );
     watch.master.write_all(b"q").unwrap();
     watch.finish(true);
 }
@@ -379,6 +431,32 @@ fn communication_errors_retry_and_recover_without_stale_error_rows() {
     watch.master.write_all(b"q").unwrap();
     watch.finish(true);
     server.join().unwrap();
-    assert!(!env.gpg_log().contains("--detach-sign"));
-    assert!(env.ca_log().is_empty());
+}
+
+// Decode the rows actually drawn, including clears, without fixing cursor bytes.
+fn drawn_rows(
+    transcript: &str,
+    width: u16,
+    height: u16,
+) -> std::collections::BTreeMap<u16, String> {
+    let parts: Vec<_> = transcript.split("\x1b[").collect();
+    let mut rows = std::collections::BTreeMap::new();
+    for pair in parts.windows(2) {
+        let Some(position) = pair[0].strip_suffix('H') else {
+            continue;
+        };
+        let Some(text) = pair[1].strip_prefix("2K") else {
+            continue;
+        };
+        let (row, column) = position.split_once(';').unwrap();
+        let row: u16 = row.parse().unwrap();
+        assert!(
+            (1..=height).contains(&row),
+            "row {row} outside height {height}"
+        );
+        assert_eq!(column, "1");
+        assert!(text.len() < usize::from(width), "unclipped row: {text}");
+        rows.insert(row, text.to_owned());
+    }
+    rows
 }

@@ -983,9 +983,9 @@ fn invalid_config_is_reported() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("invalid configuration"), "{stderr}");
 
-    // `status` does not need configuration and keeps working.
+    // Explicit one-shot status does not need valid TOML.
     assert_eq!(
-        env.status(),
+        env.stdout(&["status", "--no-watch"]),
         "Keyhold status\n\nDaemon       stopped\nHold         off\n"
     );
 }

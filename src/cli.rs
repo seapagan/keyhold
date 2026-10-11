@@ -34,11 +34,6 @@ pub fn parse_refresh_interval(value: &str) -> Result<Duration> {
             "status refresh interval must be at least 250ms".into(),
         ));
     }
-    if std::time::Instant::now().checked_add(duration).is_none() {
-        return Err(invalid(
-            "status refresh interval is too large to schedule".into(),
-        ));
-    }
     Ok(duration)
 }
 

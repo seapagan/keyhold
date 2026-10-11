@@ -57,6 +57,7 @@ fn run(command: Command) -> Result<()> {
             clear,
             keep_credential,
         } => lock_key(clear, keep_credential),
+        Command::Status(options) if options.no_watch => status_once(),
         Command::Status(options) => status(options),
         Command::Credential { action } => match action {
             CredentialAction::Clear => credential_clear(),
@@ -262,6 +263,10 @@ fn status(options: StatusOptions) -> Result<()> {
             query_status().map(|snapshot| snapshot.map(|s| s.render()))
         });
     }
+    status_once()
+}
+
+fn status_once() -> Result<()> {
     match query_status()? {
         None => presentation::status_stopped(),
         Some(snapshot) => presentation::print_status(

@@ -58,9 +58,9 @@ impl Monitor {
         attempt: Attempt,
         started: Instant,
         interval: Duration,
-    ) {
+    ) -> Result<()> {
         self.pending = false;
-        self.next = next_poll(started, attempt.finished, interval);
+        self.next = next_poll(started, attempt.finished, interval)?;
         match attempt.result {
             Ok(Some(text)) => {
                 self.text = text;
@@ -80,6 +80,7 @@ impl Monitor {
                 self.state = "failed; retrying";
             }
         }
+        Ok(())
     }
 
     fn frame(&self, interval: Duration) -> String {
@@ -105,14 +106,18 @@ fn next_poll(
     started: Instant,
     finished: Instant,
     interval: Duration,
-) -> Instant {
+) -> Result<Instant> {
     let elapsed = finished.saturating_duration_since(started).as_nanos();
     let remainder = elapsed % interval.as_nanos();
     let remainder = Duration::new(
         (remainder / 1_000_000_000) as u64,
         (remainder % 1_000_000_000) as u32,
     );
-    finished + (interval - remainder)
+    finished.checked_add(interval - remainder).ok_or_else(|| {
+        Error::Message(
+            "status refresh interval is too large to schedule".into(),
+        )
+    })
 }
 
 fn quits(event: &Event) -> bool {
@@ -191,7 +196,7 @@ fn poll_status(
 ) -> Result<()> {
     match worker.responses.try_recv() {
         Ok(attempt) => {
-            monitor.complete(attempt, *started, interval);
+            monitor.complete(attempt, *started, interval)?;
             terminal.draw(&monitor.frame(interval))?;
         }
         Err(mpsc::TryRecvError::Empty) => {}
@@ -249,19 +254,29 @@ mod tests {
         assert!(monitor.begin(now));
         let finished = now + Duration::from_secs(20);
         assert!(!monitor.begin(finished));
-        monitor.complete(
-            Attempt {
-                result: Ok(None),
-                finished,
-                wall: SystemTime::UNIX_EPOCH,
-            },
-            now,
-            Duration::from_millis(250),
-        );
+        monitor
+            .complete(
+                Attempt {
+                    result: Ok(None),
+                    finished,
+                    wall: SystemTime::UNIX_EPOCH,
+                },
+                now,
+                Duration::from_millis(250),
+            )
+            .unwrap();
         assert!(!monitor.begin(finished));
         assert!(!monitor.begin(finished + Duration::from_millis(249)));
         assert!(monitor.begin(finished + Duration::from_millis(250)));
         assert!(!monitor.begin(finished + Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn unrepresentable_deadline_returns_an_error_without_panicking() {
+        let now = Instant::now();
+        let result =
+            std::panic::catch_unwind(|| next_poll(now, now, Duration::MAX));
+        assert!(result.unwrap().is_err());
     }
 
     #[test]
@@ -275,7 +290,8 @@ mod tests {
                     start,
                     start + Duration::from_millis(finished_ms),
                     Duration::from_millis(500)
-                ),
+                )
+                .unwrap(),
                 start + Duration::from_millis(next_ms)
             );
         }
@@ -288,15 +304,17 @@ mod tests {
         let wall = SystemTime::UNIX_EPOCH + Duration::from_secs(100);
         let mut monitor = Monitor::new(now);
         let mut complete = |result, time| {
-            monitor.complete(
-                Attempt {
-                    result,
-                    finished: now,
-                    wall: time,
-                },
-                now,
-                Duration::from_secs(2),
-            );
+            monitor
+                .complete(
+                    Attempt {
+                        result,
+                        finished: now,
+                        wall: time,
+                    },
+                    now,
+                    Duration::from_secs(2),
+                )
+                .unwrap();
             monitor.frame(Duration::from_secs(2))
         };
         assert!(complete(Ok(None), wall).contains("Last success: none yet"));

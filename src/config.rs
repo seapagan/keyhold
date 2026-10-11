@@ -241,13 +241,9 @@ pub fn load_status(explicit_watch: bool) -> Result<StatusConfig> {
         })
         .is_some_and(|raw| match toml::from_str::<toml::Table>(&raw) {
             Ok(table) => table.contains_key("status"),
-            Err(_) => raw.lines().any(|line| {
-                let header = line.trim().strip_prefix('[').unwrap_or("");
-                matches!(
-                    header.split(']').next().unwrap_or("").trim(),
-                    "status" | "\"status\"" | "'status'"
-                )
-            }),
+            // Malformed TOML cannot reliably establish that status is absent.
+            // Require --no-watch rather than guessing from text.
+            Err(_) => true,
         });
     if has_status {
         loaded.map(|config| config.status)

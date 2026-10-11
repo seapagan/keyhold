@@ -9,7 +9,7 @@ use clap::Parser;
 
 use keyhold::{
     activation,
-    cli::{Cli, Command, CredentialAction},
+    cli::{Cli, Command, CredentialAction, StatusOptions},
     config::{self, Config},
     credential::CredentialStore as _,
     credential::SessionCredentialStore,
@@ -21,6 +21,8 @@ use keyhold::{
     presentation,
     state::{CredentialMode, KeySource, StatusData},
 };
+
+mod watch;
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
@@ -55,7 +57,8 @@ fn run(command: Command) -> Result<()> {
             clear,
             keep_credential,
         } => lock_key(clear, keep_credential),
-        Command::Status => status(),
+        Command::Status(options) if options.no_watch => status_once(),
+        Command::Status(options) => status(options),
         Command::Credential { action } => match action {
             CredentialAction::Clear => credential_clear(),
         },
@@ -250,15 +253,53 @@ fn require_lock_capability() -> Result<()> {
     Ok(())
 }
 
-fn status() -> Result<()> {
+fn status(options: StatusOptions) -> Result<()> {
+    let explicit_watch = options.watch || options.refresh_interval.is_some();
+    let settings = config::load_status(explicit_watch)?.resolve(&options);
+    if settings.watch
+        && (explicit_watch || watch::require_interactive().is_ok())
+    {
+        return watch::run(settings.interval, || {
+            query_status().map(|snapshot| snapshot.map(|s| s.render()))
+        });
+    }
+    status_once()
+}
+
+fn status_once() -> Result<()> {
+    match query_status()? {
+        None => presentation::status_stopped(),
+        Some(snapshot) => presentation::print_status(
+            &snapshot.data,
+            snapshot.key_state,
+            snapshot.credential,
+        ),
+    }
+    Ok(())
+}
+
+struct StatusSnapshot {
+    data: StatusData,
+    key_state: Option<String>,
+    credential: Option<String>,
+}
+
+impl StatusSnapshot {
+    fn render(self) -> String {
+        presentation::format_status(
+            &self.data,
+            self.key_state,
+            self.credential,
+        )
+    }
+}
+
+fn query_status() -> Result<Option<StatusSnapshot>> {
     match daemon::connect() {
-        Err(Error::DaemonNotRunning) => {
-            presentation::status_stopped();
-            Ok(())
-        }
+        Err(Error::DaemonNotRunning) => Ok(None),
         Err(e) => Err(e),
-        Ok(_) => {
-            let response = ipc::request(&Request::Status)?;
+        Ok(stream) => {
+            let response = ipc::request_on_stream(&stream, &Request::Status)?;
             check(response.clone())?;
             let data: StatusData = response.status.ok_or_else(|| {
                 Error::Message("daemon returned no status".into())
@@ -266,14 +307,15 @@ fn status() -> Result<()> {
             // Live key/credential state is queried at command time (a
             // snapshot, not a promise), not cached in the daemon.
             let gpg = Gpg::detect().ok();
-            presentation::print_status(
-                &data,
-                key_state_row(&data, gpg.as_ref()),
-                credential_row_with(&data, |keygrip| {
-                    SessionCredentialStore.contains(keygrip)
-                }),
-            );
-            Ok(())
+            let key_state = key_state_row(&data, gpg.as_ref());
+            let credential = credential_row_with(&data, |keygrip| {
+                SessionCredentialStore.contains(keygrip)
+            });
+            Ok(Some(StatusSnapshot {
+                data,
+                key_state,
+                credential,
+            }))
         }
     }
 }

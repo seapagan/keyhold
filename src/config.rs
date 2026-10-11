@@ -9,13 +9,18 @@ use std::{fs, io, path::Path, path::PathBuf, time::Duration};
 use serde::Deserialize;
 
 use crate::{
-    cli::{DEFAULT_INTERVAL, parse_duration},
+    cli::{
+        DEFAULT_INTERVAL, StatusOptions, parse_duration,
+        parse_refresh_interval,
+    },
     error::{Error, Result},
 };
 
 /// Effective settings for Keyhold after merging file and defaults.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {
+    /// Status watch defaults, independent of the keepalive interval.
+    pub status: StatusConfig,
     /// Key selector passed to `gpg --local-user`; `None` uses GPG's default key.
     pub key: Option<String>,
     /// Resolve Git's effective `user.signingkey` when no explicit key is
@@ -42,6 +47,7 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
+            status: StatusConfig::default(),
             key: None,
             git_key: false,
             interval: DEFAULT_INTERVAL,
@@ -51,6 +57,60 @@ impl Default for Config {
             lock_key_on_daemon_stop: false,
         }
     }
+}
+
+/// Status display settings; unknown nested keys are rejected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct StatusConfig {
+    /// Whether bare `status` watches.
+    pub watch: bool,
+    /// Status refresh interval, accepting TOML seconds or duration strings.
+    #[serde(deserialize_with = "deserialize_refresh_interval")]
+    pub interval: Duration,
+}
+
+impl Default for StatusConfig {
+    fn default() -> Self {
+        Self {
+            watch: false,
+            interval: Duration::from_secs(2),
+        }
+    }
+}
+
+impl StatusConfig {
+    /// Merge explicit CLI settings over the file defaults.
+    pub fn resolve(self, options: &StatusOptions) -> Self {
+        Self {
+            watch: !options.no_watch
+                && (options.watch
+                    || options.refresh_interval.is_some()
+                    || self.watch),
+            interval: options.refresh_interval.unwrap_or(self.interval),
+        }
+    }
+}
+
+fn deserialize_refresh_interval<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Duration, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Seconds {
+        Integer(i64),
+        Float(f64),
+        Text(String),
+    }
+    let text = match Seconds::deserialize(deserializer)? {
+        Seconds::Integer(value) => value.to_string(),
+        Seconds::Float(value) => value.to_string(),
+        Seconds::Text(value) => value,
+    };
+    parse_refresh_interval(&text).map_err(serde::de::Error::custom)
 }
 
 impl Config {
@@ -85,6 +145,7 @@ pub struct ShutdownPolicies {
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ConfigFile {
+    status: Option<StatusConfig>,
     key: Option<String>,
     git_key: Option<bool>,
     interval: Option<String>,
@@ -148,6 +209,7 @@ pub fn load_from(dir: &Path) -> Result<Config> {
         });
     }
     Ok(Config {
+        status: file.status.unwrap_or_default(),
         key: file.key,
         git_key,
         interval,
@@ -163,6 +225,42 @@ pub fn load_from(dir: &Path) -> Result<Config> {
 /// Load configuration from the standard user configuration directory.
 pub fn load() -> Result<Config> {
     load_from(&config_dir()?)
+}
+
+/// Load only status settings; bare status tolerates unreadable or malformed TOML.
+/// Explicit watch requests still report configuration read/parse errors.
+pub fn load_status(explicit_watch: bool) -> Result<StatusConfig> {
+    let loaded = (|| {
+        let path = config_dir()?.join("keyhold/config.toml");
+        let parse = || -> std::result::Result<Option<toml::Value>, String> {
+            let raw = match fs::read_to_string(&path) {
+                Ok(raw) => raw,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                    return Ok(None);
+                }
+                Err(e) => return Err(e.to_string()),
+            };
+            let mut table: toml::Table =
+                toml::from_str(&raw).map_err(|e| e.to_string())?;
+            Ok(table.remove("status"))
+        };
+        parse()
+            .map(|status| (path.clone(), status))
+            .map_err(|reason| Error::Config { path, reason })
+    })();
+    let (path, status) = match loaded {
+        Ok(loaded) => loaded,
+        Err(_) if !explicit_watch => return Ok(StatusConfig::default()),
+        Err(e) => return Err(e),
+    };
+    status.map_or(Ok(StatusConfig::default()), |value| {
+        value
+            .try_into()
+            .map_err(|e: toml::de::Error| Error::Config {
+                path,
+                reason: e.to_string(),
+            })
+    })
 }
 
 /// The current shutdown policies from the user config on disk.

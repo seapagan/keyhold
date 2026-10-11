@@ -2,12 +2,53 @@
 
 use std::time::Duration;
 
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
 
 use crate::error::{Error, Result};
 
 /// Default keepalive interval: five minutes.
 pub const DEFAULT_INTERVAL: Duration = Duration::from_secs(5 * 60);
+
+/// Parse status refresh seconds or a human-readable duration.
+pub fn parse_refresh_interval(value: &str) -> Result<Duration> {
+    let invalid = |reason: String| Error::Duration {
+        value: value.to_owned(),
+        reason,
+    };
+    let (duration, seconds) =
+        if value.chars().all(|c| c.is_ascii_digit() || c == '.') {
+            let seconds: f64 =
+                value.parse().map_err(|e: std::num::ParseFloatError| {
+                    invalid(e.to_string())
+                })?;
+            let duration = Duration::try_from_secs_f64(seconds)
+                .map_err(|e| invalid(e.to_string()))?;
+            (duration, seconds)
+        } else {
+            let duration = parse_duration(value)?;
+            (duration, duration.as_secs_f64())
+        };
+    if seconds < 0.25 {
+        return Err(invalid(
+            "status refresh interval must be at least 250ms".into(),
+        ));
+    }
+    Ok(duration)
+}
+
+/// Status-only overrides; the refresh interval is unrelated to GPG pings.
+#[derive(Debug, Default, Args)]
+pub struct StatusOptions {
+    /// Refresh status in place until q, Esc or Ctrl+C
+    #[arg(short = 'w', long, conflicts_with = "no_watch")]
+    pub watch: bool,
+    /// Force one-shot output, overriding status.watch in config
+    #[arg(long, conflicts_with = "refresh_interval")]
+    pub no_watch: bool,
+    /// Status refresh interval: seconds (0.5, 2) or duration (500ms, 2s); minimum 250ms, default 2s; implies watch
+    #[arg(short = 'i', long = "interval", value_name = "DURATION", value_parser = parse_refresh_interval)]
+    pub refresh_interval: Option<Duration>,
+}
 
 /// Parse a positive human-friendly duration (`30m`, `4h`, `1h30m`, `500ms`).
 pub fn parse_duration(value: &str) -> Result<Duration> {
@@ -87,7 +128,7 @@ pub enum Command {
         keep_credential: bool,
     },
     /// Show whether the daemon and hold are active
-    Status,
+    Status(StatusOptions),
     /// Manage the stored session credential
     Credential {
         #[command(subcommand)]

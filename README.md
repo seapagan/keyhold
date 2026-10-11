@@ -231,6 +231,50 @@ alone and does not query Secret Service. A retained stored-mode hold may
 still query its explicitly opted-in session credential after `off` or
 expiry.
 
+### Watch status
+
+One-shot `keyhold status` remains the default. Watch polls fresh daemon,
+GPG key, and session-credential state and refreshes the same meaningful
+status rows in place on the normal terminal screen:
+
+```sh
+keyhold status --watch          # or -w; default refresh every 2 seconds
+keyhold status -w --interval 2
+keyhold status -w -i 0.5        # refresh every 500 milliseconds
+keyhold status --interval 500ms # an explicit CLI interval enables watch
+keyhold status --no-watch       # one-shot even when config enables watch
+```
+
+Quit with `q`, `Q`, `Esc`, or `Ctrl+C`, without pressing Enter. Both stdin
+and stdout must be interactive terminals; `TERM` must be set and cannot
+be `dumb`. Terminal input mode and the watch display region are restored
+on exit. Watch does not start the daemon or change the hold, GPG cache,
+or credentials. A stopped daemon stays visible; outages are marked as
+disconnected/unavailable and retried until recovery or quit.
+
+The footer shows the last successful running-daemon refresh in UTC,
+the refresh interval, and the current attempt state. Failed polls and a
+stopped daemon do not advance that timestamp; before the first success
+it reads `none yet`. Slow polls never overlap or queue missed updates,
+and quit input remains responsive while a probe is waiting. GPG cache
+and expiry rows remain snapshots/estimates, as in one-shot output.
+
+Refresh intervals accept positive decimal seconds (`2`, `0.5`, `2.25`)
+or `humantime` durations (`250ms`, `2s`, `1m`, `1m30s`). The minimum is
+250 milliseconds for both CLI and config. Zero, negative, non-finite,
+overflowing, and malformed values are rejected. `--watch` conflicts
+with `--no-watch`; `--no-watch --interval ...` is also rejected.
+
+The display clips long lines to terminal width and clears disappearing
+rows. Short terminals show only the rows that fit, retaining the quit
+footer; enlarge the terminal to see every row. Colours continue to follow
+`colored_text`, including `NO_COLOR`, `FORCE_COLOR`, and `CLICOLOR`.
+
+Status **refresh** frequency is independent of the daemon's GPG
+**keepalive ping** interval shown in the `Interval` status row. These
+flags belong only to `status`; `keyhold on --interval` keeps its existing
+meaning and duration syntax.
+
 ### Lock the managed key
 
 `keyhold off` disables the hold while leaving the GPG-agent cache and any
@@ -355,6 +399,11 @@ lock_key_on_daemon_stop = false      # optional; clear the last resolved
                                      # key's GPG cache entry on clean daemon
                                      # shutdown (still works after `off` or
                                      # hold expiry)
+
+[status]
+watch = false             # optional; default one-shot status
+interval = 2.0            # optional refresh seconds; default 2s, minimum 0.25s
+# interval = "500ms"      # quoted human-readable durations also accepted
 ```
 
 Setting both `key` and `git_key = true` is rejected as an invalid
@@ -370,6 +419,19 @@ rejected with an error naming the file.
 For `lock`, explicit `--clear` / `--keep-credential` overrides
 `clear_secret_on_lock`. This setting is independent of both daemon-stop
 cleanup settings.
+
+`[status]` is optional. Its `interval` accepts TOML integers, fractional
+seconds, or quoted durations; setting that interval alone does not enable
+watch. `watch = true` enables watching for bare `keyhold status` on an
+interactive terminal; redirected stdin or stdout keeps one-shot output.
+`--no-watch` forces one-shot, `--watch` explicitly enables watch, and a
+CLI `--interval` overrides the configured refresh interval and enables
+watch. Unknown keys are rejected both at the root and inside `[status]`.
+The root `interval = "5m"` remains the GPG keepalive interval.
+Bare status tolerates malformed TOML and ignores unrelated application
+settings. Explicit watch requests reject malformed TOML; invalid status
+settings are reported before terminal setup. `--no-watch` bypasses config
+entirely. Other commands retain complete configuration validation.
 
 ## How the GnuPG TTL interaction works
 
